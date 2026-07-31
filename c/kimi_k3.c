@@ -75,6 +75,7 @@
 #include "quant.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#include "backend_cuda_k3.h"
 #endif
 
 /* ---------- config ---------- */
@@ -203,6 +204,11 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
  * placement is opt-in (K3_GPUS) and hard-capped (K3_GPU_GB).
  */
 static int    g_k3_cuda = 0;
+/* K3_EXPERT_GPU: routed-expert matmuls on the GPU (backend_cuda_k3.cu).
+ * Cleared on any failure so a run degrades to the CPU path rather than dying
+ * mid-token. Declared here because k3_cuda_report() below reports the split. */
+static int      g_k3_expert_gpu = 0;
+static uint64_t g_k3_exp_gpu = 0, g_k3_exp_cpu = 0;
 static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
 static int    g_k3_cuda_ndev = 0;
 static int    g_k3_cuda_rr = 0;
@@ -255,6 +261,9 @@ static void k3_cuda_report(void){
     size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
     fprintf(stderr,"[K3/CUDA] %zu tensors resident on GPU, %.2f GB (budget used %.2f GB, "
         "%d tensor(s) fell back)\n",n,b/1e9,g_k3_gpu_used/1e9,g_k3_cuda_nfail);
+    if(g_k3_exp_gpu||g_k3_exp_cpu)
+        fprintf(stderr,"[K3/EXP] routed experts: %llu on GPU, %llu on CPU\n",
+            (unsigned long long)g_k3_exp_gpu,(unsigned long long)g_k3_exp_cpu);
 }
 #endif
 
@@ -632,6 +641,15 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         w_load(m,&m->lm_head,"lm_head.weight",c->vocab,c->hidden,hbits);
     } else fprintf(stderr,"[K3] final norm/lm_head not present — trace-only mode\n");
     expert_table_init(m);
+#ifdef COLI_CUDA
+    /* K3_EXPERT_GPU=1 moves the routed-expert matmuls onto the GPU. Needs a
+     * device from K3_GPUS; measured on GB10 this is where ~84% of decode time
+     * sits, of which only ~14% is I/O. */
+    if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")) && g_k3_cuda)
+        g_k3_expert_gpu = coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter);
+    else if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")))
+        fprintf(stderr,"[K3/EXP] K3_EXPERT_GPU needs K3_GPUS — staying on CPU\n");
+#endif
     /* expert LRU cache, per-layer slots from the global budget */
     double egb = getenv("K3_EXPERT_GB")?atof(getenv("K3_EXPERT_GB")):8.0;
     int nmoe=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nmoe++;
@@ -832,6 +850,15 @@ static void expert_read(Model *m, int li, int eid, Slot *s){
     if(!s->base){
         if(posix_memalign((void**)&s->base,4096,(size_t)m->e_slot+8192)){
             fprintf(stderr,"OOM expert slot\n"); exit(1); }
+#ifdef COLI_CUDA
+        /* Register at birth: slots are allocated once and thereafter only
+         * SWAPPED between the LRU and the working set, so one mapping per
+         * allocation covers every expert that will ever occupy it. */
+        if(g_k3_expert_gpu && !coli_k3_register(s->base,(size_t)m->e_slot+8192)){
+            fprintf(stderr,"[K3/EXP] slot registration failed — expert GPU path off\n");
+            g_k3_expert_gpu=0;
+        }
+#endif
     }
     ERef *er=&m->eref[(int64_t)li*m->c.n_experts+eid];
     int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
@@ -878,6 +905,21 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
     Cfg *c=&m->c;
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
+#ifdef COLI_CUDA
+    if(g_k3_expert_gpu){
+        /* One call replaces all three matmul_mxfp4's; SiTU is fused into the
+         * first kernel's epilogue so `up` never leaves the device. */
+        if(coli_k3_expert(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
+                          c->latent,c->moe_inter,c->situ_b1,c->situ_b2)){
+            g_k3_exp_gpu++;
+            for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
+            return;
+        }
+        fprintf(stderr,"[K3/EXP] expert kernel failed — falling back to CPU\n");
+        g_k3_expert_gpu=0;
+    }
+    g_k3_exp_cpu++;
+#endif
     void (*mm)(float*,const float*,const uint8_t*,const uint8_t*,int,int,int)
         = g_k3_idot ? matmul_mxfp4_i8 : matmul_mxfp4;
     mm(gate,z,w1p,w1s,1,c->latent,c->moe_inter);

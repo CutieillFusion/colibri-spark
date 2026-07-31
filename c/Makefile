@@ -243,6 +243,7 @@ CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
 CUDA_OBJ  = backend_cuda.o
 INK_CUDA_OBJ = backend_cuda_ink.o
+K3_CUDA_OBJ  = backend_cuda_k3.o
 endif
 
 ifeq ($(HIP),1)
@@ -413,8 +414,11 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
-kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h backend_cuda.h $(CUDA_OBJ)
-	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h backend_cuda.h backend_cuda_k3.h $(CUDA_OBJ) $(K3_CUDA_OBJ)
+	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(K3_CUDA_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+
+backend_cuda_k3.o: backend_cuda_k3.cu backend_cuda_k3.h
+	$(GPUCC) $(GPUFLAGS) -c backend_cuda_k3.cu -o backend_cuda_k3.o
 
 # Use a baseline that matches the compiler target. macOS already targets a
 # portable baseline when ARCH is empty; forcing the x86 value there breaks
