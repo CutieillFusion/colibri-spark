@@ -73,6 +73,9 @@
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#endif
 
 /* ---------- config ---------- */
 typedef struct {
@@ -94,7 +97,15 @@ typedef struct {
 } Cfg;
 
 /* ---------- RAM-resident weight, quantized at load ---------- */
-typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I, gs; } W;
+typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;
+#ifdef COLI_CUDA
+    /* Device mirror of this tensor. Allocated lazily by the first w_matmul on
+     * the serial path (see the eligibility note there). Zeroed by the calloc
+     * of the owning Layer, so a CPU-only build and an un-placed tensor look
+     * identical. */
+    ColiCudaTensor *cuda; int cuda_device; int8_t cuda_failed, cuda_placed;
+#endif
+} W;
 
 typedef struct {                          /* KDA layer */
     W q, k, v, o, g;
@@ -173,8 +184,106 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
     for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
 
+#ifdef COLI_CUDA
+/* ---------- optional GPU placement for the RESIDENT (dense) tensors ----------
+ *
+ * Scope: attention (KDA + MLA), the LatentMoE up/down projections, the shared
+ * experts and the head — i.e. everything w_load() already quantizes into RAM.
+ * The ROUTED experts are deliberately untouched: they stream from the shards as
+ * native MXFP4 and never become a W, so they keep the CPU path.
+ *
+ * fmt is the same encoding backend_cuda.h documents (0=f32, 1=int8, 4=grouped
+ * int4) because both engines share quant.h — so coli_cuda_matmul is a drop-in
+ * for the dispatch below, uploading on first use and reusing after.
+ *
+ * GB10 caveat (upstream #653): this GPU is *integrated* — device memory and
+ * host RAM are one physical pool. Placing a tensor therefore DUPLICATES it
+ * rather than moving it off-RAM, and every byte spent here is a byte not
+ * available to the routed-expert cache, which is the actual bottleneck. Hence
+ * placement is opt-in (K3_GPUS) and hard-capped (K3_GPU_GB).
+ */
+static int    g_k3_cuda = 0;
+static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
+static int    g_k3_cuda_ndev = 0;
+static int    g_k3_cuda_rr = 0;
+static int64_t g_k3_gpu_left = 0;          /* bytes still placeable (K3_GPU_GB) */
+static int64_t g_k3_gpu_used = 0;
+static int    g_k3_cuda_nfail = 0;
+
+static int64_t w_bytes(const W *w){
+    int64_t O=w->O, I=w->I;
+    if(w->fmt==0) return O*I*4;
+    if(w->fmt==1) return O*I + O*4;
+    { int64_t rb=(I+1)/2, ng=(I+w->gs-1)/w->gs; return O*rb + O*ng*4; }
+}
+
+/* The weight blob coli_cuda_* expects for this format. */
+static const void *w_blob(const W *w){
+    return w->fmt==0 ? (const void*)w->f
+         : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+}
+
+/* K3_GPUS="0" or "0,1" places resident tensors on those CUDA ordinals; unset
+ * keeps the engine CPU-only. K3_GPU_GB caps the placement (default 8 GB).
+ * Called BEFORE the shards are mapped so a bad device or a driver problem is
+ * reported in a second rather than after mmap'ing 1.4 TB of checkpoint. */
+static void k3_cuda_init_from_env(void){
+    if(!getenv("K3_GPUS")) return;
+    for(const char *p=getenv("K3_GPUS"); *p && g_k3_cuda_ndev<COLI_CUDA_MAX_DEVICES; ){
+        g_k3_cuda_devs[g_k3_cuda_ndev++]=(int)strtol(p,(char**)&p,10);
+        while(*p==','||*p==' ') p++;
+    }
+    if(g_k3_cuda_ndev<=0 || !coli_cuda_init(g_k3_cuda_devs,g_k3_cuda_ndev)){
+        fprintf(stderr,"[K3/CUDA] coli_cuda_init failed — staying on CPU\n");
+        g_k3_cuda_ndev=0; return;
+    }
+    g_k3_cuda=1;
+    double gb = getenv("K3_GPU_GB")?atof(getenv("K3_GPU_GB")):8.0;
+    g_k3_gpu_left=(int64_t)(gb*1e9);
+    fprintf(stderr,"[K3/CUDA] %d device(s), budget %.1f GB for resident tensors "
+        "(routed experts stay on the CPU streaming path)\n",g_k3_cuda_ndev,gb);
+    for(int i=0;i<g_k3_cuda_ndev;i++)
+        if(coli_cuda_device_integrated(g_k3_cuda_devs[i]))
+            fprintf(stderr,"[K3/CUDA] device %d is INTEGRATED (#653): placement duplicates "
+                "weights in shared RAM and shrinks the expert cache by the same amount\n",
+                g_k3_cuda_devs[i]);
+}
+
+/* Placement summary — call after generation so the budget's effect is visible. */
+static void k3_cuda_report(void){
+    if(!g_k3_cuda) return;
+    size_t n=0,b=0; coli_cuda_stats(-1,&n,&b);
+    fprintf(stderr,"[K3/CUDA] %zu tensors resident on GPU, %.2f GB (budget used %.2f GB, "
+        "%d tensor(s) fell back)\n",n,b/1e9,g_k3_gpu_used/1e9,g_k3_cuda_nfail);
+}
+#endif
+
 /* ---------- W: load-time quantization + matvec ---------- */
 static void w_matmul(float *y, const float *x, const W *w, int S){
+#ifdef COLI_CUDA
+    /* Serial path only: placement mutates w lazily and the CUDA driver must not
+     * be entered from inside an OpenMP region (mirrors colibri.c's guard). */
+    if(g_k3_cuda && !w->cuda_failed && !omp_in_parallel()){
+        W *mw = (W*)w;                     /* lazy device mirror; see note above */
+        if(!mw->cuda_placed){
+            int64_t need = w_bytes(w);
+            if(need > g_k3_gpu_left) mw->cuda_failed = 1;   /* budget spent: stay on CPU */
+            else {
+                mw->cuda_device = g_k3_cuda_devs[g_k3_cuda_rr++ % g_k3_cuda_ndev];
+                mw->cuda_placed = 1;
+                g_k3_gpu_left -= need; g_k3_gpu_used += need;
+            }
+        }
+        if(mw->cuda_placed){
+            if(coli_cuda_matmul(&mw->cuda,y,x,w_blob(w),w->s,w->fmt,S,w->I,w->O,
+                                mw->cuda_device,w->gs)) return;
+            mw->cuda_failed = 1;
+            if(g_k3_cuda_nfail++ < 8)
+                fprintf(stderr,"[K3/CUDA] tensor [%d,%d] fmt=%d on device %d disabled "
+                    "after an error; falling back to CPU\n",w->O,w->I,w->fmt,mw->cuda_device);
+        }
+    }
+#endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
     else if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==4) matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs);
@@ -414,6 +523,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     load_cfg(&m->c,snap);
     Cfg *c=&m->c;
     if(n_layers_env>0&&n_layers_env<c->n_layers) c->n_layers=n_layers_env;
+#ifdef COLI_CUDA
+    k3_cuda_init_from_env();                       /* before the shards: fail fast */
+#endif
     st_init_multi(&m->S,snap,getenv("K3_DIRS"));   /* K3_DIRS: extra shard dirs (multi-drive split) */
     m->pfx[0]=0;   /* probe a layer-0 tensor: embed/head live in one of the LAST shards */
     if(!st_has(&m->S,"model.layers.0.input_layernorm.weight")&&
@@ -1540,6 +1652,9 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+#ifdef COLI_CUDA
+    k3_cuda_report();
+#endif
     if(m.trace) fclose(m.trace);
     return 0;
 }
