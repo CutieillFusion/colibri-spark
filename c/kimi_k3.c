@@ -161,6 +161,7 @@ typedef struct {
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
+    int w2_fd, w2_dfd;                    /* K3_W2_DIR store: buffered + O_DIRECT */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
     FILE *trace;
@@ -496,11 +497,68 @@ static void load_cfg(Cfg *c, const char *snap){
 /* ---------- init ---------- */
 static void expert_table_init(Model *m){
     Cfg *c=&m->c;
-    m->e_w1p=(int64_t)c->moe_inter*(c->latent/2);   m->e_w1s=(int64_t)c->moe_inter*(c->latent/32);
-    m->e_w2p=(int64_t)c->latent*(c->moe_inter/2);   m->e_w2s=(int64_t)c->latent*(c->moe_inter/32);
+    /* K3_W2_DIR: read experts from a packed 2-bit store (tools/
+     * pack_experts_2bit.py) instead of the HF MXFP4 shards. Same ue8m0 scales,
+     * codes are 2-bit indices into {-4,-1,1,4}: 8.86 MiB per expert instead of
+     * 16.74, i.e. 1.89x less to stream and to dequantize. The store is one
+     * flat file with slots in (moe_layer, expert) order, so every expert is a
+     * single contiguous pread rather than six ranges. */
+    const char *w2dir = getenv("K3_W2_DIR");
+    if(w2dir){
+        m->e_w1p=(int64_t)c->moe_inter*(c->latent/4); m->e_w1s=(int64_t)c->moe_inter*(c->latent/32);
+        m->e_w2p=(int64_t)c->latent*(c->moe_inter/4); m->e_w2s=(int64_t)c->latent*(c->moe_inter/32);
+    } else {
+        m->e_w1p=(int64_t)c->moe_inter*(c->latent/2); m->e_w1s=(int64_t)c->moe_inter*(c->latent/32);
+        m->e_w2p=(int64_t)c->latent*(c->moe_inter/2); m->e_w2s=(int64_t)c->latent*(c->moe_inter/32);
+    }
     m->e_slot=2*(m->e_w1p+m->e_w1s)+m->e_w2p+m->e_w2s;
     m->eref=calloc((size_t)c->n_layers*c->n_experts,sizeof(ERef));
     if(!m->eref){fprintf(stderr,"OOM expert table\n");exit(1);}
+    if(w2dir){
+        char p[1024]; snprintf(p,sizeof(p),"%s/experts.w2",w2dir);
+        int fd=open(p,O_RDONLY);
+        if(fd<0){ fprintf(stderr,"[K3/W2] cannot open %s: %s\n",p,strerror(errno)); exit(1); }
+        m->w2_fd=fd;
+        /* A second O_DIRECT descriptor. expert_read() normally gets one from
+         * st_direct_fd(), which only knows shards registered in m->S — this
+         * store is not, so without this it silently falls back to BUFFERED
+         * reads. Measured cost of that fallback: 132 GB took 67 s (~2 GB/s)
+         * instead of the ~20 s the device does at 6.7 GB/s, because a 766 GB
+         * working set against 116 GB of RAM just thrashes the page cache.
+         * Slot size and offsets are multiples of 4096, so the aligned path
+         * needs no head/tail slack. */
+        m->w2_dfd=open(p,O_RDONLY|O_DIRECT);
+        if(m->w2_dfd<0){
+            fprintf(stderr,"[K3/W2] O_DIRECT open failed (%s) — using buffered reads, "
+                "expect ~3x slower expert loads\n",strerror(errno));
+            m->w2_dfd=0;
+        }
+        if(m->e_slot%4096){ fprintf(stderr,"[K3/W2] slot %lld not 4096-aligned\n",
+            (long long)m->e_slot); exit(1); }
+        int64_t off[6]={0,m->e_w1p,m->e_w1p+m->e_w1s,
+                        m->e_w1p+m->e_w1s+m->e_w2p,
+                        m->e_w1p+m->e_w1s+m->e_w2p+m->e_w2s,
+                        2*m->e_w1p+m->e_w1s+m->e_w2p+m->e_w2s};
+        int nmoe=0;
+        for(int li=0;li<c->n_layers;li++){
+            if(!m->L[li].sparse) continue;
+            for(int e2=0;e2<c->n_experts;e2++){
+                ERef *er=&m->eref[(int64_t)li*c->n_experts+e2];
+                int64_t base=((int64_t)nmoe*c->n_experts+e2)*m->e_slot;
+                for(int k=0;k<6;k++){ er->fd[k]=fd; er->off[k]=base+off[k]; }
+                er->contig=1;              /* one pread per expert */
+            }
+            nmoe++;
+        }
+        struct stat sb; int64_t want=(int64_t)nmoe*c->n_experts*m->e_slot;
+        if(fstat(fd,&sb)==0 && sb.st_size<want){
+            fprintf(stderr,"[K3/W2] %s is %lld bytes, need %lld for %d MoE layers x %d experts"
+                " — refusing (incomplete pack)\n",p,(long long)sb.st_size,(long long)want,
+                nmoe,c->n_experts); exit(1); }
+        fprintf(stderr,"[K3/W2] packed 2-bit experts: %s, slot %.2f MiB, %d layers x %d = %.1f GB\n",
+            p,m->e_slot/1048576.0,nmoe,c->n_experts,want/1e9);
+        return;
+    }
     const char *mat[3]={"w1","w2","w3"};
     int64_t want[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
     int missing=0;
@@ -865,7 +923,7 @@ static void expert_read(Model *m, int li, int eid, Slot *s){
     int64_t sizes[6]={m->e_w1p,m->e_w1s,m->e_w2p,m->e_w2s,m->e_w1p,m->e_w1s};
     if(er->fd[0]<0){ fprintf(stderr,"[K3] expert L%d E%d missing on disk\n",li,eid); exit(1); }
     if(er->contig){
-        int dfd = g_k3_direct ? st_direct_fd(&m->S,er->fd[0]) : -1;
+        int dfd = g_k3_direct ? (m->w2_dfd ? m->w2_dfd : st_direct_fd(&m->S,er->fd[0])) : -1;
         if(dfd>=0){
             /* aligned window read; sub-4K head/tail slack handled explicitly.
              * The tail past the last aligned block (or past EOF) is fetched
@@ -910,8 +968,11 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
     if(g_k3_expert_gpu){
         /* One call replaces all three matmul_mxfp4's; SiTU is fused into the
          * first kernel's epilogue so `up` never leaves the device. */
-        if(coli_k3_expert(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
-                          c->latent,c->moe_inter,c->situ_b1,c->situ_b2)){
+        int ok = m->w2_fd ? coli_k3_expert_w2(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
+                                c->latent,c->moe_inter,c->situ_b1,c->situ_b2)
+                          : coli_k3_expert(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
+                                c->latent,c->moe_inter,c->situ_b1,c->situ_b2);
+        if(ok){
             g_k3_exp_gpu++;
             for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
             return;
@@ -919,6 +980,12 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
         fprintf(stderr,"[K3/EXP] expert kernel failed — falling back to CPU\n");
         g_k3_expert_gpu=0;
     }
+    /* quant.h has no 2-bit kernel: decoding a w2 slot as e2m1 would read
+     * 4-bit nibbles out of 2-bit codes and produce plausible-looking garbage
+     * rather than an error. Refuse instead. */
+    if(m->w2_fd){
+        fprintf(stderr,"[K3/EXP] K3_W2_DIR needs the GPU expert kernel "
+            "(K3_GPUS + K3_EXPERT_GPU=1); there is no 2-bit CPU path\n"); exit(1); }
     g_k3_exp_cpu++;
 #endif
     void (*mm)(float*,const float*,const uint8_t*,const uint8_t*,int,int,int)

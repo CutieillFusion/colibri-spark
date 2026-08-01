@@ -121,6 +121,90 @@ __global__ void k3_down(float *__restrict__ hz,
     if (threadIdx.x == 0) hz[o] = t;
 }
 
+/* ---------------- packed 2-bit variant (format "k3-w2") ------------------
+ * Same ue8m0 block-32 scales, but the codes are 2-bit indices into the
+ * sign-symmetric codebook {-4,-1,1,4} -- 8 bytes per group instead of 16, so
+ * 2.25 bits/weight and 1.89x less to move per expert.
+ *
+ * Symmetry is the whole point: the L2-optimal 2-bit codebook is
+ * sign-asymmetric and degenerates these models (0/12 coherence in
+ * vllm-moet/docs/quality.md), while this set at the same L2 error matches the
+ * 4-bit baseline. Packing order is column-major within the byte -- bits 0-1
+ * are column 0 -- so the kernel shifts in column order with no permute. */
+__constant__ float c_w2_lut[4];
+static const float h_w2_lut[4] = { -4.f, -1.f, 1.f, 4.f };
+
+__device__ __forceinline__ float row_dot_w2(const unsigned char *pk, const unsigned char *sc,
+                                            const float *x, int ng) {
+    float acc = 0.f;
+    for (int g = threadIdx.x; g < ng; g += blockDim.x) {
+        const unsigned char *b = pk + (g << 3);      /* 32 values = 8 bytes */
+        const float *xs = x + (g << 5);
+        float p = 0.f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned char c = b[k];
+            p += xs[4*k+0] * c_w2_lut[ c        & 3]
+               + xs[4*k+1] * c_w2_lut[(c >> 2)  & 3]
+               + xs[4*k+2] * c_w2_lut[(c >> 4)  & 3]
+               + xs[4*k+3] * c_w2_lut[(c >> 6)  & 3];
+        }
+        acc += p * mx4_scale_dev(sc[g]);
+    }
+    return acc;
+}
+
+__global__ void k3_w2_gate_up_situ(float *__restrict__ gate,
+                                   const unsigned char *__restrict__ w1p,
+                                   const unsigned char *__restrict__ w1s,
+                                   const unsigned char *__restrict__ w3p,
+                                   const unsigned char *__restrict__ w3s,
+                                   const float *__restrict__ z,
+                                   int I, float beta1, float beta2) {
+    int o = blockIdx.x, ng = I >> 5;
+    size_t rb = (size_t)(I >> 2);                    /* 2 bits/weight */
+    __shared__ float sh[K3_THREADS / 32];
+    float a1 = row_dot_w2(w1p + (size_t)o * rb, w1s + (size_t)o * ng, z, ng);
+    float g1 = blk_reduce(a1, sh);
+    __syncthreads();
+    float a3 = row_dot_w2(w3p + (size_t)o * rb, w3s + (size_t)o * ng, z, ng);
+    float g3 = blk_reduce(a3, sh);
+    if (threadIdx.x == 0)
+        gate[o] = beta1 * tanhf(g1 / beta1) * (1.f / (1.f + expf(-g1)))
+                * beta2 * tanhf(g3 / beta2);
+}
+
+__global__ void k3_w2_down(float *__restrict__ hz,
+                           const unsigned char *__restrict__ w2p,
+                           const unsigned char *__restrict__ w2s,
+                           const float *__restrict__ gate, int I) {
+    int o = blockIdx.x, ng = I >> 5;
+    size_t rb = (size_t)(I >> 2);
+    __shared__ float sh[K3_THREADS / 32];
+    float a = row_dot_w2(w2p + (size_t)o * rb, w2s + (size_t)o * ng, gate, ng);
+    float t = blk_reduce(a, sh);
+    if (threadIdx.x == 0) hz[o] = t;
+}
+
+extern "C" int coli_k3_expert_w2(const void *w1p, const void *w1s,
+                                 const void *w2p, const void *w2s,
+                                 const void *w3p, const void *w3s,
+                                 float *hz, const float *z,
+                                 int latent, int inter, float beta1, float beta2) {
+    if (!g_ready || latent != g_latent || inter != g_inter) return 0;
+    if (!ck(cudaMemcpyAsync(g_z, z, (size_t)latent * sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "z upload")) return 0;
+    k3_w2_gate_up_situ<<<inter, K3_THREADS, 0, g_stream>>>(
+        g_gate, (const unsigned char *)w1p, (const unsigned char *)w1s,
+        (const unsigned char *)w3p, (const unsigned char *)w3s, g_z, latent, beta1, beta2);
+    k3_w2_down<<<latent, K3_THREADS, 0, g_stream>>>(
+        g_hz, (const unsigned char *)w2p, (const unsigned char *)w2s, g_gate, inter);
+    if (!ck(cudaMemcpyAsync(hz, g_hz, (size_t)latent * sizeof(float),
+                            cudaMemcpyDeviceToHost, g_stream), "hz download")) return 0;
+    if (!ck(cudaStreamSynchronize(g_stream), "expert sync")) return 0;
+    return 1;
+}
+
 extern "C" int coli_k3_init(int device, int latent, int inter) {
     if (g_ready) return 1;
     if ((latent & 31) || (inter & 31)) {
@@ -135,6 +219,7 @@ extern "C" int coli_k3_init(int device, int latent, int inter) {
         return 0;
     }
     if (!ck(cudaMemcpyToSymbol(c_mx4_lut, h_mx4_lut, sizeof(h_mx4_lut)), "lut upload")) return 0;
+    if (!ck(cudaMemcpyToSymbol(c_w2_lut, h_w2_lut, sizeof(h_w2_lut)), "w2 lut upload")) return 0;
     if (!ck(cudaStreamCreate(&g_stream), "stream") ||
         !ck(cudaMalloc(&g_z, (size_t)latent * sizeof(float)), "z scratch") ||
         !ck(cudaMalloc(&g_gate, (size_t)inter * sizeof(float)), "gate scratch") ||

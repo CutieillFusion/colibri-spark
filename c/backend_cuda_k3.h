@@ -28,6 +28,14 @@ int  coli_k3_expert(const void *w1p, const void *w1s,
                     float *hz, const float *z,
                     int latent, int inter, float beta1, float beta2);
 
+/* Same contract, packed 2-bit codes ({-4,-1,1,4} indices) instead of e2m1.
+ * Scales are unchanged ue8m0, so only the code unpacking differs. */
+int  coli_k3_expert_w2(const void *w1p, const void *w1s,
+                       const void *w2p, const void *w2s,
+                       const void *w3p, const void *w3s,
+                       float *hz, const float *z,
+                       int latent, int inter, float beta1, float beta2);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus
