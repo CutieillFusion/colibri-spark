@@ -116,7 +116,7 @@ typedef struct {                          /* KDA layer */
      * slice to the GPU every time (tensor count 1021 -> 1466, budget pinned at
      * 40 GB, attn 13.3 -> 19.9 s) because each fresh W carries a null cuda
      * handle. The view must outlive the call for the placement to be reused. */
-    W qs, ks, vs, gs; int sh_ready;
+    W qs, ks, vs, gs, os; int sh_ready;   /* os = o_proj column slice */
     float *conv_q, *conv_k, *conv_v;      /* [proj*4] depthwise taps, oldest first */
     float *fa, *fb;                       /* decay low-rank, f32 [hd,hidden] [proj,hd] */
     float *bp;                            /* beta proj f32 [heads,hidden] */
@@ -125,6 +125,10 @@ typedef struct {                          /* KDA layer */
 
 typedef struct {                          /* gated MLA layer */
     W qa, qb, kva, kvb, o, g;
+    /* Head-sharded views, same scheme as KDA: q_b/g rows by head, o columns.
+     * q_a and kv_a stay replicated -- they produce the shared latents every
+     * head consumes, and they are small (5.5 and 2 MB vs 44 MB for o/g). */
+    W qbs, gs_, os; int sh_ready;
     float *qa_ln, *kva_ln;
 } Mla;
 
@@ -316,6 +320,45 @@ static W w_rows(const W *w, int r0, int nrows){
     else {
         int64_t rb=((int64_t)w->I+1)/2, ng=((int64_t)w->I+w->gs-1)/w->gs;
         v.q4 = w->q4 + (int64_t)r0*rb; v.s = w->s + (int64_t)r0*ng;
+    }
+    return v;
+}
+
+
+/* Column slice of a dense W: y = W[:, i0:i0+n] @ x[i0:i0+n], i.e. the
+ * row-parallel half of tensor parallelism. Unlike w_rows this must COPY --
+ * a column range is strided across rows -- but the copy is contiguous WITHIN
+ * each row, so it is a per-row memcpy and the result is a normal W the GPU
+ * path can place and cache like any other.
+ *
+ * Costs half the original per rank (o_proj int4 is 44 MB/layer, so 22 MB), and
+ * in exchange the all-reduce shrinks: partial outputs are [hidden] = 7168
+ * floats instead of gathering [P] = 12288. Requires i0 aligned to the group
+ * size, which holds since i0 = head*128 and gs = 64. */
+static W w_cols(const W *w, int i0, int n){
+    W v = *w;
+    v.I = n;
+#ifdef COLI_CUDA
+    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0;
+#endif
+    int64_t O=w->O;
+    if(w->fmt==0){
+        v.f=falloc(O*n);
+        for(int64_t o=0;o<O;o++) memcpy(v.f+o*n, w->f+o*w->I+i0, (size_t)n*sizeof(float));
+    } else if(w->fmt==1){
+        v.q8=malloc((size_t)O*n);
+        if(!v.q8){fprintf(stderr,"OOM w_cols\n");exit(1);}
+        for(int64_t o=0;o<O;o++) memcpy(v.q8+o*n, w->q8+o*w->I+i0, (size_t)n);
+        /* fmt=1 scales are per ROW, so slicing the input leaves them alone */
+    } else {
+        int64_t rb=((int64_t)w->I+1)/2, ng=((int64_t)w->I+w->gs-1)/w->gs;
+        int64_t rbl=n/2,               ngl=n/w->gs;
+        v.q4=malloc((size_t)O*rbl); v.s=falloc(O*ngl);
+        if(!v.q4){fprintf(stderr,"OOM w_cols\n");exit(1);}
+        for(int64_t o=0;o<O;o++){
+            memcpy(v.q4+o*rbl, w->q4+o*rb+i0/2, (size_t)rbl);
+            memcpy(v.s+o*ngl,  w->s+o*ng+i0/w->gs, (size_t)ngl*sizeof(float));
+        }
     }
     return v;
 }
@@ -856,6 +899,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         if(!a->sh_ready){
             a->qs=w_rows(&a->q,p0,pn); a->ks=w_rows(&a->k,p0,pn);
             a->vs=w_rows(&a->v,p0,pn); a->gs=w_rows(&a->g,p0,pn);
+            a->os=w_cols(&a->o,p0,pn);          /* row-parallel o_proj */
             a->sh_ready=1;
         }
         /* One S=C call per projection into a COMPACT [C,pn] buffer, then
@@ -970,8 +1014,20 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
      * per layer is cheaper than adding a second collective. o_proj itself
      * stays replicated -- it needs a strided COLUMN slice, which a row view
      * cannot express. */
-    if(k3_net_world()>1) k3_net_allreduce(on,(size_t)C*P);
-    w_matmul(out,on,&a->o,C);
+    if(wsz>1 && hn>0){
+        /* Row-parallel: each rank multiplies only its own head columns, so the
+         * partial outputs sum to the full result. Reduces [C,hidden] rather
+         * than gathering [C,P] -- 7168 floats instead of 12288, and the
+         * separate gather disappears entirely. */
+        float *cmp=falloc((int64_t)C*pn);
+        for(int t=0;t<C;t++) memcpy(cmp+(int64_t)t*pn,on+(int64_t)t*P+p0,(size_t)pn*sizeof(float));
+        w_matmul(out,cmp,&a->os,C);
+        free(cmp);
+        k3_net_allreduce(out,(size_t)C*c->hidden);
+    } else if(wsz>1){
+        memset(out,0,(size_t)C*c->hidden*sizeof(float));
+        k3_net_allreduce(out,(size_t)C*c->hidden);
+    } else w_matmul(out,on,&a->o,C);
     free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
 }
 
@@ -986,7 +1042,24 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
     w_matmul(qa,x,&a->qa,C);
     for(int t=0;t<C;t++)
         rmsnorm_(qa+(int64_t)t*c->q_lora,qa+(int64_t)t*c->q_lora,a->qa_ln,c->q_lora,c->eps);
-    w_matmul(qv,qa,&a->qb,C);
+    int wsz=k3_net_world(), wrk=k3_net_rank();
+    int mh0=0, mh1=H;
+    if(wsz>1){ int per=(H+wsz-1)/wsz; mh0=wrk*per; mh1=mh0+per; if(mh1>H) mh1=H; if(mh0>H) mh0=H; }
+    int mhn=mh1-mh0;
+    if(wsz>1 && mhn>0 && !a->sh_ready){
+        a->qbs=w_rows(&a->qb,mh0*qh,mhn*qh);
+        a->gs_=w_rows(&a->g, mh0*vh,mhn*vh);
+        a->os =w_cols(&a->o, mh0*vh,mhn*vh);
+        a->sh_ready=1;
+    }
+    if(wsz>1 && mhn>0){
+        memset(qv,0,(size_t)C*H*qh*sizeof(float));
+        float *tq=falloc((int64_t)C*mhn*qh);
+        w_matmul(tq,qa,&a->qbs,C);
+        for(int t=0;t<C;t++) memcpy(qv+(int64_t)t*H*qh+mh0*qh,tq+(int64_t)t*mhn*qh,
+                                    (size_t)mhn*qh*sizeof(float));
+        free(tq);
+    } else w_matmul(qv,qa,&a->qb,C);
     w_matmul(ckv,x,&a->kva,C);
     for(int t=0;t<C;t++){                            /* append the whole chunk to the
                                                       * cache first: token t's scores
@@ -996,13 +1069,20 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
         rmsnorm_(Lrow,cv,a->kva_ln,kvl,c->eps);
         memcpy(Rrow,cv+kvl,qr*sizeof(float));        /* NoPE: cached raw, no rotation */
     }
-    w_matmul(gv,x,&a->g,C);
+    if(wsz>1 && mhn>0){
+        memset(gv,0,(size_t)C*H*vh*sizeof(float));
+        float *tg=falloc((int64_t)C*mhn*vh);
+        w_matmul(tg,x,&a->gs_,C);
+        for(int t=0;t<C;t++) memcpy(gv+(int64_t)t*H*vh+mh0*vh,tg+(int64_t)t*mhn*vh,
+                                    (size_t)mhn*vh*sizeof(float));
+        free(tg);
+    } else w_matmul(gv,x,&a->g,C);
     for(int tt=0;tt<C;tt++){
         int nt=pos0+tt+1;
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
         float *ctxt=ctx+(int64_t)tt*H*vh;
         #pragma omp parallel for schedule(static)
-        for(int h=0;h<H;h++){
+        for(int h=mh0;h<mh1;h++){
             const float *qp=qvt+(int64_t)h*qh, *qrp=qp+c->qk_nope;
             int rbase=h*(c->qk_nope+vh);
             float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
@@ -1026,7 +1106,17 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                 cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
         }
     }
-    w_matmul(out,ctx,&a->o,C);
+    if(wsz>1 && mhn>0){
+        float *cc=falloc((int64_t)C*mhn*vh);
+        for(int t=0;t<C;t++) memcpy(cc+(int64_t)t*mhn*vh,ctx+(int64_t)t*H*vh+mh0*vh,
+                                    (size_t)mhn*vh*sizeof(float));
+        w_matmul(out,cc,&a->os,C);
+        free(cc);
+        k3_net_allreduce(out,(size_t)C*c->hidden);
+    } else if(wsz>1){
+        memset(out,0,(size_t)C*c->hidden*sizeof(float));
+        k3_net_allreduce(out,(size_t)C*c->hidden);
+    } else w_matmul(out,ctx,&a->o,C);
     free(qa);free(qv);free(ckv);free(gv);free(ctx);
 }
 
