@@ -205,6 +205,90 @@ extern "C" int coli_k3_expert_w2(const void *w1p, const void *w1s,
     return 1;
 }
 
+/* ---------------- batched 2-bit experts (one launch per layer) -----------
+ * Per-expert dispatch costs two launches and a stream sync each: at 16 experts
+ * x 92 layers that is ~2944 launches and ~1472 syncs per token, which showed up
+ * as expert compute taking 0.86 s/token when the bytes moved imply ~0.24 s.
+ * Batching a whole layer's experts into one grid removes the syncs and lets the
+ * GPU overlap the small per-expert GEMVs. blockIdx.y selects the expert. */
+#define K3_BATCH_MAX 64
+
+typedef struct { const unsigned char *w1p,*w1s,*w2p,*w2s,*w3p,*w3s; } K3Expert;
+
+static K3Expert *g_dev_ex = nullptr;
+static float    *g_gate_b = nullptr, *g_hz_b = nullptr;
+static int       g_batch_cap = 0;
+
+__global__ void k3_w2_gate_up_situ_b(float *__restrict__ gate,
+                                     const K3Expert *__restrict__ ex,
+                                     const float *__restrict__ z,
+                                     int I, int O, float beta1, float beta2) {
+    int o = blockIdx.x, j = blockIdx.y, ng = I >> 5;
+    size_t rb = (size_t)(I >> 2);
+    __shared__ float sh[K3_THREADS / 32];
+    float a1 = row_dot_w2(ex[j].w1p + (size_t)o * rb, ex[j].w1s + (size_t)o * ng, z, ng);
+    float g1 = blk_reduce(a1, sh);
+    __syncthreads();
+    float a3 = row_dot_w2(ex[j].w3p + (size_t)o * rb, ex[j].w3s + (size_t)o * ng, z, ng);
+    float g3 = blk_reduce(a3, sh);
+    if (threadIdx.x == 0)
+        gate[(size_t)j * O + o] = beta1 * tanhf(g1 / beta1) * (1.f / (1.f + expf(-g1)))
+                                * beta2 * tanhf(g3 / beta2);
+}
+
+__global__ void k3_w2_down_b(float *__restrict__ hz, const K3Expert *__restrict__ ex,
+                             const float *__restrict__ gate, int I, int O) {
+    int o = blockIdx.x, j = blockIdx.y, ng = I >> 5;
+    size_t rb = (size_t)(I >> 2);
+    __shared__ float sh[K3_THREADS / 32];
+    float a = row_dot_w2(ex[j].w2p + (size_t)o * rb, ex[j].w2s + (size_t)o * ng,
+                         gate + (size_t)j * I, ng);
+    float t = blk_reduce(a, sh);
+    if (threadIdx.x == 0) hz[(size_t)j * O + o] = t;
+}
+
+static int ensure_batch(int n, int latent, int inter) {
+    if (n <= g_batch_cap) return 1;
+    if (g_dev_ex) { cudaFree(g_dev_ex); cudaFree(g_gate_b); cudaFree(g_hz_b); }
+    if (!ck(cudaMalloc(&g_dev_ex, (size_t)n * sizeof(K3Expert)), "batch desc") ||
+        !ck(cudaMalloc(&g_gate_b, (size_t)n * inter * sizeof(float)), "batch gate") ||
+        !ck(cudaMalloc(&g_hz_b, (size_t)n * latent * sizeof(float)), "batch hz")) {
+        g_batch_cap = 0; return 0;
+    }
+    g_batch_cap = n;
+    return 1;
+}
+
+/* hz_all is [n][latent]; the caller still folds in the routing weights. */
+extern "C" int coli_k3_expert_batch_w2(const void *const *w1p, const void *const *w1s,
+                                       const void *const *w2p, const void *const *w2s,
+                                       const void *const *w3p, const void *const *w3s,
+                                       int n, float *hz_all, const float *z,
+                                       int latent, int inter, float beta1, float beta2) {
+    if (!g_ready || n < 1 || n > K3_BATCH_MAX) return 0;
+    if (latent != g_latent || inter != g_inter) return 0;
+    if (!ensure_batch(n, latent, inter)) return 0;
+
+    K3Expert host[K3_BATCH_MAX];
+    for (int j = 0; j < n; j++) {
+        host[j].w1p = (const unsigned char *)w1p[j]; host[j].w1s = (const unsigned char *)w1s[j];
+        host[j].w2p = (const unsigned char *)w2p[j]; host[j].w2s = (const unsigned char *)w2s[j];
+        host[j].w3p = (const unsigned char *)w3p[j]; host[j].w3s = (const unsigned char *)w3s[j];
+    }
+    if (!ck(cudaMemcpyAsync(g_dev_ex, host, (size_t)n * sizeof(K3Expert),
+                            cudaMemcpyHostToDevice, g_stream), "batch desc upload")) return 0;
+    if (!ck(cudaMemcpyAsync(g_z, z, (size_t)latent * sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "z upload")) return 0;
+    dim3 gu((unsigned)inter, (unsigned)n), dn((unsigned)latent, (unsigned)n);
+    k3_w2_gate_up_situ_b<<<gu, K3_THREADS, 0, g_stream>>>(g_gate_b, g_dev_ex, g_z,
+                                                          latent, inter, beta1, beta2);
+    k3_w2_down_b<<<dn, K3_THREADS, 0, g_stream>>>(g_hz_b, g_dev_ex, g_gate_b, inter, latent);
+    if (!ck(cudaMemcpyAsync(hz_all, g_hz_b, (size_t)n * latent * sizeof(float),
+                            cudaMemcpyDeviceToHost, g_stream), "hz download")) return 0;
+    if (!ck(cudaStreamSynchronize(g_stream), "batch sync")) return 0;   /* ONE sync per layer */
+    return 1;
+}
+
 extern "C" int coli_k3_init(int device, int latent, int inter) {
     if (g_ready) return 1;
     if ((latent & 31) || (inter & 31)) {

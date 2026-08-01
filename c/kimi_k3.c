@@ -162,6 +162,7 @@ typedef struct {
     LCache *ecache;
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
     int w2_fd, w2_dfd;                    /* K3_W2_DIR store: buffered + O_DIRECT */
+    float *hz_batch;                      /* [64][latent] batched-expert results */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
     FILE *trace;
@@ -211,6 +212,7 @@ static int    g_k3_cuda = 0;
  * mid-token. Declared here because k3_cuda_report() below reports the split. */
 static int      g_k3_expert_gpu = 0;
 static uint64_t g_k3_exp_gpu = 0, g_k3_exp_cpu = 0;
+static int      g_k3_expert_batch = 0;   /* K3_EXPERT_BATCH=1; see the note at its use */
 static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
 static int    g_k3_cuda_ndev = 0;
 static int    g_k3_cuda_rr = 0;
@@ -555,6 +557,7 @@ static void expert_table_init(Model *m){
             fprintf(stderr,"[K3/W2] %s is %lld bytes, need %lld for %d MoE layers x %d experts"
                 " — refusing (incomplete pack)\n",p,(long long)sb.st_size,(long long)want,
                 nmoe,c->n_experts); exit(1); }
+        m->hz_batch=falloc((int64_t)64*c->latent);   /* K3_BATCH_MAX x latent */
         fprintf(stderr,"[K3/W2] packed 2-bit experts: %s, slot %.2f MiB, %d layers x %d = %.1f GB\n",
             p,m->e_slot/1048576.0,nmoe,c->n_experts,want/1e9);
         return;
@@ -704,6 +707,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     /* K3_EXPERT_GPU=1 moves the routed-expert matmuls onto the GPU. Needs a
      * device from K3_GPUS; measured on GB10 this is where ~84% of decode time
      * sits, of which only ~14% is I/O. */
+    g_k3_expert_batch = getenv("K3_EXPERT_BATCH")?atoi(getenv("K3_EXPERT_BATCH")):0;
     if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")) && g_k3_cuda)
         g_k3_expert_gpu = coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter);
     else if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")))
@@ -1059,7 +1063,7 @@ static void lp_submit(Model *m, int n){
 static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                                 const int *pfirst, const int *pcnt,
                                 const int *poslist, const float *wlist,
-                                const float *Z, int stride, float *U,
+                                const float *Z, int stride, int C, float *U,
                                 float *gate, float *up, float *hz){
     for(int base=0;base<nu;base+=LP_MAX){
         int nb=nu-base<LP_MAX?nu-base:LP_MAX;
@@ -1083,6 +1087,20 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
             }
             m->ebytes+=(uint64_t)nmiss*(uint64_t)m->e_slot;
         }
+        /* Decode (C==1) applies every expert to the SAME z, so a whole layer
+         * fits one launch. Prefill cannot: an expert serves several positions,
+         * each with its own z, and the batched kernel shares one. */
+        int batchable=0;
+#ifdef COLI_CUDA
+        /* OFF by default: measured 0.51 vs 0.58 tok/s. Collapsing a layer into
+         * one launch removes ~1472 syncs/token, but the per-expert loop below
+         * deliberately overlaps I/O with compute (expert j computes while j+1
+         * loads) and batching waits for ALL of them first -- eload went 5.1 ->
+         * 8.3 s, more than the syncs were worth. Keep it for the residency
+         * endgame, where there is no I/O left to hide and the trade reverses. */
+        batchable = (g_k3_expert_batch && C==1 && m->w2_fd && g_k3_expert_gpu && nb<=64);
+        for(int j=0;j<nb&&batchable;j++) if(pcnt[base+j]!=1) batchable=0;
+#endif
         for(int j=0;j<nb;j++){
             if(g_k3_pipe && qof[j]>=0 &&
                !atomic_load_explicit(&g_lp.ready[qof[j]],memory_order_acquire)){
@@ -1091,6 +1109,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                     usleep(50);
                 m->t_eload+=now_s()-t0;
             }
+            if(batchable) continue;     /* just wait here; compute below */
             int f=pfirst[base+j];
             for(int p2=0;p2<pcnt[base+j];p2++){
                 int t=poslist[f+p2];
@@ -1098,6 +1117,31 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                              U+(int64_t)t*stride,gate,up,hz);
             }
         }
+#ifdef COLI_CUDA
+        if(batchable){
+            const void *p1[64],*s1[64],*p2b[64],*s2b[64],*p3[64],*s3[64];
+            for(int j=0;j<nb;j++){
+                uint8_t *b=use[j]->buf;
+                p1[j]=b;                                   s1[j]=b+m->e_w1p;
+                p2b[j]=b+m->e_w1p+m->e_w1s;                s2b[j]=(uint8_t*)p2b[j]+m->e_w2p;
+                p3[j]=(uint8_t*)s2b[j]+m->e_w2s;           s3[j]=(uint8_t*)p3[j]+m->e_w1p;
+            }
+            if(coli_k3_expert_batch_w2(p1,s1,p2b,s2b,p3,s3,nb,m->hz_batch,Z,
+                                       m->c.latent,m->c.moe_inter,m->c.situ_b1,m->c.situ_b2)){
+                g_k3_exp_gpu+=nb;
+                for(int j=0;j<nb;j++){
+                    const float *h=m->hz_batch+(int64_t)j*m->c.latent;
+                    float wk=wlist[pfirst[base+j]];
+                    for(int i=0;i<m->c.latent;i++) U[i]+=wk*h[i];
+                }
+            } else {   /* batch refused: fall back to one-at-a-time, same math */
+                for(int j=0;j<nb;j++){
+                    int f=pfirst[base+j];
+                    expert_apply(m,use[j],Z,wlist[f],U,gate,up,hz);
+                }
+            }
+        }
+#endif
         /* promotion: swap the freshly-read slots into the layer LRU */
         LCache *lc=&m->ecache[li];
         int promo = nmiss<lc->cap ? nmiss : lc->cap;
@@ -1206,7 +1250,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
                 else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
             }
-        experts_apply_union(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,u,gate,up,hz);
+        experts_apply_union(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,C,u,gate,up,hz);
         free(map);free(uid);free(pcnt);free(pfirst);free(poslist);free(wlist);free(cur);
     }
     /* Sum the per-rank partial expert contributions. MUST precede the rmsnorm:
