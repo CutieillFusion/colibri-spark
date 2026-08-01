@@ -44,6 +44,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #define K3_NET_MAX 16
@@ -227,6 +228,45 @@ static void k3_net_barrier(void) {
     float x = 0.f;
     k3_net_allreduce(&x, 1);
     g_net_secs = 0; g_net_calls = 0;
+}
+
+/* ---- non-blocking form: issue on a worker thread, wait later ---------------
+ * Measured at 4 ranks: the collective costs 3.21 ms/call in-engine but only
+ * ~1.12 ms of that is transport -- the rest is rank arrival jitter, because
+ * top-16 routing lands unevenly across the e%world shards (expert counts per
+ * rank differed 10676..11392) and every barrier pays the max.
+ *
+ * Neither part can be made much faster, but both can be HIDDEN: the shared
+ * experts depend on x, not on the reduced accumulator, so they are legitimate
+ * independent work to run underneath. A worker thread is enough -- one
+ * collective is in flight at a time, the main thread never touches these
+ * sockets meanwhile, and it keeps the blocking implementation as the single
+ * source of truth. */
+static pthread_t g_ar_th;
+static float    *g_ar_v = NULL;
+static size_t    g_ar_n = 0;
+static int       g_ar_active = 0;
+
+static void *k3_ar_worker(void *unused) {
+    (void)unused;
+    k3_net_allreduce(g_ar_v, g_ar_n);
+    return NULL;
+}
+
+static void k3_net_allreduce_start(float *v, size_t n) {
+    if (g_net_world <= 1) return;
+    g_ar_v = v; g_ar_n = n;
+    if (pthread_create(&g_ar_th, NULL, k3_ar_worker, NULL) != 0) {
+        k3_net_allreduce(v, n);          /* fall back to blocking */
+        return;
+    }
+    g_ar_active = 1;
+}
+
+static void k3_net_allreduce_wait(void) {
+    if (g_net_world <= 1 || !g_ar_active) return;
+    pthread_join(g_ar_th, NULL);
+    g_ar_active = 0;
 }
 
 static void k3_net_finalize(void) {

@@ -1560,21 +1560,28 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     /* Sum the per-rank partial expert contributions. MUST precede the rmsnorm:
      * that norm is nonlinear, so reducing after it would not equal the
      * single-node result. 14 KB per token per layer — latency, not bandwidth. */
-    k3_net_allreduce(u,(size_t)C*LT);
+    /* Issue the reduce, then run the SHARED experts underneath it: they read x,
+     * not the reduced accumulator, so they are independent. At 4 ranks the
+     * collective is 3.21 ms of which only ~1.12 ms is transport -- the rest is
+     * arrival jitter -- and the shared experts are ~0.15 s/token, enough to
+     * cover most of it. Ordering is otherwise unchanged; out += sd still
+     * happens after lat_up. */
+    k3_net_allreduce_start(u,(size_t)C*LT);
     tp0=now_s();
-    for(int t=0;t<C;t++)
-        rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
-    m->t_rnorm+=now_s()-tp0; tp0=now_s();
-    w_matmul(out,u,&o->lat_up,C);
-    m->t_latent+=now_s()-tp0; tp0=now_s();
-    /* shared experts at full width */
     int shi=MI*c->n_shared;
     float *sg=falloc((int64_t)C*shi), *su=falloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
     w_matmul(sg,x,&o->sh_gate,C); w_matmul(su,x,&o->sh_up,C);
     for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
     w_matmul(sd,sg,&o->sh_down,C);
-    for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
     m->t_shared+=now_s()-tp0;
+    k3_net_allreduce_wait();
+    tp0=now_s();
+    for(int t=0;t<C;t++)
+        rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
+    m->t_rnorm+=now_s()-tp0; tp0=now_s();
+    w_matmul(out,u,&o->lat_up,C);
+    m->t_latent+=now_s()-tp0;
+    for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
     free(sco);free(idxs);free(wsels);free(keff);
     free(z);free(u);free(gate);free(up);free(hz);free(sg);free(su);free(sd);
 }
