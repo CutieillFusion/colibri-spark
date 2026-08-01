@@ -48,6 +48,31 @@ int main(void){
     printf("expert slot %.2f MiB | %.3f ms/expert | %.1f GB/s\n",
            slot/1048576.0, ms, (slot/1e9)/(ms/1e3));
     printf("-> 16 experts x 92 layers = %.2f s/token of expert compute\n", 16*92*ms/1e3);
+    /* Same kernel, DEVICE-resident weights: isolates zero-copy from the kernel. */
+    void *d1p=coli_k3_devcopy(w1p,w1p_n), *d1s=coli_k3_devcopy(w1s,w1s_n);
+    void *d2p=coli_k3_devcopy(w2p,w2p_n), *d2s=coli_k3_devcopy(w2s,w2s_n);
+    void *d3p=coli_k3_devcopy(w3p,w1p_n), *d3s=coli_k3_devcopy(w3s,w1s_n);
+    if(d1p&&d1s&&d2p&&d2s&&d3p&&d3s){
+        for(int i=0;i<20;i++) coli_k3_expert_w2(d1p,d1s,d2p,d2s,d3p,d3s,hz,z,latent,inter,4.f,25.f);
+        double t1=now();
+        for(int i=0;i<N;i++) coli_k3_expert_w2(d1p,d1s,d2p,d2s,d3p,d3s,hz,z,latent,inter,4.f,25.f);
+        double ms2=(now()-t1)*1e3/N;
+        printf("device-resident:  %.3f ms/expert | %.1f GB/s\n", ms2, (slot/1e9)/(ms2/1e3));
+    }
+    /* Batched: 16 experts, ONE sync. Isolates fixed per-call overhead. */
+    {
+        const int B=16;
+        const void *p1[16],*s1[16],*p2[16],*s2[16],*p3[16],*s3[16];
+        float *hzb=malloc(sizeof(float)*(size_t)B*latent);
+        for(int j=0;j<B;j++){ p1[j]=w1p; s1[j]=w1s; p2[j]=w2p; s2[j]=w2s; p3[j]=w3p; s3[j]=w3s; }
+        for(int i=0;i<5;i++) coli_k3_expert_batch_w2(p1,s1,p2,s2,p3,s3,B,hzb,z,latent,inter,4.f,25.f);
+        double t2=now(); const int M=40;
+        for(int i=0;i<M;i++) coli_k3_expert_batch_w2(p1,s1,p2,s2,p3,s3,B,hzb,z,latent,inter,4.f,25.f);
+        double ms3=(now()-t2)*1e3/M/B;
+        printf("batched x%d:       %.3f ms/expert | %.1f GB/s\n", B, ms3, (slot/1e9)/(ms3/1e3));
+        printf("-> 16 experts x 92 layers = %.2f s/token of expert compute\n", 16*92*ms3/1e3);
+        free(hzb);
+    }
     coli_k3_shutdown();
     return 0;
 }

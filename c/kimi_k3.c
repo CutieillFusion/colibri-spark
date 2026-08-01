@@ -124,6 +124,9 @@ typedef struct {                          /* gated MLA layer */
 
 typedef struct {                          /* LatentMoE */
     float *router, *rbias, *lat_norm;     /* [E,hidden] f32, [E], [latent] */
+    W router_w;                           /* same f32 buffer, so the router goes
+                                           * through w_matmul and lands on the GPU
+                                           * instead of quant.h's CPU f32 path */
     W lat_down, lat_up, sh_gate, sh_up, sh_down;
 } Moe;
 
@@ -688,6 +691,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         if(l->sparse){
             Moe *o=&l->moe;
             o->router=f32_load(m,NM("model.layers.%d.block_sparse_moe.gate.weight",i),(int64_t)c->n_experts*c->hidden);
+            /* 25.7 MB/layer x 92 = 2.36 GB/token. On the CPU f32 path that is
+             * ~0.21 s/token at the ~11 GB/s those cores manage; as a W it uses
+             * the same GPU dispatch as every other dense tensor. */
+            o->router_w.fmt=0; o->router_w.f=o->router;
+            o->router_w.O=c->n_experts; o->router_w.I=c->hidden;
             o->rbias =f32_load(m,NM("model.layers.%d.block_sparse_moe.gate.e_score_correction_bias",i),c->n_experts);
             o->lat_norm=f32_load(m,NM("model.layers.%d.block_sparse_moe.routed_expert_norm.weight",i),c->latent);
             w_load(m,&o->lat_down,NM("model.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",i),c->latent,c->hidden,bits);
@@ -1170,7 +1178,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     Cfg *c=&m->c; Moe *o=&l->moe;
     int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
     float *sco=falloc((int64_t)C*E);
-    matmul(sco,x,o->router,C,c->hidden,E);
+    w_matmul(sco,x,&o->router_w,C);
     int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
     int *keff=malloc((size_t)C*sizeof(int));
     if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}

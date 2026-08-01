@@ -44,6 +44,9 @@ int  coli_k3_expert_batch_w2(const void *const *w1p, const void *const *w1s,
                              int n, float *hz_all, const float *z,
                              int latent, int inter, float beta1, float beta2);
 
+/* Bench-only: device-resident copy, to separate zero-copy cost from kernel cost. */
+void *coli_k3_devcopy(const void *src, size_t n);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus
