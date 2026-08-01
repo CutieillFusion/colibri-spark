@@ -106,6 +106,7 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
      * of the owning Layer, so a CPU-only build and an un-placed tensor look
      * identical. */
     ColiCudaTensor *cuda; int cuda_device; int8_t cuda_failed, cuda_placed;
+    int8_t k3_reg, k3_dense_off;      /* zero-copy dense path: registered / declined */
 #endif
 } W;
 
@@ -168,6 +169,12 @@ typedef struct {
     float *hz_batch;                      /* [64][latent] batched-expert results */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
+    /* fine-grained moe breakdown (K3_PROFILE=1): coarse t_moe hid that
+     * routed experts were only ~1/5 of it, which sent one optimisation
+     * pass at the wrong term. */
+    double t_router, t_topk, t_latent, t_shared, t_expert, t_rnorm;
+    double t_ekernel;                     /* GPU call only, inside t_expert */
+    uint64_t n_ekernel;
     FILE *trace;
 } Model;
 
@@ -214,6 +221,13 @@ static int    g_k3_cuda = 0;
  * Cleared on any failure so a run degrades to the CPU path rather than dying
  * mid-token. Declared here because k3_cuda_report() below reports the split. */
 static int      g_k3_expert_gpu = 0;
+/* K3_DENSE_GPU: zero-copy dense GEMV. OFF by default -- measured a LOSS.
+ * The kernel is 5% faster in isolation (59.4 vs 56.5 GB/s) but reads weights
+ * from host memory, and host-mapped reads degrade ~3.6x while the expert
+ * loader is DMA-ing; the stock path keeps dense device-resident and is immune.
+ * Gating the whole block matters: registering the buffers is itself costly
+ * (~36 GB pinned) and cost 0.65 -> 0.55 tok/s even with the path disabled. */
+static int      g_k3_dense_gpu = 0;
 static uint64_t g_k3_exp_gpu = 0, g_k3_exp_cpu = 0;
 static int      g_k3_expert_batch = 0;   /* K3_EXPERT_BATCH=1; see the note at its use */
 static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
@@ -277,6 +291,24 @@ static void k3_cuda_report(void){
 /* ---------- W: load-time quantization + matvec ---------- */
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_CUDA
+    /* Zero-copy dense GEMV first: no upload and no duplicate of the weights,
+     * which is what frees RAM for the expert cache. Falls through to the
+     * uploading path when it declines (prefill, or x too big for shared). */
+    if(g_k3_dense_gpu && g_k3_cuda && !w->k3_dense_off && !omp_in_parallel() && S==1
+       && (w->fmt==1||w->fmt==4)){
+        W *mw=(W*)w;
+        if(!mw->k3_reg){
+            int64_t rb=(w->fmt==4)?((int64_t)w->I+1)/2:(int64_t)w->I;
+            int64_t nsc=(w->fmt==4)?((int64_t)w->I+w->gs-1)/w->gs:1;
+            if(coli_k3_register((void*)w_blob(w),(size_t)w->O*rb) &&
+               coli_k3_register(w->s,(size_t)w->O*nsc*sizeof(float))) mw->k3_reg=1;
+            else mw->k3_dense_off=1;
+        }
+        if(mw->k3_reg){
+            if(coli_k3_dense(y,x,w_blob(w),w->s,w->fmt,S,w->I,w->O,w->gs)) return;
+            mw->k3_dense_off=1;   /* declined for a stable reason; stop retrying */
+        }
+    }
     /* Serial path only: placement mutates w lazily and the CUDA driver must not
      * be entered from inside an OpenMP region (mirrors colibri.c's guard). */
     if(g_k3_cuda && !w->cuda_failed && !omp_in_parallel()){
@@ -727,6 +759,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * device from K3_GPUS; measured on GB10 this is where ~84% of decode time
      * sits, of which only ~14% is I/O. */
     g_k3_expert_batch = getenv("K3_EXPERT_BATCH")?atoi(getenv("K3_EXPERT_BATCH")):0;
+    g_k3_dense_gpu    = getenv("K3_DENSE_GPU")?atoi(getenv("K3_DENSE_GPU")):0;
     if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")) && g_k3_cuda)
         g_k3_expert_gpu = coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter);
     else if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")))
@@ -991,10 +1024,12 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
     if(g_k3_expert_gpu){
         /* One call replaces all three matmul_mxfp4's; SiTU is fused into the
          * first kernel's epilogue so `up` never leaves the device. */
+        double tk0=now_s();
         int ok = m->w2_fd ? coli_k3_expert_w2(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
                                 c->latent,c->moe_inter,c->situ_b1,c->situ_b2)
                           : coli_k3_expert(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
                                 c->latent,c->moe_inter,c->situ_b1,c->situ_b2);
+        m->t_ekernel+=now_s()-tk0; m->n_ekernel++;
         if(ok){
             g_k3_exp_gpu++;
             for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
@@ -1178,7 +1213,9 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     Cfg *c=&m->c; Moe *o=&l->moe;
     int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
     float *sco=falloc((int64_t)C*E);
+    double tp0=now_s();
     w_matmul(sco,x,&o->router_w,C);
+    m->t_router+=now_s()-tp0; tp0=now_s();
     int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
     int *keff=malloc((size_t)C*sizeof(int));
     if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
@@ -1215,9 +1252,11 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
         }
         keff[t]=Kt;
     }
+    m->t_topk+=now_s()-tp0; tp0=now_s();
     float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT);
     float *gate=falloc(MI), *up=falloc(MI), *hz=falloc(LT);
     w_matmul(z,x,&o->lat_down,C);
+    m->t_latent+=now_s()-tp0;
     memset(u,0,(size_t)C*LT*sizeof(float));
     /* union across the chunk: each unique expert loads ONCE and applies to
      * every position that selected it (position lists via counting sort).
@@ -1269,16 +1308,21 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 if(er->contig){ if(er->fd[0]>=0) posix_fadvise(er->fd[0],er->off[0],m->e_slot,POSIX_FADV_WILLNEED); }
                 else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
             }
+        double te0=now_s();
         experts_apply_union(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,C,u,gate,up,hz);
+        m->t_expert+=now_s()-te0;
         free(map);free(uid);free(pcnt);free(pfirst);free(poslist);free(wlist);free(cur);
     }
     /* Sum the per-rank partial expert contributions. MUST precede the rmsnorm:
      * that norm is nonlinear, so reducing after it would not equal the
      * single-node result. 14 KB per token per layer — latency, not bandwidth. */
     k3_net_allreduce(u,(size_t)C*LT);
+    tp0=now_s();
     for(int t=0;t<C;t++)
         rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
+    m->t_rnorm+=now_s()-tp0; tp0=now_s();
     w_matmul(out,u,&o->lat_up,C);
+    m->t_latent+=now_s()-tp0; tp0=now_s();
     /* shared experts at full width */
     int shi=MI*c->n_shared;
     float *sg=falloc((int64_t)C*shi), *su=falloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
@@ -1286,6 +1330,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
     w_matmul(sd,sg,&o->sh_down,C);
     for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
+    m->t_shared+=now_s()-tp0;
     free(sco);free(idxs);free(wsels);free(keff);
     free(z);free(u);free(gate);free(up);free(hz);free(sg);free(su);free(sd);
 }
@@ -1844,6 +1889,14 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+    fprintf(stderr,"[K3] moe split: router %.1fs topk %.1fs latent %.1fs experts %.1fs"
+            " (of which eload %.1fs) rnorm %.1fs shared %.1fs\n",
+            m.t_router,m.t_topk,m.t_latent,m.t_expert,m.t_eload,m.t_rnorm,m.t_shared);
+    fprintf(stderr,"[K3] expert region: GPU kernel %.1fs over %llu calls (%.3f ms each);"
+            " everything else in the region %.1fs\n",
+            m.t_ekernel,(unsigned long long)m.n_ekernel,
+            m.n_ekernel?1e3*m.t_ekernel/(double)m.n_ekernel:0.0,
+            m.t_expert-m.t_eload-m.t_ekernel);
     if(k3_net_world()>1)
         fprintf(stderr,"[K3/NET] allreduce %.1fs over %llu calls (%.2f ms each)\n",
             k3_net_secs(),(unsigned long long)k3_net_calls(),

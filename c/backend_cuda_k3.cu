@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "backend_cuda_k3.h"
 
@@ -481,4 +482,162 @@ extern "C" void coli_k3_shutdown(void) {
     cudaFree(g_z); cudaFree(g_gate); cudaFree(g_hz);
     cudaStreamDestroy(g_stream);
     g_ready = 0;
+}
+
+/* ---------------- K3 dense GEMV (fmt 1 = int8, fmt 4 = int4-g64) ----------
+ * backend_cuda.cu's quant_matmul carries the same three costs the expert
+ * kernel had, and it measured 59 GB/s against this one's 90+:
+ *   - one block per output row, reading x from GLOBAL every time, so the
+ *     activation vector is re-read by every block (the 16:1 traffic problem)
+ *   - a shared-memory block reduction with log2(256) = 8 __syncthreads
+ *   - fmt=4 does an integer DIVIDE per element (i / gs) to find the group
+ * Here: one warp per row, x staged in shared once per block, shuffle-only
+ * reduction, and a shift instead of the divide (gs is a power of two).
+ *
+ * Weights are read zero-copy from the host W buffers -- measured free on this
+ * integrated part -- so unlike coli_cuda_matmul this uploads nothing and
+ * duplicates nothing, returning ~36 GB of RAM to the expert cache, which is
+ * what actually binds decode.
+ *
+ * quant_matmul is left alone: it is shared with colibri/inkling and cannot be
+ * regression-tested from here.
+ */
+extern __shared__ float shx_d[];
+
+/* stage=1 copies x into shared; stage=0 reads it from global. Staging is only
+ * a win when x is SMALL: at I=12288 it costs 49 KB/block and drops occupancy to
+ * 1-2 blocks/SM, which measured 1.8x SLOWER than the stock kernel. The expert
+ * kernel benefits because its x is 3584 floats (14 KB); dense x is 7168-12288. */
+__global__ void k3_dense_i4g(float *__restrict__ y, const float *__restrict__ x,
+                             const unsigned char *__restrict__ q4,
+                             const float *__restrict__ scl,
+                             int I, int O, int gsh, int ng, int stage) {
+    const float *xv = x;
+    if (stage) {
+        for (int i = threadIdx.x; i < I; i += blockDim.x) shx_d[i] = x[i];
+        __syncthreads();
+        xv = shx_d;
+    }
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+    const unsigned char *w = q4 + (size_t)o * rb;
+    const float *s = scl + (size_t)o * ng;
+    int gsz = 1 << gsh;                       /* group size, power of two */
+    float acc = 0.f;
+    for (int g = lane; g < ng; g += 32) {
+        const unsigned char *b = w + ((size_t)g << (gsh - 1));   /* gsz/2 bytes */
+        const float *xs = xv + ((size_t)g << gsh);
+        int n = I - (g << gsh); if (n > gsz) n = gsz;
+        float p = 0.f;
+        for (int k = 0; k < (n >> 1); k++) {
+            unsigned char c = b[k];
+            p += xs[2*k]   * (float)((int)(c & 0xF) - 8)
+               + xs[2*k+1] * (float)((int)(c >> 4)  - 8);
+        }
+        acc += p * s[g];
+    }
+    #pragma unroll
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[o] = acc;
+}
+
+__global__ void k3_dense_i8(float *__restrict__ y, const float *__restrict__ x,
+                            const signed char *__restrict__ q8,
+                            const float *__restrict__ scl, int I, int O, int stage) {
+    const float *xv = x;
+    if (stage) {
+        for (int i = threadIdx.x; i < I; i += blockDim.x) shx_d[i] = x[i];
+        __syncthreads();
+        xv = shx_d;
+    }
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    const signed char *w = q8 + (size_t)o * I;
+    float acc = 0.f;
+    for (int i = lane; i < I; i += 32) acc += xv[i] * (float)w[i];
+    #pragma unroll
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[o] = acc * scl[o];
+}
+
+static int    g_dense_attr = 0;
+static int    g_dense_shmax = 0;
+static float *g_dx = nullptr, *g_dy = nullptr;
+static int    g_dx_cap = 0, g_dy_cap = 0;
+
+/* x and y are ordinary host buffers the kernel cannot address, so stage them
+ * through device scratch like the expert path does. Both are small next to the
+ * weights (28 KB of x, <=640 KB of y) -- it is the WEIGHTS that must not be
+ * copied, and those stay zero-copy. */
+static int ensure_dense_scratch(int I, int O) {
+    if (I > g_dx_cap) {
+        if (g_dx) cudaFree(g_dx);
+        if (!ck(cudaMalloc(&g_dx, (size_t)I * sizeof(float)), "dense x scratch")) { g_dx_cap = 0; return 0; }
+        g_dx_cap = I;
+    }
+    if (O > g_dy_cap) {
+        if (g_dy) cudaFree(g_dy);
+        if (!ck(cudaMalloc(&g_dy, (size_t)O * sizeof(float)), "dense y scratch")) { g_dy_cap = 0; return 0; }
+        g_dy_cap = O;
+    }
+    return 1;
+}
+
+/* S==1 only (decode GEMV). Returns 0 when it cannot help, so the caller keeps
+ * its existing path for prefill and for shapes whose x will not fit shared. */
+extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const float *scales,
+                             int fmt, int S, int I, int O, int gs) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("K3_DENSE_GPU"); en = e ? atoi(e) : 0; }
+    if (!en && !getenv("K3_DENSE_BENCH")) return 0;      /* off by default: see below */
+    if (!g_ready || S != 1 || I <= 0 || O <= 0) return 0;
+    /* Only stage when x is small enough that shared memory does not throttle
+     * occupancy. 16 KB keeps >=4 blocks/SM; beyond that, global + L1 wins. */
+    int stage = ((size_t)I * sizeof(float) <= 16u * 1024u);
+    { const char *fs = getenv("K3_DENSE_STAGE"); if (fs) stage = atoi(fs); }
+    if (stage && (size_t)I * sizeof(float) > 96u * 1024u) stage = 0;
+    size_t shbytes = stage ? (size_t)I * sizeof(float) : 0;
+    if (fmt != 1 && fmt != 4) return 0;
+    int gsh = 0;
+    if (fmt == 4) {
+        if (gs <= 0 || (gs & (gs - 1))) return 0;        /* need a power of two */
+        while ((1 << gsh) < gs) gsh++;
+        if (I & (gs - 1)) return 0;                      /* whole groups only */
+    }
+    if (!g_dense_attr) {
+        /* Query the opt-in limit rather than assuming: sm_121 caps dynamic
+         * shared near 99 KB, and asking for 100 KB fails, leaving a STICKY
+         * CUDA error that then breaks every later launch -- including
+         * coli_cuda_matmul's, which made the stock path look like it was
+         * declining when it was simply poisoned. */
+        int mx = 0;
+        cudaDeviceGetAttribute(&mx, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        if (mx > 0) {
+            cudaFuncSetAttribute(k3_dense_i4g, cudaFuncAttributeMaxDynamicSharedMemorySize, mx);
+            cudaFuncSetAttribute(k3_dense_i8,  cudaFuncAttributeMaxDynamicSharedMemorySize, mx);
+        }
+        g_dense_shmax = mx;
+        cudaGetLastError();                               /* clear, do not inherit */
+        g_dense_attr = 1;
+    }
+    if (stage && shbytes > (size_t)g_dense_shmax) { stage = 0; shbytes = 0; }
+    if (!ensure_dense_scratch(I, O)) return 0;
+    if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)I * sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "dense x upload")) return 0;
+    int blocks = (O + K3_WARPS - 1) / K3_WARPS;
+    if (fmt == 4) {
+        int ng = (I + gs - 1) / gs;
+        k3_dense_i4g<<<blocks, K3_FAST_THREADS, shbytes, g_stream>>>(
+            g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng, stage);
+    } else {
+        k3_dense_i8<<<blocks, K3_FAST_THREADS, shbytes, g_stream>>>(
+            g_dy, g_dx, (const signed char *)w, scales, I, O, stage);
+    }
+    if (!ck(cudaGetLastError(), "dense launch")) return 0;
+    if (!ck(cudaMemcpyAsync(y, g_dy, (size_t)O * sizeof(float),
+                            cudaMemcpyDeviceToHost, g_stream), "dense y download")) return 0;
+    return ck(cudaStreamSynchronize(g_stream), "dense sync");
 }

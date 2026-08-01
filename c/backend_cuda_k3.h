@@ -47,6 +47,12 @@ int  coli_k3_expert_batch_w2(const void *const *w1p, const void *const *w1s,
 /* Bench-only: device-resident copy, to separate zero-copy cost from kernel cost. */
 void *coli_k3_devcopy(const void *src, size_t n);
 
+/* Dense GEMV for K3's own w_matmul: warp-per-row, x staged in shared memory,
+ * weights read zero-copy from the host buffers (no upload, no duplication).
+ * S==1 only; returns 0 when it declines so the caller keeps its old path. */
+int  coli_k3_dense(float *y, const float *x, const void *w, const float *scales,
+                   int fmt, int S, int I, int O, int gs);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus

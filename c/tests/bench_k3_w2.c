@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <time.h>
 #include "../backend_cuda_k3.h"
 
@@ -59,6 +60,39 @@ int main(void){
         double ms2=(now()-t1)*1e3/N;
         printf("device-resident:  %.3f ms/expert | %.1f GB/s\n", ms2, (slot/1e9)/(ms2/1e3));
     }
+    /* COLD: cycle through many distinct experts so nothing stays cache-resident.
+     * The single-buffer numbers above reuse one 8.86 MB expert hundreds of
+     * times, which is L2-hot and NOT what the engine does -- it streams a
+     * different expert every call. This is the number that should match the
+     * engine. */
+    {
+        const int NE = 48;                     /* 48 x 8.86 MB = 425 MB, far past any cache */
+        uint8_t **c1p=malloc(NE*sizeof(void*)), **c1s=malloc(NE*sizeof(void*));
+        uint8_t **c2p=malloc(NE*sizeof(void*)), **c2s=malloc(NE*sizeof(void*));
+        uint8_t **c3p=malloc(NE*sizeof(void*)), **c3s=malloc(NE*sizeof(void*));
+        int okc=1;
+        for(int j=0;j<NE&&okc;j++){
+            if(posix_memalign((void**)&c1p[j],4096,w1p_n)||posix_memalign((void**)&c1s[j],4096,w1s_n)||
+               posix_memalign((void**)&c2p[j],4096,w2p_n)||posix_memalign((void**)&c2s[j],4096,w2s_n)||
+               posix_memalign((void**)&c3p[j],4096,w1p_n)||posix_memalign((void**)&c3s[j],4096,w1s_n)){ okc=0; break; }
+            memcpy(c1p[j],w1p,w1p_n); memcpy(c1s[j],w1s,w1s_n);
+            memcpy(c2p[j],w2p,w2p_n); memcpy(c2s[j],w2s,w2s_n);
+            memcpy(c3p[j],w3p,w1p_n); memcpy(c3s[j],w3s,w1s_n);
+            coli_k3_register(c1p[j],w1p_n); coli_k3_register(c1s[j],w1s_n);
+            coli_k3_register(c2p[j],w2p_n); coli_k3_register(c2s[j],w2s_n);
+            coli_k3_register(c3p[j],w1p_n); coli_k3_register(c3s[j],w1s_n);
+        }
+        if(okc){
+            for(int i=0;i<NE;i++) coli_k3_expert_w2(c1p[i],c1s[i],c2p[i],c2s[i],c3p[i],c3s[i],hz,z,latent,inter,4.f,25.f);
+            double tc=now(); const int K=NE*4;
+            for(int i=0;i<K;i++){ int j=i%NE;
+                coli_k3_expert_w2(c1p[j],c1s[j],c2p[j],c2s[j],c3p[j],c3s[j],hz,z,latent,inter,4.f,25.f); }
+            double msc=(now()-tc)*1e3/K;
+            printf("COLD (%d distinct):  %.3f ms/expert | %.1f GB/s\n", NE, msc, (slot/1e9)/(msc/1e3));
+            printf("-> 16 experts x 92 layers = %.2f s/token of expert compute\n", 16*92*msc/1e3);
+        } else printf("COLD: alloc failed\n");
+    }
+
     /* Batched: 16 experts, ONE sync. Isolates fixed per-call overhead. */
     {
         const int B=16;
