@@ -186,6 +186,81 @@ __global__ void k3_w2_down(float *__restrict__ hz,
     if (threadIdx.x == 0) hz[o] = t;
 }
 
+/* ---------------- warp-per-row 2-bit kernels (the fast path) --------------
+ * The block-per-row layout above measured 15 GB/s against 59 GB/s for the
+ * dense path on the same GPU. Cause: one 896-byte row spread over 128 threads
+ * is ~7 bytes/thread, plus shared memory and two __syncthreads for the block
+ * reductions, plus byte-at-a-time loads.
+ *
+ * Here one WARP owns a row and eight warps share a block:
+ *   - 56 bytes/thread instead of 7
+ *   - reduction is pure __shfl_down: no shared memory, no block sync
+ *   - 8-byte loads. Safe only for the w2 store, whose slots are 4096-aligned
+ *     and whose w1p/w1s offsets are multiples of 16 -- the MXFP4 path reads
+ *     HF shard offsets that carry no such guarantee, which is why it uses
+ *     byte loads.
+ *   - lane L takes groups L, L+32, ... so a warp's 32 lanes read 256
+ *     contiguous bytes: fully coalesced.
+ */
+#define K3_WARPS 8
+#define K3_FAST_THREADS (K3_WARPS * 32)
+
+__device__ __forceinline__ float warp_row_dot_w2(const unsigned char *__restrict__ pk,
+                                                 const unsigned char *__restrict__ sc,
+                                                 const float *__restrict__ x,
+                                                 int ng, int lane) {
+    float acc = 0.f;
+    for (int g = lane; g < ng; g += 32) {
+        unsigned long long v = *(const unsigned long long *)(pk + (g << 3));
+        const float *xs = x + (g << 5);
+        float p = 0.f;
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            unsigned int c = (unsigned int)((v >> (8 * k)) & 0xFFull);
+            p += xs[4*k+0] * c_w2_lut[ c        & 3]
+               + xs[4*k+1] * c_w2_lut[(c >> 2)  & 3]
+               + xs[4*k+2] * c_w2_lut[(c >> 4)  & 3]
+               + xs[4*k+3] * c_w2_lut[(c >> 6)  & 3];
+        }
+        acc += p * mx4_scale_dev(sc[g]);
+    }
+    #pragma unroll
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    return acc;                                   /* lane 0 holds the total */
+}
+
+__global__ void k3_w2_gate_up_fast(float *__restrict__ gate,
+                                   const unsigned char *__restrict__ w1p,
+                                   const unsigned char *__restrict__ w1s,
+                                   const unsigned char *__restrict__ w3p,
+                                   const unsigned char *__restrict__ w3s,
+                                   const float *__restrict__ z,
+                                   int I, int O, float beta1, float beta2) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    int ng = I >> 5;
+    size_t rb = (size_t)(I >> 2);
+    float g1 = warp_row_dot_w2(w1p + (size_t)o * rb, w1s + (size_t)o * ng, z, ng, lane);
+    float g3 = warp_row_dot_w2(w3p + (size_t)o * rb, w3s + (size_t)o * ng, z, ng, lane);
+    if (lane == 0)
+        gate[o] = beta1 * tanhf(g1 / beta1) * (1.f / (1.f + expf(-g1)))
+                * beta2 * tanhf(g3 / beta2);
+}
+
+__global__ void k3_w2_down_fast(float *__restrict__ hz,
+                                const unsigned char *__restrict__ w2p,
+                                const unsigned char *__restrict__ w2s,
+                                const float *__restrict__ gate, int I, int O) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    int ng = I >> 5;
+    size_t rb = (size_t)(I >> 2);
+    float t = warp_row_dot_w2(w2p + (size_t)o * rb, w2s + (size_t)o * ng, gate, ng, lane);
+    if (lane == 0) hz[o] = t;
+}
+
 extern "C" int coli_k3_expert_w2(const void *w1p, const void *w1s,
                                  const void *w2p, const void *w2s,
                                  const void *w3p, const void *w3s,
@@ -194,11 +269,13 @@ extern "C" int coli_k3_expert_w2(const void *w1p, const void *w1s,
     if (!g_ready || latent != g_latent || inter != g_inter) return 0;
     if (!ck(cudaMemcpyAsync(g_z, z, (size_t)latent * sizeof(float),
                             cudaMemcpyHostToDevice, g_stream), "z upload")) return 0;
-    k3_w2_gate_up_situ<<<inter, K3_THREADS, 0, g_stream>>>(
+    int gu_blocks = (inter + K3_WARPS - 1) / K3_WARPS;
+    int dn_blocks = (latent + K3_WARPS - 1) / K3_WARPS;
+    k3_w2_gate_up_fast<<<gu_blocks, K3_FAST_THREADS, 0, g_stream>>>(
         g_gate, (const unsigned char *)w1p, (const unsigned char *)w1s,
-        (const unsigned char *)w3p, (const unsigned char *)w3s, g_z, latent, beta1, beta2);
-    k3_w2_down<<<latent, K3_THREADS, 0, g_stream>>>(
-        g_hz, (const unsigned char *)w2p, (const unsigned char *)w2s, g_gate, inter);
+        (const unsigned char *)w3p, (const unsigned char *)w3s, g_z, latent, inter, beta1, beta2);
+    k3_w2_down_fast<<<dn_blocks, K3_FAST_THREADS, 0, g_stream>>>(
+        g_hz, (const unsigned char *)w2p, (const unsigned char *)w2s, g_gate, inter, latent);
     if (!ck(cudaMemcpyAsync(hz, g_hz, (size_t)latent * sizeof(float),
                             cudaMemcpyDeviceToHost, g_stream), "hz download")) return 0;
     if (!ck(cudaStreamSynchronize(g_stream), "expert sync")) return 0;

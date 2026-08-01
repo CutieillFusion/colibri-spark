@@ -541,25 +541,36 @@ static void expert_table_init(Model *m){
                         m->e_w1p+m->e_w1s+m->e_w2p,
                         m->e_w1p+m->e_w1s+m->e_w2p+m->e_w2s,
                         2*m->e_w1p+m->e_w1s+m->e_w2p+m->e_w2s};
+        /* K3_W2_SHARD=r/N: this store holds only experts with e%N==r, packed
+         * contiguously, so each node carries 1/N of the 766 GB. Matches the
+         * e%world expert-parallel split in moe_forward, and is what makes a
+         * RAM-resident expert set reachable at all. */
+        int sr=0,sw=1;
+        if(getenv("K3_W2_SHARD") && sscanf(getenv("K3_W2_SHARD"),"%d/%d",&sr,&sw)==2 && sw>0){
+            if(c->n_experts%sw){ fprintf(stderr,"[K3/W2] %d experts not divisible by %d\n",
+                c->n_experts,sw); exit(1); }
+        } else { sr=0; sw=1; }
+        int Eloc=c->n_experts/sw;
         int nmoe=0;
         for(int li=0;li<c->n_layers;li++){
             if(!m->L[li].sparse) continue;
             for(int e2=0;e2<c->n_experts;e2++){
                 ERef *er=&m->eref[(int64_t)li*c->n_experts+e2];
-                int64_t base=((int64_t)nmoe*c->n_experts+e2)*m->e_slot;
+                if(sw>1 && e2%sw!=sr){ for(int k=0;k<6;k++) er->fd[k]=-1; continue; }
+                int64_t base=((int64_t)nmoe*Eloc+e2/sw)*m->e_slot;
                 for(int k=0;k<6;k++){ er->fd[k]=fd; er->off[k]=base+off[k]; }
                 er->contig=1;              /* one pread per expert */
             }
             nmoe++;
         }
-        struct stat sb; int64_t want=(int64_t)nmoe*c->n_experts*m->e_slot;
+        struct stat sb; int64_t want=(int64_t)nmoe*Eloc*m->e_slot;
         if(fstat(fd,&sb)==0 && sb.st_size<want){
             fprintf(stderr,"[K3/W2] %s is %lld bytes, need %lld for %d MoE layers x %d experts"
                 " — refusing (incomplete pack)\n",p,(long long)sb.st_size,(long long)want,
-                nmoe,c->n_experts); exit(1); }
+                nmoe,Eloc); exit(1); }
         m->hz_batch=falloc((int64_t)64*c->latent);   /* K3_BATCH_MAX x latent */
-        fprintf(stderr,"[K3/W2] packed 2-bit experts: %s, slot %.2f MiB, %d layers x %d = %.1f GB\n",
-            p,m->e_slot/1048576.0,nmoe,c->n_experts,want/1e9);
+        fprintf(stderr,"[K3/W2] packed 2-bit experts: %s, slot %.2f MiB, %d layers x %d"
+            " (shard %d/%d) = %.1f GB\n",p,m->e_slot/1048576.0,nmoe,Eloc,sr,sw,want/1e9);
         return;
     }
     const char *mat[3]={"w1","w2","w3"};
