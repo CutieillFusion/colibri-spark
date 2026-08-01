@@ -238,6 +238,12 @@ static int      g_k3_expert_gpu = 0;
  * Gating the whole block matters: registering the buffers is itself costly
  * (~36 GB pinned) and cost 0.65 -> 0.55 tok/s even with the path disabled. */
 static int      g_k3_dense_gpu = 0;
+/* K3_TP_ATTN=0 disables tensor-parallel attention, leaving dense replicated.
+ * TP attention adds a SECOND collective per layer (186/token instead of 93).
+ * At 2 nodes that was worth it (+12%, collective 1.37 ms). At 4 nodes the
+ * collective costs 3.41 ms, so 93 extra of them is ~0.32 s/token against a
+ * sharding saving of ~0.2 -- net negative. Keep it on for 2 nodes, off for 4. */
+static int      g_k3_tp_attn = 1;
 static uint64_t g_k3_exp_gpu = 0, g_k3_exp_cpu = 0;
 static int      g_k3_expert_batch = 0;   /* K3_EXPERT_BATCH=1; see the note at its use */
 static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
@@ -873,6 +879,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * sits, of which only ~14% is I/O. */
     g_k3_expert_batch = getenv("K3_EXPERT_BATCH")?atoi(getenv("K3_EXPERT_BATCH")):0;
     g_k3_dense_gpu    = getenv("K3_DENSE_GPU")?atoi(getenv("K3_DENSE_GPU")):0;
+    g_k3_tp_attn      = getenv("K3_TP_ATTN")?atoi(getenv("K3_TP_ATTN")):1;
     if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")) && g_k3_cuda)
         g_k3_expert_gpu = coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter);
     else if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")))
@@ -925,7 +932,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
      * per-head loop and the conv/recurrent state keep their existing indexing;
      * only the slices this rank owns are filled, and `on` is reduced to full
      * width before o_proj. */
-    int wsz=k3_net_world(), wrk=k3_net_rank();
+    int wsz=g_k3_tp_attn?k3_net_world():1, wrk=k3_net_rank();
     int h0=0, h1=H;
     if(wsz>1){ int per=(H+wsz-1)/wsz; h0=wrk*per; h1=h0+per; if(h1>H) h1=H; if(h0>H) h0=H; }
     int hn=h1-h0, pn=hn*hd, p0=h0*hd;
@@ -1108,7 +1115,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
     w_matmul(qa,x,&a->qa,C);
     for(int t=0;t<C;t++)
         rmsnorm_(qa+(int64_t)t*c->q_lora,qa+(int64_t)t*c->q_lora,a->qa_ln,c->q_lora,c->eps);
-    int wsz=k3_net_world(), wrk=k3_net_rank();
+    int wsz=g_k3_tp_attn?k3_net_world():1, wrk=k3_net_rank();
     int mh0=0, mh1=H;
     if(wsz>1){ int per=(H+wsz-1)/wsz; mh0=wrk*per; mh1=mh0+per; if(mh1>H) mh1=H; if(mh0>H) mh0=H; }
     int mhn=mh1-mh0;
