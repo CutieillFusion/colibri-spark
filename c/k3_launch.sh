@@ -24,7 +24,7 @@ HOSTS=(spark1 spark2 spark3 spark4)
 UP=("" 10.10.12.1 192.168.0.159 10.10.34.1)     # per-rank upstream address
 
 COMMON="K3_WORLD=$WORLD K3_GROUP_SIZE=2 K3_MASTER_PORT=$PORT \
-K3_GPUS=0 K3_GPU_GB=40 K3_EXPERT_GPU=1 K3_EXPERT_GB=28 K3_MAXT=512 OMP_NUM_THREADS=20"
+K3_GPUS=0 K3_GPU_GB=40 K3_EXPERT_GPU=1 K3_EXPERT_GB=${K3_EGB:-28} K3_MAXT=512 OMP_NUM_THREADS=20"
 
 # Per-rank 2-bit expert store. Rank 0 keeps the FULL store: expert parallelism
 # means it only ever reads e%world==0, and full-store indexing already places

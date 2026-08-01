@@ -116,7 +116,7 @@ typedef struct {                          /* KDA layer */
      * slice to the GPU every time (tensor count 1021 -> 1466, budget pinned at
      * 40 GB, attn 13.3 -> 19.9 s) because each fresh W carries a null cuda
      * handle. The view must outlive the call for the placement to be reused. */
-    W qs, ks, vs, gs, os; int sh_ready;   /* os = o_proj column slice */
+    W qs, ks, vs, gs, os, qkvg; int sh_ready, fuse;  /* qkvg = fused q|k|v|g */
     float *conv_q, *conv_k, *conv_v;      /* [proj*4] depthwise taps, oldest first */
     float *fa, *fb;                       /* decay low-rank, f32 [hd,hidden] [proj,hd] */
     float *bp;                            /* beta proj f32 [heads,hidden] */
@@ -358,6 +358,39 @@ static W w_cols(const W *w, int i0, int n){
         for(int64_t o=0;o<O;o++){
             memcpy(v.q4+o*rbl, w->q4+o*rb+i0/2, (size_t)rbl);
             memcpy(v.s+o*ngl,  w->s+o*ng+i0/w->gs, (size_t)ngl*sizeof(float));
+        }
+    }
+    return v;
+}
+
+
+/* Fuse four same-shaped projections that share an input into ONE W.
+ * q/k/v/g are each [P,hidden] applied to the same x, so concatenating their
+ * rows makes a single [4*n, hidden] matmul. Attention stopped responding to
+ * weight-traffic cuts (halving q/k/v/g AND o_proj left attn at 11.8 s), which
+ * says it is bound by per-call GPU round trips -- ~6 matmuls/layer x 93, each
+ * an upload/download/sync. This removes three of the four for the largest of
+ * them. Copies the head slice only, so under TP it costs 4*pn rows, not 4*P. */
+static W w_concat4(const W *a, const W *b, const W *c, const W *d, int r0, int n){
+    const W *src[4]={a,b,c,d};
+    W v=*a; v.O=4*n;
+#ifdef COLI_CUDA
+    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0;
+#endif
+    if(a->fmt==1){
+        v.q8=malloc((size_t)4*n*a->I); v.s=falloc((int64_t)4*n);
+        if(!v.q8){fprintf(stderr,"OOM w_concat4\n");exit(1);}
+        for(int j=0;j<4;j++){
+            memcpy(v.q8+(int64_t)j*n*a->I, src[j]->q8+(int64_t)r0*a->I, (size_t)n*a->I);
+            memcpy(v.s+(int64_t)j*n,       src[j]->s+r0,                (size_t)n*sizeof(float));
+        }
+    } else {
+        int64_t rb=((int64_t)a->I+1)/2, ng=((int64_t)a->I+a->gs-1)/a->gs;
+        v.q4=malloc((size_t)4*n*rb); v.s=falloc((int64_t)4*n*ng);
+        if(!v.q4){fprintf(stderr,"OOM w_concat4\n");exit(1);}
+        for(int j=0;j<4;j++){
+            memcpy(v.q4+(int64_t)j*n*rb, src[j]->q4+(int64_t)r0*rb, (size_t)n*rb);
+            memcpy(v.s+(int64_t)j*n*ng,  src[j]->s+(int64_t)r0*ng,  (size_t)n*ng*sizeof(float));
         }
     }
     return v;
@@ -900,18 +933,36 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             a->qs=w_rows(&a->q,p0,pn); a->ks=w_rows(&a->k,p0,pn);
             a->vs=w_rows(&a->v,p0,pn); a->gs=w_rows(&a->g,p0,pn);
             a->os=w_cols(&a->o,p0,pn);          /* row-parallel o_proj */
+            /* K3_FUSE_QKVG=1: measured NEUTRAL (0.78 vs 0.77, inside run-to-run
+             * noise) while costing ~6.4 GB RSS, so it is opt-in. It does what it
+             * claims -- GPU tensor count 1021 -> 814, four launches per layer
+             * become one -- which is itself the finding: attention responds
+             * neither to halving its weight traffic nor to removing 207 round
+             * trips per token, so the cost is somewhere neither hypothesis
+             * reached and wants a CUDA profiler, not another guess. */
+            a->fuse = getenv("K3_FUSE_QKVG") && atoi(getenv("K3_FUSE_QKVG"));
+            if(a->fuse) a->qkvg=w_concat4(&a->q,&a->k,&a->v,&a->g,p0,pn);
             a->sh_ready=1;
         }
-        /* One S=C call per projection into a COMPACT [C,pn] buffer, then
-         * scatter. Looping per token issued C times the GPU round trips. */
-        float *tmp=falloc((int64_t)C*pn);
-        W *sw[4]={&a->qs,&a->ks,&a->vs,&a->gs}; float *dst[4]={q,k,v,gp};
-        for(int u2=0;u2<4;u2++){
-            w_matmul(tmp,x,sw[u2],C);
-            for(int t=0;t<C;t++)
-                memcpy(dst[u2]+(int64_t)t*P+p0,tmp+(int64_t)t*pn,(size_t)pn*sizeof(float));
+        float *dst[4]={q,k,v,gp};
+        if(a->fuse){                       /* ONE call for all four, then scatter */
+            float *tmp=falloc((int64_t)C*4*pn);
+            w_matmul(tmp,x,&a->qkvg,C);
+            for(int u2=0;u2<4;u2++)
+                for(int t=0;t<C;t++)
+                    memcpy(dst[u2]+(int64_t)t*P+p0,
+                           tmp+(int64_t)t*4*pn+(int64_t)u2*pn,(size_t)pn*sizeof(float));
+            free(tmp);
+        } else {
+            float *tmp=falloc((int64_t)C*pn);
+            W *sw[4]={&a->qs,&a->ks,&a->vs,&a->gs};
+            for(int u2=0;u2<4;u2++){
+                w_matmul(tmp,x,sw[u2],C);
+                for(int t=0;t<C;t++)
+                    memcpy(dst[u2]+(int64_t)t*P+p0,tmp+(int64_t)t*pn,(size_t)pn*sizeof(float));
+            }
+            free(tmp);
         }
-        free(tmp);
     } else if(hn>0){
         w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
         w_matmul(gp,x,&a->g,C);
