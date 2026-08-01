@@ -112,6 +112,11 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
 
 typedef struct {                          /* KDA layer */
     W q, k, v, o, g;
+    /* Head-sharded views, built ONCE. Building them per call re-uploaded the
+     * slice to the GPU every time (tensor count 1021 -> 1466, budget pinned at
+     * 40 GB, attn 13.3 -> 19.9 s) because each fresh W carries a null cuda
+     * handle. The view must outlive the call for the placement to be reused. */
+    W qs, ks, vs, gs; int sh_ready;
     float *conv_q, *conv_k, *conv_v;      /* [proj*4] depthwise taps, oldest first */
     float *fa, *fb;                       /* decay low-rank, f32 [hd,hidden] [proj,hd] */
     float *bp;                            /* beta proj f32 [heads,hidden] */
@@ -287,6 +292,33 @@ static void k3_cuda_report(void){
             (unsigned long long)g_k3_exp_gpu,(unsigned long long)g_k3_exp_cpu);
 }
 #endif
+
+
+/* ---------- tensor parallelism: row-slice view of a dense W ----------------
+ * Attention is head-structured, so sharding q/k/v/g by head is just a
+ * contiguous ROW range of each [P, hidden] matrix. A W is only pointers plus
+ * dims, so a sub-view needs no loader change, no extra memory and no new
+ * format -- and each rank then READS only its slice, which is where the time
+ * goes (attn is ~18 GB/token, the largest single term once experts shard).
+ *
+ * o_proj would need a COLUMN slice, which is strided and not expressible this
+ * way; instead the per-head outputs are all-reduced back to full width and
+ * o_proj is computed redundantly. That leaves ~20% of KDA traffic unsharded
+ * but avoids restructuring the loader. */
+static W w_rows(const W *w, int r0, int nrows){
+    W v = *w;
+    v.O = nrows;
+#ifdef COLI_CUDA
+    v.cuda = NULL; v.cuda_placed = 0; v.cuda_failed = 0; v.k3_reg = 0; v.k3_dense_off = 0;
+#endif
+    if(w->fmt==0)      v.f  = w->f  + (int64_t)r0*w->I;
+    else if(w->fmt==1){ v.q8 = w->q8 + (int64_t)r0*w->I; v.s = w->s + r0; }
+    else {
+        int64_t rb=((int64_t)w->I+1)/2, ng=((int64_t)w->I+w->gs-1)/w->gs;
+        v.q4 = w->q4 + (int64_t)r0*rb; v.s = w->s + (int64_t)r0*ng;
+    }
+    return v;
+}
 
 /* ---------- W: load-time quantization + matvec ---------- */
 static void w_matmul(float *y, const float *x, const W *w, int S){
@@ -808,11 +840,50 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     float *q=falloc((int64_t)C*P), *k=falloc((int64_t)C*P), *v=falloc((int64_t)C*P);
     float *gp=falloc((int64_t)C*P), *on=falloc((int64_t)C*P);
     float *t1=falloc((int64_t)C*c->kda_hd), *graw=falloc((int64_t)C*P), *braw=falloc((int64_t)C*H);
-    w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
-    w_matmul(gp,x,&a->g,C);
+    /* Head-sharded: rank r owns heads [h0,h1). Buffers stay full width so the
+     * per-head loop and the conv/recurrent state keep their existing indexing;
+     * only the slices this rank owns are filled, and `on` is reduced to full
+     * width before o_proj. */
+    int wsz=k3_net_world(), wrk=k3_net_rank();
+    int h0=0, h1=H;
+    if(wsz>1){ int per=(H+wsz-1)/wsz; h0=wrk*per; h1=h0+per; if(h1>H) h1=H; if(h0>H) h0=H; }
+    int hn=h1-h0, pn=hn*hd, p0=h0*hd;
+    if(wsz>1){ memset(q,0,(size_t)C*P*sizeof(float)); memset(k,0,(size_t)C*P*sizeof(float));
+               memset(v,0,(size_t)C*P*sizeof(float)); memset(gp,0,(size_t)C*P*sizeof(float));
+               memset(graw,0,(size_t)C*P*sizeof(float)); memset(braw,0,(size_t)C*H*sizeof(float));
+               memset(on,0,(size_t)C*P*sizeof(float)); }
+    if(wsz>1 && hn>0){
+        if(!a->sh_ready){
+            a->qs=w_rows(&a->q,p0,pn); a->ks=w_rows(&a->k,p0,pn);
+            a->vs=w_rows(&a->v,p0,pn); a->gs=w_rows(&a->g,p0,pn);
+            a->sh_ready=1;
+        }
+        /* One S=C call per projection into a COMPACT [C,pn] buffer, then
+         * scatter. Looping per token issued C times the GPU round trips. */
+        float *tmp=falloc((int64_t)C*pn);
+        W *sw[4]={&a->qs,&a->ks,&a->vs,&a->gs}; float *dst[4]={q,k,v,gp};
+        for(int u2=0;u2<4;u2++){
+            w_matmul(tmp,x,sw[u2],C);
+            for(int t=0;t<C;t++)
+                memcpy(dst[u2]+(int64_t)t*P+p0,tmp+(int64_t)t*pn,(size_t)pn*sizeof(float));
+        }
+        free(tmp);
+    } else if(hn>0){
+        w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
+        w_matmul(gp,x,&a->g,C);
+    }
     matmul(t1,x,a->fa,C,c->hidden,c->kda_hd);
-    matmul(graw,t1,a->fb,C,c->kda_hd,P);
-    matmul(braw,x,a->bp,C,c->hidden,H);
+    if(wsz>1){
+        for(int t=0;t<C;t++){
+            matmul(graw+(int64_t)t*P+p0,t1+(int64_t)t*c->kda_hd,a->fb+(int64_t)p0*c->kda_hd,
+                   1,c->kda_hd,pn);
+            matmul(braw+(int64_t)t*H+h0,x+(int64_t)t*c->hidden,a->bp+(int64_t)h0*c->hidden,
+                   1,c->hidden,hn);
+        }
+    } else {
+        matmul(graw,t1,a->fb,C,c->kda_hd,P);
+        matmul(braw,x,a->bp,C,c->hidden,H);
+    }
     float qscale=1.f/sqrtf((float)hd);
     for(int t=0;t<C;t++){
         float *qt=q+(int64_t)t*P, *kt=k+(int64_t)t*P, *tv=v+(int64_t)t*P;
@@ -824,7 +895,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         for(int w2=0;w2<3;w2++){
             float *win=wins[w2], *vec=vecs[w2]; const float *cw=taps[w2];
             #pragma omp parallel for schedule(static)
-            for(int d=0;d<P;d++){
+            for(int d=p0;d<p0+pn;d++){
                 float *wd=win+(int64_t)d*K;
                 for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
                 wd[K-1]=vec[d];
@@ -834,7 +905,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             }
         }
         #pragma omp parallel for schedule(static)
-        for(int h=0;h<H;h++){
+        for(int h=h0;h<h1;h++){
             const float *qh=qt+(int64_t)h*hd, *kh=kt+(int64_t)h*hd, *vh=tv+(int64_t)h*hd;
             float qn[512], kn[512], alpha[512], kS[512], vt[512], oh[512];
             float sq=0,sk=0;
@@ -892,6 +963,14 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             for(int vv=0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
         }
     }
+    /* Gather the head slices back to full width before o_proj. Implemented as
+     * a sum over zero-filled buffers rather than a true all-gather: each rank
+     * wrote only its own heads and left the rest zero, so the reduction IS the
+     * concatenation. Costs P floats (48 KB) instead of P/N, which at ~0.5 ms
+     * per layer is cheaper than adding a second collective. o_proj itself
+     * stays replicated -- it needs a strided COLUMN slice, which a row view
+     * cannot express. */
+    if(k3_net_world()>1) k3_net_allreduce(on,(size_t)C*P);
     w_matmul(out,on,&a->o,C);
     free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
 }
