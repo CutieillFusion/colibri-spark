@@ -79,6 +79,33 @@
 #include "backend_cuda_k3.h"
 #endif
 
+/* MLA latent-cache element. Only the 24 non-KDA layers cache anything (the 69
+ * KDA layers carry a fixed 0.40 GB recurrent state), and MLA already compresses
+ * to a 576-float latent -- but the cache is still scanned end to end for every
+ * token, so this width sets BOTH the memory ceiling at long context and the
+ * bandwidth of that scan:
+ *
+ *        ctx     fp32     bf16      fp8
+ *       256K   13.5 GB   6.8 GB   3.4 GB
+ *         1M   54.0 GB  27.0 GB  13.5 GB
+ *
+ * bf16 is a pure truncation of fp32 -- no scale, no clamp, no calibration --
+ * so it cannot introduce the range bugs a real 8-bit format would, and the
+ * conversion is one shift. The latents are post-rmsnorm (kva_ln), so their
+ * range is already normalised if we later go to fp8. Build with -DK3_KV_FP32
+ * to A/B against the original fp32 cache -- compile-time, so the inner loops
+ * carry no branch either way. */
+#ifdef K3_KV_FP32
+typedef float kvq;
+static inline kvq   kv_enc(float f){ return f; }
+static inline float kv_dec(kvq h)  { return h; }
+#else
+typedef uint16_t kvq;
+static inline kvq   kv_enc(float f){ union{float f;uint32_t u;}b; b.f=f;
+                                     return (kvq)((b.u+0x8000u)>>16); }  /* round-to-nearest */
+static inline float kv_dec(kvq h)  { union{uint32_t u;float f;}b; b.u=(uint32_t)h<<16; return b.f; }
+#endif
+
 /* ---------- config ---------- */
 typedef struct {
     int hidden, n_layers, vocab, first_dense, dense_inter;
@@ -169,12 +196,13 @@ typedef struct {
     float **kstate;                       /* [layer] -> [heads*hd*hd], S[k][v] */
     float **cwq, **cwk, **cwv;            /* conv windows [proj*conv_k], oldest first */
     /* MLA cache */
-    float **Lc, **Rc; int max_t;
+    kvq **Lc, **Rc; int max_t;
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
     int w2_fd, w2_dfd, w1_mode;           /* expert store: buffered + O_DIRECT, 1-bit? */
+    uint32_t *route_hist;                 /* K3_ROUTE_STATS: [layer][expert] counts */
     float *hz_batch;                      /* [64][latent] batched-expert results */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
@@ -244,6 +272,16 @@ static int      g_k3_dense_gpu = 0;
  * collective costs 3.41 ms, so 93 extra of them is ~0.32 s/token against a
  * sharding saving of ~0.2 -- net negative. Keep it on for 2 nodes, off for 4. */
 static int      g_k3_tp_attn = 1;
+/* Rank's head range [*h0, *h0+*hn) out of H heads. MUST match the split the
+ * kda/mla forwards compute, or a rank loads one slice and multiplies another;
+ * both derive it from this single formula for that reason. */
+static void k3_head_shard(int H, int *h0, int *hn){
+    int wsz = g_k3_tp_attn ? k3_net_world() : 1, wrk = k3_net_rank();
+    if(wsz<=1){ *h0=0; *hn=H; return; }
+    int per=(H+wsz-1)/wsz, a=wrk*per, b=a+per;
+    if(a>H) a=H; if(b>H) b=H;
+    *h0=a; *hn=b-a;
+}
 static uint64_t g_k3_exp_gpu = 0, g_k3_exp_cpu = 0;
 static int      g_k3_expert_batch = 0;   /* K3_EXPERT_BATCH=1; see the note at its use */
 static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
@@ -316,6 +354,17 @@ static void k3_cuda_report(void){
  * way; instead the per-head outputs are all-reduced back to full width and
  * o_proj is computed redundantly. That leaves ~20% of KDA traffic unsharded
  * but avoids restructuring the loader. */
+/* Release a tensor's host-side buffers. Only safe once nothing can read them
+ * again: no w_rows view aliases them (w_rows is a pointer view, w_cols copies),
+ * no CPU helper reads them (w_addrow/w_rowdot on kv_b_proj), and either the
+ * tensor is device-resident or this rank never multiplies it. On GB10 the host
+ * and device copies occupy ONE physical pool, so this is a real reclaim, not
+ * bookkeeping. */
+static void w_free_host(W *w){
+    free(w->f); free(w->q8); free(w->q4); free(w->s);
+    w->f=NULL; w->q8=NULL; w->q4=NULL; w->s=NULL;
+}
+
 static W w_rows(const W *w, int r0, int nrows){
     W v = *w;
     v.O = nrows;
@@ -356,7 +405,14 @@ static W w_cols(const W *w, int i0, int n){
         v.q8=malloc((size_t)O*n);
         if(!v.q8){fprintf(stderr,"OOM w_cols\n");exit(1);}
         for(int64_t o=0;o<O;o++) memcpy(v.q8+o*n, w->q8+o*w->I+i0, (size_t)n);
-        /* fmt=1 scales are per ROW, so slicing the input leaves them alone */
+        /* fmt=1 scales are per ROW, so a column slice does not change their
+         * VALUES -- but they must still be COPIED, not aliased. `v = *w` above
+         * carries w->s over by pointer, and the o_proj path frees the parent
+         * (w_free_host) immediately after this call, which would leave every
+         * fmt=1 view holding a dangling scale array. fmt=4 below already
+         * copies; this branch silently did not. */
+        v.s=falloc(O);
+        memcpy(v.s, w->s, (size_t)O*sizeof(float));
     } else {
         int64_t rb=((int64_t)w->I+1)/2, ng=((int64_t)w->I+w->gs-1)/w->gs;
         int64_t rbl=n/2,               ngl=n/w->gs;
@@ -486,11 +542,35 @@ static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
 static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
 static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning */
-static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
+/* Load rows [R0,R0+NR) of the [O,I] tensor `name`; NR==O loads all of it.
+ *
+ * With tensor-parallel attention each rank multiplies ONLY its own head slice,
+ * so loading the whole projection and taking a w_rows() view spends
+ * (world-1)/world of the bytes on rows this rank never reads -- 10.25 GB per
+ * rank on the KDA q/k/v/g alone at world=4. Worse, the view aliases the
+ * parent's buffer, which is exactly what stops us releasing the host copy once
+ * the tensor is device-resident (see the #653 note above): the wasted memory
+ * cannot even be reclaimed later.
+ *
+ * Rows are contiguous in a row-major [O,I] tensor, so a row range is a
+ * contiguous ELEMENT range and st_read_slice_f32 fetches it directly -- the
+ * quantizer already streams in QCHUNK-row blocks, so this only shifts the read
+ * offset and shrinks the allocation. O is still validated against the tensor's
+ * true numel, so a wrong shard bound fails loudly instead of loading garbage.
+ *
+ * Slicing is supported on the load-time-quantizing path only. The U8
+ * pre-quantized container and the raw-f32 path read whole tensors, so they
+ * refuse a partial request rather than silently returning full rows. */
+static void w_load_rows(Model *m, W *w, const char *name, int O, int I, int bits,
+                        int R0, int NR){
     char nm[512]; snprintf(nm,sizeof(nm),"%s%s",m->pfx,name);
     st_tensor *t=st_find(&m->S,nm);
     if(!t) st_die_missing(&m->S,nm);
-    memset(w,0,sizeof(*w)); w->O=O; w->I=I;
+    if(NR<0||R0<0||(int64_t)R0+NR>O){
+        fprintf(stderr,"%s: bad row slice [%d,%d) of %d rows\n",nm,R0,R0+NR,O); exit(1); }
+    memset(w,0,sizeof(*w)); w->O=NR; w->I=I;
+    if(t->dtype==3 && NR!=O){
+        fprintf(stderr,"%s: row-slice load unsupported for the U8 container\n",nm); exit(1); }
     if(t->dtype==3){
         /* repacked container (tools/k3_repack.py): pre-quantized U8 + .qs f32
          * scales — no load-time quantization, K3_BITS is ignored for these
@@ -543,24 +623,26 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
         return;
     }
     if(t->numel!=(int64_t)O*I){ fprintf(stderr,"%s: numel %lld != %dx%d\n",nm,(long long)t->numel,O,I); exit(1); }
-    if(bits>=32){ w->fmt=0; w->f=falloc((int64_t)O*I); st_read_f32(&m->S,nm,w->f,0); return; }
+    if(bits>=32){
+        if(NR!=O){ fprintf(stderr,"%s: row-slice load unsupported at f32\n",nm); exit(1); }
+        w->fmt=0; w->f=falloc((int64_t)O*I); st_read_f32(&m->S,nm,w->f,0); return; }
     int gs=64;
     if(bits<=4 && I%gs){ bits=8; }        /* int4-g64 wants I%64==0; fall back */
     float *scr=falloc((int64_t)QCHUNK*I);
-    if(bits>4){ w->fmt=1; w->q8=malloc((int64_t)O*I); w->s=falloc(O);
+    if(bits>4){ w->fmt=1; w->q8=malloc((int64_t)NR*I); w->s=falloc(NR);
         if(!w->q8){fprintf(stderr,"OOM int8 %s\n",nm);exit(1);}
-        for(int r0=0;r0<O;r0+=QCHUNK){ int n=O-r0<QCHUNK?O-r0:QCHUNK;
-            st_read_slice_f32(&m->S,nm,(int64_t)r0*I,(int64_t)n*I,scr,1);
+        for(int r0=0;r0<NR;r0+=QCHUNK){ int n=NR-r0<QCHUNK?NR-r0:QCHUNK;
+            st_read_slice_f32(&m->S,nm,(int64_t)(R0+r0)*I,(int64_t)n*I,scr,1);
             for(int r=0;r<n;r++){ const float *src=scr+(int64_t)r*I;
                 float am=0; for(int i=0;i<I;i++){ float a=fabsf(src[i]); if(a>am)am=a; }
                 float s=am/127.f; if(s<1e-20f)s=1e-20f; w->s[r0+r]=s; float inv=1.f/s;
                 int8_t *dst=w->q8+(int64_t)(r0+r)*I;
                 for(int i=0;i<I;i++){ int v=(int)lrintf(src[i]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[i]=(int8_t)v; } } }
     } else { w->fmt=4; w->gs=gs; int rb=I/2, ng=I/gs;
-        w->q4=malloc((int64_t)O*rb); w->s=falloc((int64_t)O*ng);
+        w->q4=malloc((int64_t)NR*rb); w->s=falloc((int64_t)NR*ng);
         if(!w->q4){fprintf(stderr,"OOM int4 %s\n",nm);exit(1);}
-        for(int r0=0;r0<O;r0+=QCHUNK){ int n=O-r0<QCHUNK?O-r0:QCHUNK;
-            st_read_slice_f32(&m->S,nm,(int64_t)r0*I,(int64_t)n*I,scr,1);
+        for(int r0=0;r0<NR;r0+=QCHUNK){ int n=NR-r0<QCHUNK?NR-r0:QCHUNK;
+            st_read_slice_f32(&m->S,nm,(int64_t)(R0+r0)*I,(int64_t)n*I,scr,1);
             for(int r=0;r<n;r++){ const float *src=scr+(int64_t)r*I;
                 uint8_t *dst=w->q4+(int64_t)(r0+r)*rb; float *scl=w->s+(int64_t)(r0+r)*ng;
                 for(int g=0;g<ng;g++){ const float *gp=src+g*gs;
@@ -572,6 +654,10 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
                         dst[(g*gs+i)>>1]=(uint8_t)((v0+8)|((v1+8)<<4)); } } } }
     }
     free(scr);
+}
+
+static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
+    w_load_rows(m,w,name,O,I,bits,0,O);
 }
 static float *f32_load(Model *m, const char *name, int64_t want){
     char nm[512]; snprintf(nm,sizeof(nm),"%s%s",m->pfx,name);
@@ -775,6 +861,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     g_k3_topp  = getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f;
     if(g_k3_topp>0.f)
         fprintf(stderr,"[K3] TOPP=%.2f: routed experts pruned to cumulative weight (quality lever — A/B with K3_LOGITS)\n",g_k3_topp);
+    /* Resolved here, not with the other flags below, because the head-sliced
+     * attention loads depend on it. */
+    g_k3_tp_attn = getenv("K3_TP_ATTN")?atoi(getenv("K3_TP_ATTN")):1;
     int bits   = getenv("K3_BITS")?atoi(getenv("K3_BITS")):4;
     int mbits  = getenv("K3_MLA_BITS")?atoi(getenv("K3_MLA_BITS")):8;
     int hbits  = getenv("K3_HEAD_BITS")?atoi(getenv("K3_HEAD_BITS")):8;
@@ -803,10 +892,16 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
           free(rn); free(rp); }
         if(l->kda){
             Kda *a=&l->a; int P=c->kda_proj;
-            w_load(m,&a->q,NM("model.layers.%d.self_attn.q_proj.weight",i),P,c->hidden,bits);
-            w_load(m,&a->k,NM("model.layers.%d.self_attn.k_proj.weight",i),P,c->hidden,bits);
-            w_load(m,&a->v,NM("model.layers.%d.self_attn.v_proj.weight",i),P,c->hidden,bits);
-            w_load(m,&a->g,NM("model.layers.%d.self_attn.g_proj.weight",i),P,c->hidden,bits);
+            /* q/k/v/g are row-parallel: this rank only ever multiplies its own
+             * head rows, so load just those. At world=4 that is 3/4 of 13.67 GB
+             * left unread, and it removes the w_rows aliasing that pinned the
+             * host copy alive after device placement. */
+            int kh0,khn; k3_head_shard(c->kda_heads,&kh0,&khn);
+            int kr0=kh0*c->kda_hd, krn=khn*c->kda_hd;
+            w_load_rows(m,&a->q,NM("model.layers.%d.self_attn.q_proj.weight",i),P,c->hidden,bits,kr0,krn);
+            w_load_rows(m,&a->k,NM("model.layers.%d.self_attn.k_proj.weight",i),P,c->hidden,bits,kr0,krn);
+            w_load_rows(m,&a->v,NM("model.layers.%d.self_attn.v_proj.weight",i),P,c->hidden,bits,kr0,krn);
+            w_load_rows(m,&a->g,NM("model.layers.%d.self_attn.g_proj.weight",i),P,c->hidden,bits,kr0,krn);
             w_load(m,&a->o,NM("model.layers.%d.self_attn.o_proj.weight",i),c->hidden,P,bits);
             a->conv_q=f32_load(m,NM("model.layers.%d.self_attn.q_conv1d.weight",i),(int64_t)P*c->conv_k);
             a->conv_k=f32_load(m,NM("model.layers.%d.self_attn.k_conv1d.weight",i),(int64_t)P*c->conv_k);
@@ -831,11 +926,14 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         } else {
             Mla *a=&l->m;
             w_load(m,&a->qa,NM("model.layers.%d.self_attn.q_a_proj.weight",i),c->q_lora,c->hidden,mbits);
-            w_load(m,&a->qb,NM("model.layers.%d.self_attn.q_b_proj.weight",i),c->n_heads*c->qk_head,c->q_lora,mbits);
+            int mh0_,mhn_; k3_head_shard(c->n_heads,&mh0_,&mhn_);   /* row-parallel, as KDA above */
+            w_load_rows(m,&a->qb,NM("model.layers.%d.self_attn.q_b_proj.weight",i),c->n_heads*c->qk_head,c->q_lora,mbits,
+                        mh0_*c->qk_head,mhn_*c->qk_head);
             w_load(m,&a->kva,NM("model.layers.%d.self_attn.kv_a_proj_with_mqa.weight",i),c->kv_lora+c->qk_rope,c->hidden,mbits);
             w_load(m,&a->kvb,NM("model.layers.%d.self_attn.kv_b_proj.weight",i),c->n_heads*(c->qk_nope+c->v_head),c->kv_lora,mbits);
             w_load(m,&a->o,NM("model.layers.%d.self_attn.o_proj.weight",i),c->hidden,c->n_heads*c->v_head,mbits);
-            w_load(m,&a->g,NM("model.layers.%d.self_attn.g_proj.weight",i),c->n_heads*c->v_head,c->hidden,mbits);
+            w_load_rows(m,&a->g,NM("model.layers.%d.self_attn.g_proj.weight",i),c->n_heads*c->v_head,c->hidden,mbits,
+                        mh0_*c->v_head,mhn_*c->v_head);
             a->qa_ln =f32_load(m,NM("model.layers.%d.self_attn.q_a_layernorm.weight",i),c->q_lora);
             a->kva_ln=f32_load(m,NM("model.layers.%d.self_attn.kv_a_layernorm.weight",i),c->kv_lora);
         }
@@ -872,6 +970,10 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
           free(rn); free(rp); }
         w_load(m,&m->lm_head,"lm_head.weight",c->vocab,c->hidden,hbits);
     } else fprintf(stderr,"[K3] final norm/lm_head not present — trace-only mode\n");
+    if(getenv("K3_ROUTE_STATS")){
+        m->route_hist=calloc((size_t)c->n_layers*c->n_experts,sizeof(uint32_t));
+        if(!m->route_hist){fprintf(stderr,"OOM route hist\n");exit(1);}
+    }
     expert_table_init(m);
 #ifdef COLI_CUDA
     /* K3_EXPERT_GPU=1 moves the routed-expert matmuls onto the GPU. Needs a
@@ -879,7 +981,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * sits, of which only ~14% is I/O. */
     g_k3_expert_batch = getenv("K3_EXPERT_BATCH")?atoi(getenv("K3_EXPERT_BATCH")):0;
     g_k3_dense_gpu    = getenv("K3_DENSE_GPU")?atoi(getenv("K3_DENSE_GPU")):0;
-    g_k3_tp_attn      = getenv("K3_TP_ATTN")?atoi(getenv("K3_TP_ATTN")):1;
+    /* NOTE: g_k3_tp_attn is resolved EARLIER, before the weights load -- the
+     * head-sliced loads below depend on it, and reading it here would be too
+     * late (the projections would already be resident at full width). */
     if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")) && g_k3_cuda)
         g_k3_expert_gpu = coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter);
     else if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")))
@@ -942,9 +1046,15 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
                memset(on,0,(size_t)C*P*sizeof(float)); }
     if(wsz>1 && hn>0){
         if(!a->sh_ready){
-            a->qs=w_rows(&a->q,p0,pn); a->ks=w_rows(&a->k,p0,pn);
-            a->vs=w_rows(&a->v,p0,pn); a->gs=w_rows(&a->g,p0,pn);
+            /* offset 0: w_load_rows already loaded only [p0,p0+pn), so the
+             * tensor IS the slice. The view is now the whole buffer. */
+            a->qs=w_rows(&a->q,0,pn); a->ks=w_rows(&a->k,0,pn);
+            a->vs=w_rows(&a->v,0,pn); a->gs=w_rows(&a->g,0,pn);
             a->os=w_cols(&a->o,p0,pn);          /* row-parallel o_proj */
+            /* w_cols COPIED this rank's columns (a column slice is not
+             * contiguous, so it cannot be sliced at load like the rows above).
+             * The full o is dead from here on -- release it, 3.4 GB of KDA. */
+            w_free_host(&a->o);
             /* K3_FUSE_QKVG=1: measured NEUTRAL (0.78 vs 0.77, inside run-to-run
              * noise) while costing ~6.4 GB RSS, so it is opt-in. It does what it
              * claims -- GPU tensor count 1021 -> 814, four launches per layer
@@ -953,7 +1063,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
              * trips per token, so the cost is somewhere neither hypothesis
              * reached and wants a CUDA profiler, not another guess. */
             a->fuse = getenv("K3_FUSE_QKVG") && atoi(getenv("K3_FUSE_QKVG"));
-            if(a->fuse) a->qkvg=w_concat4(&a->q,&a->k,&a->v,&a->g,p0,pn);
+            if(a->fuse) a->qkvg=w_concat4(&a->q,&a->k,&a->v,&a->g,0,pn);
             a->sh_ready=1;
         }
         double kp0=now_s();
@@ -1120,9 +1230,10 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
     if(wsz>1){ int per=(H+wsz-1)/wsz; mh0=wrk*per; mh1=mh0+per; if(mh1>H) mh1=H; if(mh0>H) mh0=H; }
     int mhn=mh1-mh0;
     if(wsz>1 && mhn>0 && !a->sh_ready){
-        a->qbs=w_rows(&a->qb,mh0*qh,mhn*qh);
-        a->gs_=w_rows(&a->g, mh0*vh,mhn*vh);
+        a->qbs=w_rows(&a->qb,0,mhn*qh);        /* already head-sliced at load */
+        a->gs_=w_rows(&a->g, 0,mhn*vh);
         a->os =w_cols(&a->o, mh0*vh,mhn*vh);
+        w_free_host(&a->o);                    /* copied by w_cols; see KDA note */
         a->sh_ready=1;
     }
     if(wsz>1 && mhn>0){
@@ -1137,10 +1248,12 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
     for(int t=0;t<C;t++){                            /* append the whole chunk to the
                                                       * cache first: token t's scores
                                                       * only read rows 0..pos0+t */
-        float *Lrow=m->Lc[li]+(int64_t)(pos0+t)*kvl, *Rrow=m->Rc[li]+(int64_t)(pos0+t)*qr;
+        kvq *Lrow=m->Lc[li]+(int64_t)(pos0+t)*kvl, *Rrow=m->Rc[li]+(int64_t)(pos0+t)*qr;
         const float *cv=ckv+(int64_t)t*(kvl+qr);
-        rmsnorm_(Lrow,cv,a->kva_ln,kvl,c->eps);
-        memcpy(Rrow,cv+kvl,qr*sizeof(float));        /* NoPE: cached raw, no rotation */
+        float lt[4096];                              /* kvl <= 4096, enforced at cfg load */
+        rmsnorm_(lt,cv,a->kva_ln,kvl,c->eps);
+        for(int i=0;i<kvl;i++) Lrow[i]=kv_enc(lt[i]);
+        for(int i=0;i<qr;i++)  Rrow[i]=kv_enc(cv[kvl+i]);  /* NoPE: cached raw, no rotation */
     }
     if(wsz>1 && mhn>0){
         memset(gv,0,(size_t)C*H*vh*sizeof(float));
@@ -1162,16 +1275,16 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
             for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
             float *sc=falloc(nt);
             for(int t=0;t<nt;t++){
-                const float *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
-                float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*Lt[i];
-                for(int i=0;i<qr;i++) s2+=qrp[i]*Rt[i];
+                const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
+                float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*kv_dec(Lt[i]);
+                for(int i=0;i<qr;i++) s2+=qrp[i]*kv_dec(Rt[i]);
                 sc[t]=s2*c->attn_scale;
             }
             softmax_(sc,nt);
             float clat[4096]; memset(clat,0,kvl*sizeof(float));
             for(int t=0;t<nt;t++){
-                const float *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
-                for(int i=0;i<kvl;i++) clat[i]+=s2*Lt[i];
+                const kvq *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
+                for(int i=0;i<kvl;i++) clat[i]+=s2*kv_dec(Lt[i]);
             }
             free(sc);
             float *cx=ctxt+(int64_t)h*vh;
@@ -1495,6 +1608,13 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
             }
         }
         keff[t]=Kt;
+        /* K3_ROUTE_STATS: which experts the router actually picks. Needed to
+         * decide what can be pruned: at 1 bit each node still needs 106 GB of
+         * experts plus ~30 GB of dense against 116 GB, so residency requires
+         * dropping the cold tail. Counted on every rank -- the router is
+         * replicated, so any rank sees the full 896-wide distribution. */
+        if(m->route_hist)
+            for(int kk=0;kk<Kt;kk++) m->route_hist[(int64_t)li*E+idx[kk]]++;
     }
     m->t_topk+=now_s()-tp0; tp0=now_s();
     float *z=falloc((int64_t)C*LT), *u=falloc((int64_t)C*LT);
@@ -1676,12 +1796,18 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
 
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c; m->max_t=max_t;
-    m->Lc=calloc(c->n_layers,sizeof(float*));
-    m->Rc=calloc(c->n_layers,sizeof(float*));
+    m->Lc=calloc(c->n_layers,sizeof(kvq*));
+    m->Rc=calloc(c->n_layers,sizeof(kvq*));
+    int nc=0;
     for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda){
-        m->Lc[i]=falloc((int64_t)max_t*c->kv_lora);
-        m->Rc[i]=falloc((int64_t)max_t*c->qk_rope);
+        m->Lc[i]=malloc((size_t)max_t*c->kv_lora*sizeof(kvq));
+        m->Rc[i]=malloc((size_t)max_t*c->qk_rope*sizeof(kvq));
+        if(!m->Lc[i]||!m->Rc[i]){ fprintf(stderr,"OOM kv cache\n"); exit(1); }
+        nc++;
     }
+    fprintf(stderr,"[K3] kv cache %d/%d layers x %d tok x %d el x %zub = %.2f GB\n",
+            nc,c->n_layers,max_t,c->kv_lora+c->qk_rope,sizeof(kvq),
+            (double)nc*max_t*(c->kv_lora+c->qk_rope)*sizeof(kvq)/1073741824.0);
 }
 
 typedef struct { float p; int id; } SampleProb;
@@ -2157,6 +2283,13 @@ int main(int argc, char **argv){
 #ifdef COLI_CUDA
     k3_cuda_report();
 #endif
+    if(m.route_hist && getenv("K3_ROUTE_STATS")){
+        FILE *rf=fopen(getenv("K3_ROUTE_STATS"),"wb");
+        if(rf){ fwrite(m.route_hist,sizeof(uint32_t),
+                       (size_t)m.c.n_layers*m.c.n_experts,rf); fclose(rf);
+            fprintf(stderr,"[K3] route stats -> %s (%d layers x %d experts)\n",
+                    getenv("K3_ROUTE_STATS"),m.c.n_layers,m.c.n_experts); }
+    }
     if(m.trace) fclose(m.trace);
     return 0;
 }
