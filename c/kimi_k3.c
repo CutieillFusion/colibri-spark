@@ -174,7 +174,7 @@ typedef struct {
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
-    int w2_fd, w2_dfd;                    /* K3_W2_DIR store: buffered + O_DIRECT */
+    int w2_fd, w2_dfd, w1_mode;           /* expert store: buffered + O_DIRECT, 1-bit? */
     float *hz_batch;                      /* [64][latent] batched-expert results */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
@@ -183,6 +183,7 @@ typedef struct {
      * pass at the wrong term. */
     double t_router, t_topk, t_latent, t_shared, t_expert, t_rnorm;
     double t_ekernel;                     /* GPU call only, inside t_expert */
+    double t_kproj, t_kconv, t_khead, t_kout;  /* kda_forward breakdown */
     uint64_t n_ekernel;
     FILE *trace;
 } Model;
@@ -648,10 +649,13 @@ static void expert_table_init(Model *m){
      * 16.74, i.e. 1.89x less to stream and to dequantize. The store is one
      * flat file with slots in (moe_layer, expert) order, so every expert is a
      * single contiguous pread rather than six ranges. */
-    const char *w2dir = getenv("K3_W2_DIR");
+    const char *w1dir = getenv("K3_W1_DIR");
+    const char *w2dir = w1dir ? w1dir : getenv("K3_W2_DIR");
+    m->w1_mode = w1dir ? 1 : 0;
     if(w2dir){
-        m->e_w1p=(int64_t)c->moe_inter*(c->latent/4); m->e_w1s=(int64_t)c->moe_inter*(c->latent/32);
-        m->e_w2p=(int64_t)c->latent*(c->moe_inter/4); m->e_w2s=(int64_t)c->latent*(c->moe_inter/32);
+        int den = m->w1_mode ? 8 : 4;     /* 1 bit vs 2 bits per weight */
+        m->e_w1p=(int64_t)c->moe_inter*(c->latent/den); m->e_w1s=(int64_t)c->moe_inter*(c->latent/32);
+        m->e_w2p=(int64_t)c->latent*(c->moe_inter/den); m->e_w2s=(int64_t)c->latent*(c->moe_inter/32);
     } else {
         m->e_w1p=(int64_t)c->moe_inter*(c->latent/2); m->e_w1s=(int64_t)c->moe_inter*(c->latent/32);
         m->e_w2p=(int64_t)c->latent*(c->moe_inter/2); m->e_w2s=(int64_t)c->latent*(c->moe_inter/32);
@@ -660,7 +664,7 @@ static void expert_table_init(Model *m){
     m->eref=calloc((size_t)c->n_layers*c->n_experts,sizeof(ERef));
     if(!m->eref){fprintf(stderr,"OOM expert table\n");exit(1);}
     if(w2dir){
-        char p[1024]; snprintf(p,sizeof(p),"%s/experts.w2",w2dir);
+        char p[1024]; snprintf(p,sizeof(p),"%s/experts.w2",w2dir);   /* same filename both widths */
         int fd=open(p,O_RDONLY);
         if(fd<0){ fprintf(stderr,"[K3/W2] cannot open %s: %s\n",p,strerror(errno)); exit(1); }
         m->w2_fd=fd;
@@ -713,7 +717,8 @@ static void expert_table_init(Model *m){
                 nmoe,Eloc); exit(1); }
         m->hz_batch=falloc((int64_t)64*c->latent);   /* K3_BATCH_MAX x latent */
         fprintf(stderr,"[K3/W2] packed 2-bit experts: %s, slot %.2f MiB, %d layers x %d"
-            " (shard %d/%d) = %.1f GB\n",p,m->e_slot/1048576.0,nmoe,Eloc,sr,sw,want/1e9);
+            " (shard %d/%d, %d-bit) = %.1f GB\n",p,m->e_slot/1048576.0,nmoe,Eloc,sr,sw,
+            m->w1_mode?1:2,want/1e9);
         return;
     }
     const char *mat[3]={"w1","w2","w3"};
@@ -944,6 +949,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             if(a->fuse) a->qkvg=w_concat4(&a->q,&a->k,&a->v,&a->g,p0,pn);
             a->sh_ready=1;
         }
+        double kp0=now_s();
         float *dst[4]={q,k,v,gp};
         if(a->fuse){                       /* ONE call for all four, then scatter */
             float *tmp=falloc((int64_t)C*4*pn);
@@ -963,9 +969,12 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             }
             free(tmp);
         }
+        m->t_kproj+=now_s()-kp0;
     } else if(hn>0){
+        double kp0=now_s();
         w_matmul(q,x,&a->q,C); w_matmul(k,x,&a->k,C); w_matmul(v,x,&a->v,C);
         w_matmul(gp,x,&a->g,C);
+        m->t_kproj+=now_s()-kp0;
     }
     matmul(t1,x,a->fa,C,c->hidden,c->kda_hd);
     if(wsz>1){
@@ -985,6 +994,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         float *gpt=gp+(int64_t)t*P, *ont=on+(int64_t)t*P;
         const float *rgt=graw+(int64_t)t*P, *bt=braw+(int64_t)t*H;
         /* depthwise causal conv (window: oldest..newest) + SiLU, rolls forward */
+        double kc0=now_s();
         float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
         float *vecs[3]={qt,kt,tv}; float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
         for(int w2=0;w2<3;w2++){
@@ -999,6 +1009,8 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 vec[d]=siluf_(acc);
             }
         }
+        m->t_kconv+=now_s()-kc0;
+        double kh0=now_s();
         #pragma omp parallel for schedule(static)
         for(int h=h0;h<h1;h++){
             const float *qh=qt+(int64_t)h*hd, *kh=kt+(int64_t)h*hd, *vh=tv+(int64_t)h*hd;
@@ -1057,7 +1069,9 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             float *dst=ont+(int64_t)h*hd;
             for(int vv=0;vv<hd;vv++) dst[vv]=oh[vv]*r*a->onw[vv]*sigmoidf_(gpt[(int64_t)h*hd+vv]);
         }
+        m->t_khead+=now_s()-kh0;
     }
+    double ko0=now_s();
     /* Gather the head slices back to full width before o_proj. Implemented as
      * a sum over zero-filled buffers rather than a true all-gather: each rank
      * wrote only its own heads and left the rest zero, so the reduction IS the
@@ -1079,6 +1093,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         memset(out,0,(size_t)C*c->hidden*sizeof(float));
         k3_net_allreduce(out,(size_t)C*c->hidden);
     } else w_matmul(out,on,&a->o,C);
+    m->t_kout+=now_s()-ko0;
     free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
 }
 
@@ -1245,9 +1260,11 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
         /* One call replaces all three matmul_mxfp4's; SiTU is fused into the
          * first kernel's epilogue so `up` never leaves the device. */
         double tk0=now_s();
-        int ok = m->w2_fd ? coli_k3_expert_w2(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
+        int ok = m->w1_mode ? coli_k3_expert_w1(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
                                 c->latent,c->moe_inter,c->situ_b1,c->situ_b2)
-                          : coli_k3_expert(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
+               : m->w2_fd    ? coli_k3_expert_w2(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
+                                c->latent,c->moe_inter,c->situ_b1,c->situ_b2)
+                             : coli_k3_expert(w1p,w1s,w2p,w2s,w3p,w3s,hz,z,
                                 c->latent,c->moe_inter,c->situ_b1,c->situ_b2);
         m->t_ekernel+=now_s()-tk0; m->n_ekernel++;
         if(ok){
@@ -2117,6 +2134,8 @@ int main(int argc, char **argv){
             m.t_ekernel,(unsigned long long)m.n_ekernel,
             m.n_ekernel?1e3*m.t_ekernel/(double)m.n_ekernel:0.0,
             m.t_expert-m.t_eload-m.t_ekernel);
+    fprintf(stderr,"[K3] kda split: proj %.1fs conv %.1fs heads %.1fs out+reduce %.1fs\n",
+            m.t_kproj,m.t_kconv,m.t_khead,m.t_kout);
     if(k3_net_world()>1)
         fprintf(stderr,"[K3/NET] allreduce %.1fs over %llu calls (%.2f ms each)\n",
             k3_net_secs(),(unsigned long long)k3_net_calls(),

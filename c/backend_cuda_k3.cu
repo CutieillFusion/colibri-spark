@@ -213,10 +213,15 @@ __global__ void k3_w2_down(float *__restrict__ hz,
  *   sign = idx&2 ? + : -        mag = (idx ^ (idx>>1)) & 1 ? 1 : 4
  *   idx 0->-4  1->-1  2->+1  3->+4
  */
-__device__ __forceinline__ float w2_val(unsigned int idx) {
-    float m = ((idx ^ (idx >> 1)) & 1u) ? 1.f : 4.f;
-    return (idx & 2u) ? m : -m;
-}
+/* Codebook in constant memory so K3_W1 can collapse it at init.
+ * K3_W1=1 sets {-a,-a,+a,+a}: because the 2-bit codebook is sign-symmetric,
+ * sign(2-bit value) == sign(the original MXFP4 value), so this is EXACTLY the
+ * sign-based 1-bit quantization of the checkpoint -- testable with no repack
+ * and no new storage. a defaults to the mean |w| of the 2-bit distribution
+ * (0.77*1 + 0.23*4 = 1.69), which minimises L2 for a two-level quantiser.
+ * Measured earlier: LUT vs arithmetic made no difference (31.5 vs 31.6 GB/s). */
+__constant__ float c_w2v[4];
+__device__ __forceinline__ float w2_val(unsigned int idx) { return c_w2v[idx & 3u]; }
 
 __device__ __forceinline__ float warp_row_dot_w2(const unsigned char *__restrict__ pk,
                                                  const unsigned char *__restrict__ sc,
@@ -403,6 +408,107 @@ extern "C" int coli_k3_expert_batch_w2(const void *const *w1p, const void *const
     return 1;
 }
 
+
+/* ---------------- packed 1-bit experts (format "k3-w1") ------------------
+ * One SIGN bit per weight, 8 per byte, keeping the ue8m0 block-32 scales:
+ * 1.25 bits/weight, slot 4.92 MiB (vs 8.86 at 2-bit, 16.74 at MXFP4), expert
+ * set 1447 -> 425 GB. Value = bit ? +a : -a.
+ *
+ * Viable because the codebook {-a,+a} is sign-symmetric BY CONSTRUCTION, which
+ * is the property that decides whether these models survive quantisation --
+ * not the L2 error, which is 0.64 here versus 0.38 at 2 bits. Verified
+ * coherent on K3 before this was built, by collapsing the 2-bit codebook in
+ * the kernel (K3_W1=1) -- no repack needed for the quality answer.
+ *
+ * `a` folds into the group scale, so the kernel just picks +/-x per bit and
+ * multiplies once per group. 32 values = 4 bytes. */
+__constant__ float c_w1a[1];
+
+__device__ __forceinline__ float warp_row_dot_w1(const unsigned char *__restrict__ pk,
+                                                 const unsigned char *__restrict__ sc,
+                                                 const float *__restrict__ x,
+                                                 int ng, int lane) {
+    float acc = 0.f;
+    for (int g = lane; g < ng; g += 32) {
+        unsigned int v = *(const unsigned int *)(pk + (g << 2));   /* 32 bits */
+        const float *xs = x + (g << 5);
+        /* Branchless sign flip: XOR bit 31 when the weight bit is 0. The
+         * obvious `bit ? x : -x` costs a select per weight and 32 serial loop
+         * iterations per group -- versus 8 iterations x 4 values in the 2-bit
+         * kernel -- which made 1-bit SLOWER than 2-bit despite moving half the
+         * bytes (moe 22.4 -> 27.3 s). Four partial sums restore the ILP the
+         * 2-bit path gets for free. */
+        float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            unsigned int b0 = (~v >> (j))      & 1u, b1 = (~v >> (j + 8))  & 1u;
+            unsigned int b2 = (~v >> (j + 16)) & 1u, b3 = (~v >> (j + 24)) & 1u;
+            p0 += __uint_as_float(__float_as_uint(xs[j])      ^ (b0 << 31));
+            p1 += __uint_as_float(__float_as_uint(xs[j + 8])  ^ (b1 << 31));
+            p2 += __uint_as_float(__float_as_uint(xs[j + 16]) ^ (b2 << 31));
+            p3 += __uint_as_float(__float_as_uint(xs[j + 24]) ^ (b3 << 31));
+        }
+        acc += ((p0 + p1) + (p2 + p3)) * mx4_scale_dev(sc[g]);
+    }
+    #pragma unroll
+    for (int off = 16; off; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    return acc;
+}
+
+__global__ void k3_w1_gate_up_fast(float *__restrict__ gate,
+                                   const unsigned char *__restrict__ w1p,
+                                   const unsigned char *__restrict__ w1s,
+                                   const unsigned char *__restrict__ w3p,
+                                   const unsigned char *__restrict__ w3s,
+                                   const float *__restrict__ z,
+                                   int I, int O, float beta1, float beta2) {
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i] = z[i];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    int ng = I >> 5; size_t rb = (size_t)(I >> 3);
+    float a = c_w1a[0];
+    float g1 = warp_row_dot_w1(w1p + (size_t)o*rb, w1s + (size_t)o*ng, shx, ng, lane) * a;
+    float g3 = warp_row_dot_w1(w3p + (size_t)o*rb, w3s + (size_t)o*ng, shx, ng, lane) * a;
+    if (lane == 0)
+        gate[o] = beta1 * tanhf(g1 / beta1) * (1.f / (1.f + expf(-g1)))
+                * beta2 * tanhf(g3 / beta2);
+}
+
+__global__ void k3_w1_down_fast(float *__restrict__ hz,
+                                const unsigned char *__restrict__ w2p,
+                                const unsigned char *__restrict__ w2s,
+                                const float *__restrict__ gate, int I, int O) {
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i] = gate[i];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    int ng = I >> 5; size_t rb = (size_t)(I >> 3);
+    float t = warp_row_dot_w1(w2p + (size_t)o*rb, w2s + (size_t)o*ng, shx, ng, lane) * c_w1a[0];
+    if (lane == 0) hz[o] = t;
+}
+
+extern "C" int coli_k3_expert_w1(const void *w1p, const void *w1s,
+                                 const void *w2p, const void *w2s,
+                                 const void *w3p, const void *w3s,
+                                 float *hz, const float *z,
+                                 int latent, int inter, float beta1, float beta2) {
+    if (!g_ready || latent != g_latent || inter != g_inter) return 0;
+    if (!ck(cudaMemcpyAsync(g_z, z, (size_t)latent*sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "z upload")) return 0;
+    int gu = (inter + K3_WARPS - 1) / K3_WARPS, dn = (latent + K3_WARPS - 1) / K3_WARPS;
+    k3_w1_gate_up_fast<<<gu, K3_FAST_THREADS, latent*sizeof(float), g_stream>>>(
+        g_gate, (const unsigned char*)w1p, (const unsigned char*)w1s,
+        (const unsigned char*)w3p, (const unsigned char*)w3s, g_z, latent, inter, beta1, beta2);
+    k3_w1_down_fast<<<dn, K3_FAST_THREADS, inter*sizeof(float), g_stream>>>(
+        g_hz, (const unsigned char*)w2p, (const unsigned char*)w2s, g_gate, inter, latent);
+    if (!ck(cudaMemcpyAsync(hz, g_hz, (size_t)latent*sizeof(float),
+                            cudaMemcpyDeviceToHost, g_stream), "hz download")) return 0;
+    return ck(cudaStreamSynchronize(g_stream), "expert sync");
+}
+
 extern "C" int coli_k3_init(int device, int latent, int inter) {
     if (g_ready) return 1;
     if ((latent & 31) || (inter & 31)) {
@@ -418,6 +524,16 @@ extern "C" int coli_k3_init(int device, int latent, int inter) {
     }
     if (!ck(cudaMemcpyToSymbol(c_mx4_lut, h_mx4_lut, sizeof(h_mx4_lut)), "lut upload")) return 0;
     if (!ck(cudaMemcpyToSymbol(c_w2_lut, h_w2_lut, sizeof(h_w2_lut)), "w2 lut upload")) return 0;
+    {   float v[4] = { -4.f, -1.f, 1.f, 4.f };
+        if (getenv("K3_W1") && atoi(getenv("K3_W1"))) {
+            float a = getenv("K3_W1_A") ? (float)atof(getenv("K3_W1_A")) : 1.69f;
+            v[0] = v[1] = -a; v[2] = v[3] = a;
+            fprintf(stderr, "[K3/EXP] K3_W1: experts collapsed to 1 bit {%+.2f,%+.2f}\n", -a, a);
+        }
+        if (!ck(cudaMemcpyToSymbol(c_w2v, v, sizeof(v)), "w2v upload")) return 0;
+        float a1 = getenv("K3_W1_A") ? (float)atof(getenv("K3_W1_A")) : 1.69f;
+        if (!ck(cudaMemcpyToSymbol(c_w1a, &a1, sizeof(a1)), "w1a upload")) return 0;
+    }
     if (!ck(cudaStreamCreate(&g_stream), "stream") ||
         !ck(cudaMalloc(&g_z, (size_t)latent * sizeof(float)), "z scratch") ||
         !ck(cudaMalloc(&g_gate, (size_t)inter * sizeof(float)), "gate scratch") ||

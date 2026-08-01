@@ -53,6 +53,13 @@ void *coli_k3_devcopy(const void *src, size_t n);
 int  coli_k3_dense(float *y, const float *x, const void *w, const float *scales,
                    int fmt, int S, int I, int O, int gs);
 
+/* 1-bit variant: one sign bit per weight, 8 per byte, same ue8m0 scales. */
+int  coli_k3_expert_w1(const void *w1p, const void *w1s,
+                       const void *w2p, const void *w2s,
+                       const void *w3p, const void *w3s,
+                       float *hz, const float *z,
+                       int latent, int inter, float beta1, float beta2);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus
