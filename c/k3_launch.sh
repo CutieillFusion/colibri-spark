@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Launch multi-node Kimi-K3 with a topology-aware all-reduce.
+#
+# The cluster is two isolated 200 GbE pairs (spark1<->spark2, spark3<->spark4)
+# bridged only by 1 GbE, so ranks are grouped by pair: each member reduces to
+# its pair leader over the fabric, and only the two leaders talk across the
+# bridge. Intra-group links MUST use the 10.10.x fabric addresses -- the
+# `sparkN` hostnames resolve to tailscale over the 1 GbE, which would silently
+# put the fast path on the slow wire.
+#
+#   rank 0 = spark1 (leader, root)   rank 1 = spark2 -> 10.10.12.1
+#   rank 2 = spark3 (leader)         rank 3 = spark4 -> 10.10.34.1
+#   rank 2 -> rank 0 over 192.168.0.159 (the 1 GbE bridge, one hop per layer)
+#
+# Usage:  ./k3_launch.sh <world:2|4> "<prompt>" [ngen]
+set -uo pipefail
+WORLD=${1:-2}; PROMPT=${2:-"The capital of France is"}; NGEN=${3:-8}
+BIN=${K3_BIN:-$HOME/colibri-spark/c/kimi_k3}
+SNAP=${K3_SNAP:-/tmp/Kimi-K3}
+PORT=${K3_MASTER_PORT:-29555}
+S="ssh -o BatchMode=yes -o StrictHostKeyChecking=no"
+
+HOSTS=(spark1 spark2 spark3 spark4)
+UP=("" 10.10.12.1 192.168.0.159 10.10.34.1)     # per-rank upstream address
+
+COMMON="K3_WORLD=$WORLD K3_GROUP_SIZE=2 K3_MASTER_PORT=$PORT \
+K3_GPUS=0 K3_GPU_GB=40 K3_EXPERT_GPU=1 K3_EXPERT_GB=28 K3_MAXT=512 OMP_NUM_THREADS=20"
+
+pids=()
+for ((r=0; r<WORLD; r++)); do
+  env_r="$COMMON K3_RANK=$r"
+  [ -n "${UP[$r]}" ] && env_r="$env_r K3_UP_HOST=${UP[$r]}"
+  # rank 0 keeps stdout (only it prints tokens); the rest log to files
+  if [ "$r" = 0 ]; then
+    $S "${HOSTS[$r]}" "$env_r $BIN $SNAP '$PROMPT' --ngen $NGEN" 2>&1 | sed "s/^/[r0] /" &
+  else
+    $S "${HOSTS[$r]}" "$env_r $BIN $SNAP '$PROMPT' --ngen $NGEN" \
+        > /tmp/k3-rank$r.log 2>&1 &
+  fi
+  pids+=($!)
+done
+wait "${pids[0]}"
+rc=$?
+for p in "${pids[@]:1}"; do wait "$p" 2>/dev/null; done
+echo "[launch] rank0 exit=$rc; other ranks logged to /tmp/k3-rank*.log (on this host)"
+exit $rc

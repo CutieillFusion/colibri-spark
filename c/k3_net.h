@@ -1,0 +1,239 @@
+#ifndef COLIBRI_K3_NET_H
+#define COLIBRI_K3_NET_H
+/* Hierarchical TCP all-reduce for multi-node Kimi-K3.
+ *
+ * Why sockets and not MPI/NCCL: the payload is one MoE latent accumulator per
+ * layer -- 3584 floats = 14 KB -- so ~93 reductions and ~1.3 MB per token. On
+ * any of these links that is negligible wire time; what costs is round trips.
+ * A dependency-free reduction keeps Colibri's "pure C, zero deps" property and
+ * is within a few hundred microseconds of anything fancier at this size.
+ *
+ * Why hierarchical: this cluster is NOT a 4-way fabric. Each Spark spends both
+ * its 200G ports on one partner, so it is two isolated pairs
+ * (spark1<->spark2, spark3<->spark4) bridged only by 1 GbE. A flat star rooted
+ * at rank 0 would drag every far-pair rank's payload across that bridge --
+ * 4 messages per reduction here. Reducing inside each pair first and crossing
+ * once cuts bridge traffic by the group size and keeps the slow hop off the
+ * critical path for all but one rank.
+ *
+ *   phase 1  members -> group leader        (intra-pair, 200 GbE)
+ *   phase 2  leaders  <-> root              (cross-pair, 1 GbE, ONE exchange)
+ *   phase 3  leader   -> members            (intra-pair, 200 GbE)
+ *
+ * Set K3_GROUP_SIZE=1 or =K3_WORLD to degenerate back to a flat star.
+ *
+ * Environment (the launcher computes these per rank):
+ *   K3_WORLD        ranks total; unset or 1 -> every collective is a no-op
+ *   K3_RANK         this rank, 0..world-1
+ *   K3_GROUP_SIZE   ranks per group (default = world, i.e. flat)
+ *   K3_UP_HOST      address of this rank's upstream: its group leader if it is
+ *                   a member, rank 0 if it is a non-root leader. Unset on
+ *                   rank 0. Use the FAST address for intra-group links --
+ *                   `ssh sparkN` names resolve to tailscale, not the fabric,
+ *                   so pass 10.10.12.x / 10.10.34.x here.
+ *   K3_MASTER_PORT  TCP port every leader listens on (default 29555)
+ */
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define K3_NET_MAX 16
+
+static int    g_net_rank = 0, g_net_world = 1, g_net_gsize = 1;
+static int    g_net_leader = 0, g_net_isleader = 1;
+static int    g_net_fd[K3_NET_MAX];        /* downstream: members, and (root) peer leaders */
+static int    g_net_up = -1;               /* upstream: leader, or root for a leader */
+static float *g_net_scratch = NULL;
+static size_t g_net_scratch_n = 0;
+static double g_net_secs = 0;              /* time parked in collectives */
+static uint64_t g_net_calls = 0;
+
+static inline int k3_net_rank(void)  { return g_net_rank; }
+static inline int k3_net_world(void) { return g_net_world; }
+static inline double k3_net_secs(void) { return g_net_secs; }
+static inline uint64_t k3_net_calls(void) { return g_net_calls; }
+
+static double k3_now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+                            return t.tv_sec + t.tv_nsec*1e-9; }
+
+static int k3_send_all(int fd, const void *p, size_t n) {
+    const char *b = (const char *)p;
+    while (n) { ssize_t k = send(fd, b, n, 0);
+        if (k <= 0) { if (errno == EINTR) continue; return 0; }
+        b += k; n -= (size_t)k; }
+    return 1;
+}
+static int k3_recv_all(int fd, void *p, size_t n) {
+    char *b = (char *)p;
+    while (n) { ssize_t k = recv(fd, b, n, 0);
+        if (k <= 0) { if (k < 0 && errno == EINTR) continue; return 0; }
+        b += k; n -= (size_t)k; }
+    return 1;
+}
+static void k3_nodelay(int fd) {
+    int one = 1;
+    /* Every message is a synchronous round trip; Nagle would add up to 40 ms
+     * per reduction, which at ~93 reductions/token is fatal. */
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
+static int k3_connect_retry(const char *host, int port) {
+    struct addrinfo hints, *res = NULL; char ps[16];
+    snprintf(ps, sizeof(ps), "%d", port);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    int fd = -1;
+    /* Ranks come up together under srun; retry so we do not race the listen. */
+    for (int t = 0; t < 900 && fd < 0; t++) {
+        if (res) { freeaddrinfo(res); res = NULL; }
+        if (getaddrinfo(host, ps, &hints, &res)) { usleep(100000); continue; }
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (connect(fd, res->ai_addr, res->ai_addrlen)) { close(fd); fd = -1; usleep(100000); }
+    }
+    if (res) freeaddrinfo(res);
+    if (fd < 0) { fprintf(stderr, "[K3/NET] connect %s:%d failed\n", host, port); exit(1); }
+    k3_nodelay(fd);
+    return fd;
+}
+
+static int k3_net_init(void) {
+    const char *w = getenv("K3_WORLD");
+    g_net_world = w ? atoi(w) : 1;
+    if (g_net_world <= 1) { g_net_world = 1; return 1; }
+    if (g_net_world > K3_NET_MAX) { fprintf(stderr,"[K3/NET] world %d > %d\n",g_net_world,K3_NET_MAX); exit(1); }
+    g_net_rank  = getenv("K3_RANK") ? atoi(getenv("K3_RANK")) : 0;
+    g_net_gsize = getenv("K3_GROUP_SIZE") ? atoi(getenv("K3_GROUP_SIZE")) : g_net_world;
+    if (g_net_gsize < 1) g_net_gsize = 1;
+    g_net_leader   = (g_net_rank / g_net_gsize) * g_net_gsize;
+    g_net_isleader = (g_net_rank == g_net_leader);
+    int port = getenv("K3_MASTER_PORT") ? atoi(getenv("K3_MASTER_PORT")) : 29555;
+    for (int i = 0; i < K3_NET_MAX; i++) g_net_fd[i] = -1;
+
+    /* How many inbound connections this rank owns: its group members, plus --
+     * on the root -- one per peer leader. */
+    int nmembers = 0;
+    for (int r = g_net_leader + 1; r < g_net_leader + g_net_gsize && r < g_net_world; r++) nmembers++;
+    int npeers = 0;
+    if (g_net_rank == 0)
+        for (int L = g_net_gsize; L < g_net_world; L += g_net_gsize) npeers++;
+    int nacc = (g_net_isleader ? nmembers : 0) + npeers;
+
+    int ls = -1;
+    if (nacc > 0) {
+        ls = socket(AF_INET, SOCK_STREAM, 0);
+        int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in a; memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons((uint16_t)port);
+        if (bind(ls,(struct sockaddr*)&a,sizeof(a)) || listen(ls, K3_NET_MAX)) {
+            fprintf(stderr,"[K3/NET] bind/listen :%d: %s\n",port,strerror(errno)); exit(1); }
+    }
+
+    /* Members connect up before leaders do, and every listener is already
+     * bound above, so there is no ordering deadlock: a leader can accept its
+     * members and then dial the root while the root is still accepting. */
+    if (!g_net_isleader) {
+        const char *up = getenv("K3_UP_HOST");
+        if (!up) { fprintf(stderr,"[K3/NET] rank %d: K3_UP_HOST unset\n",g_net_rank); exit(1); }
+        g_net_up = k3_connect_retry(up, port);
+        if (!k3_send_all(g_net_up,&g_net_rank,sizeof(g_net_rank))) { fprintf(stderr,"[K3/NET] hello\n"); exit(1); }
+    }
+    for (int i = 0; i < nacc; i++) {
+        int fd = accept(ls, NULL, NULL);
+        if (fd < 0) { fprintf(stderr,"[K3/NET] accept: %s\n",strerror(errno)); exit(1); }
+        int peer = -1;
+        if (!k3_recv_all(fd,&peer,sizeof(peer)) || peer < 0 || peer >= g_net_world) {
+            fprintf(stderr,"[K3/NET] bad hello\n"); exit(1); }
+        k3_nodelay(fd);
+        g_net_fd[peer] = fd;
+    }
+    if (g_net_isleader && g_net_rank != 0) {
+        const char *up = getenv("K3_UP_HOST");
+        if (!up) { fprintf(stderr,"[K3/NET] leader %d: K3_UP_HOST unset\n",g_net_rank); exit(1); }
+        g_net_up = k3_connect_retry(up, port);
+        if (!k3_send_all(g_net_up,&g_net_rank,sizeof(g_net_rank))) { fprintf(stderr,"[K3/NET] hello\n"); exit(1); }
+    }
+    if (ls >= 0) close(ls);
+    fprintf(stderr,"[K3/NET] rank %d/%d group=%d leader=%d%s ready\n",
+            g_net_rank,g_net_world,g_net_gsize,g_net_leader,g_net_isleader?" (leader)":"");
+    return g_net_world;
+}
+
+static void k3_reduce_from(int fd, float *v, size_t n) {
+    if (g_net_scratch_n < n) {
+        g_net_scratch = (float*)realloc(g_net_scratch, n*sizeof(float));
+        if (!g_net_scratch) { fprintf(stderr,"[K3/NET] OOM scratch\n"); exit(1); }
+        g_net_scratch_n = n;
+    }
+    if (!k3_recv_all(fd,g_net_scratch,n*sizeof(float))) { fprintf(stderr,"[K3/NET] recv\n"); exit(1); }
+    for (size_t i = 0; i < n; i++) v[i] += g_net_scratch[i];
+}
+
+/* v[0..n) := elementwise sum over all ranks. Blocking; every rank must call it
+ * the same number of times in the same order. */
+static void k3_net_allreduce(float *v, size_t n) {
+    if (g_net_world <= 1) return;
+    double t0 = k3_now();
+
+    /* 1. intra-group: members -> leader (fast link) */
+    if (g_net_isleader) {
+        for (int r = g_net_leader+1; r < g_net_leader+g_net_gsize && r < g_net_world; r++)
+            k3_reduce_from(g_net_fd[r], v, n);
+    } else if (!k3_send_all(g_net_up, v, n*sizeof(float))) {
+        fprintf(stderr,"[K3/NET] send to leader\n"); exit(1);
+    }
+
+    /* 2. across groups: leaders only — the single hop over the slow bridge */
+    if (g_net_isleader) {
+        if (g_net_rank == 0) {
+            for (int L = g_net_gsize; L < g_net_world; L += g_net_gsize)
+                k3_reduce_from(g_net_fd[L], v, n);
+            for (int L = g_net_gsize; L < g_net_world; L += g_net_gsize)
+                if (!k3_send_all(g_net_fd[L], v, n*sizeof(float))) {
+                    fprintf(stderr,"[K3/NET] bcast to leader %d\n",L); exit(1); }
+        } else {
+            if (!k3_send_all(g_net_up, v, n*sizeof(float)) ||
+                !k3_recv_all(g_net_up, v, n*sizeof(float))) {
+                fprintf(stderr,"[K3/NET] leader exchange\n"); exit(1); }
+        }
+    }
+
+    /* 3. intra-group: leader -> members (fast link) */
+    if (g_net_isleader) {
+        for (int r = g_net_leader+1; r < g_net_leader+g_net_gsize && r < g_net_world; r++)
+            if (!k3_send_all(g_net_fd[r], v, n*sizeof(float))) {
+                fprintf(stderr,"[K3/NET] bcast to member %d\n",r); exit(1); }
+    } else if (!k3_recv_all(g_net_up, v, n*sizeof(float))) {
+        fprintf(stderr,"[K3/NET] recv from leader\n"); exit(1);
+    }
+
+    g_net_secs += k3_now() - t0; g_net_calls++;
+}
+
+/* Rendezvous, then zero the counters. Ranks finish loading at different times
+ * (measured: 23 s apart on a 2-node run), and without this the first reduction
+ * absorbs that skew and shows up as enormous per-call network cost — which is
+ * startup jitter, not wire time. Call once after the model is resident. */
+static void k3_net_barrier(void) {
+    if (g_net_world <= 1) return;
+    float x = 0.f;
+    k3_net_allreduce(&x, 1);
+    g_net_secs = 0; g_net_calls = 0;
+}
+
+static void k3_net_finalize(void) {
+    if (g_net_world <= 1) return;
+    for (int i = 0; i < K3_NET_MAX; i++) if (g_net_fd[i] >= 0) close(g_net_fd[i]);
+    if (g_net_up >= 0) close(g_net_up);
+    free(g_net_scratch); g_net_scratch = NULL; g_net_scratch_n = 0;
+}
+
+#endif

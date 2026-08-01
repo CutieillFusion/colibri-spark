@@ -73,6 +73,7 @@
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
+#include "k3_net.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #include "backend_cuda_k3.h"
@@ -1102,15 +1103,23 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
         if(!map||!uid||!pcnt||!pfirst||!poslist||!cur){fprintf(stderr,"OOM moe union\n");exit(1);}
         for(int e=0;e<E;e++) map[e]=-1;
         int nu=0;
+        int world=k3_net_world(), rank=k3_net_rank();
         for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
             int e=idxs[(int64_t)t*K+kk];
+            /* Expert parallelism: every rank runs the SAME router and top-k
+             * (same weights, same x, deterministic), so ownership needs no
+             * communication — each rank simply drops the experts it does not
+             * hold and the partial sums are reduced below. */
+            if(world>1 && e%world!=rank) continue;
             if(map[e]<0){ map[e]=nu; uid[nu]=e; pcnt[nu]=0; nu++; }
             pcnt[map[e]]++;
         }
         int acc=0;
         for(int j=0;j<nu;j++){ pfirst[j]=acc; cur[j]=acc; acc+=pcnt[j]; }
         for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
-            int j=map[idxs[(int64_t)t*K+kk]];
+            int e=idxs[(int64_t)t*K+kk];
+            if(world>1 && e%world!=rank) continue;
+            int j=map[e];
             poslist[cur[j]]=t; wlist[cur[j]]=wsels[(int64_t)t*K+kk]; cur[j]++;
         }
         /* keep loads in DISK-OFFSET order (experts are NOT id-ordered inside
@@ -1133,6 +1142,10 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
         experts_apply_union(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,u,gate,up,hz);
         free(map);free(uid);free(pcnt);free(pfirst);free(poslist);free(wlist);free(cur);
     }
+    /* Sum the per-rank partial expert contributions. MUST precede the rmsnorm:
+     * that norm is nonlinear, so reducing after it would not equal the
+     * single-node result. 14 KB per token per layer — latency, not bandwidth. */
+    k3_net_allreduce(u,(size_t)C*LT);
     for(int t=0;t<C;t++)
         rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
     w_matmul(out,u,&o->lat_up,C);
@@ -1542,6 +1555,12 @@ static void serve_loop(Model *m, Tok *T){
 }
 
 int main(int argc, char **argv){
+    /* Multi-node: K3_WORLD>1 shards the routed experts across ranks. Every
+     * rank runs the identical dense forward and, after the per-layer
+     * all-reduce, holds identical activations — so all ranks sample the same
+     * token and stay in lockstep with no extra synchronisation. Only rank 0
+     * writes to stdout. No-op when K3_WORLD is unset. */
+    k3_net_init();
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
     if(!serving&&argc<2){
         fprintf(stderr,"usage: %s <model_dir> [prompt] [--ids \"1 2 3\"] [--ngen N]\n",argv[0]);
@@ -1577,6 +1596,7 @@ int main(int argc, char **argv){
     int nlayers=getenv("K3_LAYERS")?atoi(getenv("K3_LAYERS")):0;
     Model m;
     model_init(&m,snap,nlayers);
+    k3_net_barrier();   /* line the ranks up before timing anything (see k3_net.h) */
     if(getenv("K3_TRACE")){
         m.trace=fopen(getenv("K3_TRACE"),"wb");
         if(!m.trace){ perror(getenv("K3_TRACE")); return 1; }
@@ -1675,7 +1695,7 @@ int main(int argc, char **argv){
                 show=0;
             } else if(t==sp[3]) show=0;
         }
-        if(show){
+        if(show && k3_net_rank()==0){    /* every rank generates; only rank 0 speaks */
             if(has_tok){ int n2=tok_decode(&T,&t,1,buf,sizeof(buf)-1); fwrite(buf,1,n2,stdout); fflush(stdout); }
             else { printf("%d ",t); fflush(stdout); }
         }
@@ -1694,6 +1714,10 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+    if(k3_net_world()>1)
+        fprintf(stderr,"[K3/NET] allreduce %.1fs over %llu calls (%.2f ms each)\n",
+            k3_net_secs(),(unsigned long long)k3_net_calls(),
+            k3_net_calls()?1e3*k3_net_secs()/(double)k3_net_calls():0.0);
 #ifdef COLI_CUDA
     k3_cuda_report();
 #endif
