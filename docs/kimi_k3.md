@@ -162,6 +162,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_DENSE_GPU` | 1 | zero-copy CUDA dense GEMV during decode (0 = device-mirror path) |
 | `K3_DENSE_EXACT` | 1 | stock-order bit-exact reduction (0 = legacy warp reduction) |
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
+| `K3_SPEC` | 0 | greedy speculative depth (0 = off); prompt-lookup draft for harness validation |
 | `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |
 | `K3_MAXT` | prompt+ngen | context capacity |
@@ -184,6 +185,53 @@ results are **bit-identical** to token-at-a-time (verified: 125-position
 teacher-forced logit streams at C=32 vs C=1 match exactly). Measured prefill:
 ~5.3 -> **2.0 s/token** at C=32. The KDA state-update sweeps are AVX2
 (scalar fallback for head dims not divisible by 8).
+
+## Speculative-decoding harness
+
+`K3_SPEC=k` enables a draft-agnostic greedy verification loop with proposal
+depth `k` (capped at 48). It is off by default and currently uses only a small,
+deterministic prompt-lookup draft: the longest recent suffix match in the live
+context proposes tokens that followed its earlier occurrence. This draft is a
+machinery test, not a performance model; a learned draft can replace the
+proposal callback without changing verification, rollback, or commit.
+The harness currently applies to standalone generation (including
+`k3_launch.sh`); serve-mode decoding remains unchanged.
+
+The newest committed token is held pending. A verify pass runs
+`[pending, draft...]` with one target-logit row per position, accepts the
+longest greedy-argmax prefix, restores KDA recurrence plus all three convolution
+windows, logically truncates the append-only MLA cache, then replays
+`pending + accepted`. The target's mismatch/bonus token becomes the next
+pending token. Each rank snapshots only its tensor-parallel KDA head slice, and
+draft ids are explicitly checked for equality across ranks before target
+collectives begin. AttnRes needs no snapshot: its prefix and block residuals
+are allocated inside each forward and carry state across layers, not tokens.
+
+Only `COLI_TEMP=0` is supported by this harness. Exit statistics report draft
+proposals and acceptances, mean accepted prefix, verify-pass count, unique
+experts per layer for a single row versus the verify union, expert cache
+hits/misses and bytes per accepted draft token, and the verify pass's expert
+load-time share. A rejected verify still warms the expert LRU and its I/O is
+intentionally counted; only model-sequential state is rolled back.
+
+Measured on four GB10 nodes with the 1-bit store, `K3_GPU_GB=30`,
+`K3_EXPERT_GB=60`, `K3_SPEC=8`, and the 300-token B-tree prompt used by the
+decode baseline, this trivial draft is a clear loss:
+
+| mode | decode | tok/s | expert hit | streamed |
+|---|---:|---:|---:|---:|
+| stock | 247.2 s | 1.21 | 87.7% | 70.5 GB |
+| prompt lookup | 524.5 s | 0.57 | 93.1% | 86.4 GB |
+
+Prompt lookup proposed 236 tokens, accepted 42 (mean accepted prefix 0.16 over
+258 verify passes), and widened the multi-row verify union from 16 to about
+81.9 experts/layer. Verify passes spent 15.5 of 327.1 seconds waiting for
+expert loads; snapshot copies took 1.4 seconds and replay took 195.5 seconds.
+Both runs produced the identical 300-token FNV-64 id hash
+`b265beb4b663098e`. The higher cache hit percentage is therefore not a speedup:
+verification warmed the LRU by doing substantially more total work. The flag
+stays off by default; a useful learned draft needs enough acceptance to recover
+the verify/replay cost.
 
 ## Chat, API, and Web
 

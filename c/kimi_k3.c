@@ -48,6 +48,8 @@
  *   K3_DENSE_GPU=0|1     zero-copy dense decode GEMV (default 1)
  *   K3_DENSE_EXACT=0|1   stock-order exact reduction (default 1)
  *   K3_CHUNK=N           prefill chunk size (default 32; 1 = token-at-a-time)
+ *   K3_SPEC=N            greedy speculative draft depth (default 0 = off;
+ *                        prompt-lookup draft, target always verifies)
  *   K3_THINK=0|1         chat mode: open the think channel (default 1)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
  *   K3_TRACE=path        dump f32 hidden state after every layer (validation)
@@ -225,6 +227,10 @@ typedef struct {
     float *hz_batch;                      /* [64][latent] batched-expert results */
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
+    int state_pos;                         /* logical KDA/MLA position (rollback truncates here) */
+    int spec_verify;                       /* route-union accounting: inside verify pass */
+    uint64_t spec_union, spec_union_layers;/* unique experts in verify chunks */
+    uint64_t spec_c1, spec_c1_rows;        /* same routes viewed one position at a time */
     /* fine-grained moe breakdown (K3_PROFILE=1): coarse t_moe hid that
      * routed experts were only ~1/5 of it, which sent one optimisation
      * pass at the wrong term. */
@@ -1718,6 +1724,26 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
             if(map[e]<0){ map[e]=nu; uid[nu]=e; pcnt[nu]=0; nu++; }
             pcnt[map[e]]++;
         }
+        /* Speculation widens the routed-expert working set from one row's
+         * top-k to the union of every verify row. Record both views from the
+         * SAME router decisions; comparing against a separate C=1 run would
+         * mix in different cache history and make the result misleading. */
+        if(m->spec_verify){
+            for(int t=0;t<C;t++){
+                m->spec_c1+=(uint64_t)keff[t];
+                m->spec_c1_rows++;
+            }
+            if(C>1){
+                uint8_t *seen=calloc((size_t)E,1); int gnu=0;
+                if(!seen){ fprintf(stderr,"OOM spec route union\n"); exit(1); }
+                for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
+                    int e=idxs[(int64_t)t*K+kk]; if(!seen[e]){ seen[e]=1; gnu++; }
+                }
+                free(seen);
+                m->spec_union+=(uint64_t)gnu;
+                m->spec_union_layers++;
+            }
+        }
         int acc=0;
         for(int j=0;j<nu;j++){ pfirst[j]=acc; cur[j]=acc; acc+=pcnt[j]; }
         for(int t=0;t<C;t++) for(int kk=0;kk<keff[t];kk++){
@@ -1786,16 +1812,75 @@ static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out)
     free(g);free(u);
 }
 
+/* A speculative verify mutates KDA recurrence and convolution windows in
+ * place. MLA is append-only, so restoring its logical length is enough: rows
+ * at and beyond pos are ignored and overwritten by replay. Only the local TP
+ * head slice is live on a rank, which keeps a four-rank snapshot near 109 MB
+ * instead of copying 434 MB of zero/foreign state. */
+typedef struct {
+    float *kstate, *conv;
+    size_t nk, nc;
+    int pos;
+} K3StateSnapshot;
+
+static void k3_snapshot_init(K3StateSnapshot *s, const Model *m){
+    memset(s,0,sizeof(*s));
+    const Cfg *c=&m->c; int h0,hn; k3_head_shard(c->kda_heads,&h0,&hn); (void)h0;
+    int nkda=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].kda) nkda++;
+    s->nk=(size_t)nkda*hn*c->kda_hd*c->kda_hd;
+    s->nc=(size_t)nkda*3*hn*c->kda_hd*c->conv_k;
+    s->kstate=falloc(s->nk?s->nk:1);
+    s->conv=falloc(s->nc?s->nc:1);
+}
+
+static void k3_snapshot_take(K3StateSnapshot *s, const Model *m){
+    const Cfg *c=&m->c; int h0,hn; k3_head_shard(c->kda_heads,&h0,&hn);
+    size_t kn=(size_t)hn*c->kda_hd*c->kda_hd;
+    size_t cn=(size_t)hn*c->kda_hd*c->conv_k, ko=0, co=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
+        memcpy(s->kstate+ko,m->kstate[i]+(size_t)h0*c->kda_hd*c->kda_hd,kn*sizeof(float)); ko+=kn;
+        float *w[3]={m->cwq[i],m->cwk[i],m->cwv[i]};
+        for(int q=0;q<3;q++){ memcpy(s->conv+co,w[q]+(size_t)h0*c->kda_hd*c->conv_k,cn*sizeof(float)); co+=cn; }
+    }
+    if(ko!=s->nk||co!=s->nc){ fprintf(stderr,"[K3/spec] snapshot layout mismatch\n"); exit(1); }
+    s->pos=m->state_pos;
+}
+
+static void k3_snapshot_restore(Model *m, const K3StateSnapshot *s){
+    const Cfg *c=&m->c; int h0,hn; k3_head_shard(c->kda_heads,&h0,&hn);
+    size_t kn=(size_t)hn*c->kda_hd*c->kda_hd;
+    size_t cn=(size_t)hn*c->kda_hd*c->conv_k, ko=0, co=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
+        memcpy(m->kstate[i]+(size_t)h0*c->kda_hd*c->kda_hd,s->kstate+ko,kn*sizeof(float)); ko+=kn;
+        float *w[3]={m->cwq[i],m->cwk[i],m->cwv[i]};
+        for(int q=0;q<3;q++){ memcpy(w[q]+(size_t)h0*c->kda_hd*c->conv_k,s->conv+co,cn*sizeof(float)); co+=cn; }
+    }
+    m->state_pos=s->pos;                  /* logical MLA truncation */
+}
+
+static void k3_snapshot_free(K3StateSnapshot *s){
+    free(s->kstate); free(s->conv); memset(s,0,sizeof(*s));
+}
+
 /* ---------- a CHUNK of C tokens through the stack, layer-major: every dense
  * matmul batches over the chunk (weights stream from RAM once per chunk), the
  * MoE loads each unique expert once. Sequential state (KDA recurrence, MLA
  * cache, AttnRes bookkeeping) advances per token inside each layer, which is
  * exactly the original order — chunked results are bit-identical to C=1.
- * Returns the LAST position's logits (falloc'd), or NULL pre-head. ---------- */
+ * `logit_rows` selects no returned logits (0), only the last row (1), or all
+ * C rows (C). The latter is the verifier interface; K3_LOGITS uses the same
+ * head loop rather than a separate inference path. Returned storage is
+ * falloc'd and row-major. ---------- */
 static float *g_x0=NULL; static int g_x0_n=0;  /* K3_X0: injected inputs (validation) */
 static FILE *g_lfp=NULL;                       /* K3_LOGITS: per-position logit dump */
-static float *step_chunk(Model *m, const int *ids, int pos0, int C){
+static float *step_chunk_rows(Model *m, const int *ids, int pos0, int C, int logit_rows){
     Cfg *c=&m->c; int D=c->hidden;
+    if(C<1 || (logit_rows!=0 && logit_rows!=1 && logit_rows!=C)){
+        fprintf(stderr,"step_chunk: invalid C=%d logit_rows=%d\n",C,logit_rows); exit(1);
+    }
+    if(pos0!=m->state_pos){
+        fprintf(stderr,"step_chunk: non-sequential pos %d (state at %d)\n",pos0,m->state_pos); exit(1);
+    }
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
     float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
     float *prefix=falloc((int64_t)C*D), *nrm=falloc((int64_t)C*D);
@@ -1847,22 +1932,28 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
     float *logits=NULL;
     if(m->has_head){
         double t0=now_s();
+        if(logit_rows) logits=falloc((int64_t)logit_rows*c->vocab);
         for(int t=0;t<C;t++){
-            /* head only where needed: the chunk's last token (feeds sampling)
-             * and every position when K3_LOGITS dumps teacher-forced logits */
-            if(!g_lfp && t<C-1) continue;
+            int keep_all=(logit_rows==C), keep_last=(logit_rows==1&&t==C-1);
+            if(!g_lfp && !keep_all && !keep_last) continue;
             res_mix(mix,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
             rmsnorm_(mix,mix,m->final_norm,D,c->eps);
             if(m->trace) fwrite(mix,sizeof(float),D,m->trace);
-            float *lo=falloc(c->vocab);
+            float *lo=keep_all?logits+(int64_t)t*c->vocab:
+                      keep_last?logits:falloc(c->vocab);
             w_matmul(lo,mix,&m->lm_head,1);
             if(g_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_lfp);
-            if(t==C-1) logits=lo; else free(lo);
+            if(!keep_all&&!keep_last) free(lo);
         }
         m->t_head+=now_s()-t0;
     }
+    m->state_pos=pos0+C;
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
     return logits;
+}
+
+static float *step_chunk(Model *m, const int *ids, int pos0, int C){
+    return step_chunk_rows(m,ids,pos0,C,1);
 }
 
 static void kv_alloc(Model *m, int max_t){
@@ -1899,6 +1990,91 @@ static int sample_tok(const float *lo, int V, float temp, float top_p){
     double r=((double)rand()/RAND_MAX)*kept, acc=0; int pick=rank[0].id;
     for(int i=0;i<n;i++){ acc+=rank[i].p; if(acc>=r){ pick=rank[i].id; break; } }
     free(rank); return pick;
+}
+
+/* Draft-provider boundary. A future learned draft only replaces `propose`;
+ * snapshot, target verification, acceptance, rollback and commit stay here. */
+typedef int (*K3DraftPropose)(void *ctx, const int *ids, int nids, int *out, int cap);
+typedef struct { K3DraftPropose propose; void *ctx; const char *name; } K3Draft;
+
+static int k3_argmax(const float *lo, int V){
+    int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b;
+}
+
+static uint64_t k3_token_hash_add(uint64_t h, int id){
+    uint32_t u=(uint32_t)id;
+    for(int b=0;b<4;b++){ h^=(uint8_t)(u>>(8*b)); h*=UINT64_C(1099511628211); }
+    return h;
+}
+
+static int k3_accept_prefix(const float *rows, int V, const int *draft, int n){
+    int a=0; while(a<n && k3_argmax(rows+(int64_t)a*V,V)==draft[a]) a++; return a;
+}
+
+/* Prompt lookup: longest live-context suffix (up to 8 tokens), most recent
+ * earlier occurrence first, followed by as many already-seen tokens as fit.
+ * It is intentionally tiny and deterministic; its job is to exercise the
+ * harness, not to be a useful K3 draft model. */
+static int k3_prompt_lookup(void *unused, const int *ids, int n, int *out, int cap){
+    (void)unused;
+    if(cap<1||n<3) return 0;
+    int maxm=n-1<8?n-1:8;
+    for(int m=maxm;m>=2;m--){
+        const int *suffix=ids+n-m;
+        for(int i=n-m-1;i>=0;i--){
+            if(i+m>=n || memcmp(ids+i,suffix,(size_t)m*sizeof(int))) continue;
+            int got=n-(i+m); if(got>cap) got=cap;
+            if(got>0){ memcpy(out,ids+i+m,(size_t)got*sizeof(int)); return got; }
+        }
+    }
+    return 0;
+}
+
+/* Every rank owns an identical live token context and therefore must produce
+ * an identical draft before entering the target collectives. Make that a
+ * checked invariant: a divergent draft otherwise deadlocks at acceptance. */
+static void k3_draft_assert_equal(const int *draft, int n){
+    int world=k3_net_world(); if(world<=1) return;
+    float *v=falloc(n+1); v[0]=(float)n;
+    for(int i=0;i<n;i++) v[i+1]=(float)draft[i];
+    k3_net_allreduce(v,(size_t)n+1);
+    int bad=(v[0]!=(float)(n*world));
+    for(int i=0;i<n;i++) if(v[i+1]!=(float)(draft[i]*world)) bad=1;
+    free(v);
+    if(bad){ fprintf(stderr,"[K3/spec] draft mismatch across ranks\n"); exit(1); }
+}
+
+typedef struct {
+    uint64_t proposed, accepted, passes, emitted;
+    uint64_t hits0, miss0, bytes0;
+    double verify_s, verify_eload, snapshot_s, replay_s;
+} K3SpecStats;
+
+typedef struct {
+    Tok *tok; int has_tok, chat; const int *sp;
+    int xsup, xopen, xtl; char xtag[64], buf[512];
+} K3PrintState;
+
+static void k3_print_generated(K3PrintState *p, int t){
+    int show=1;
+    if(p->chat&&p->sp[0]>=0){
+        if(t==p->sp[0]||t==p->sp[1]){ p->xsup=1; p->xopen=(t==p->sp[0]); p->xtl=0; show=0; }
+        else if(t==p->sp[2]){
+            if(p->xsup){ p->xsup=0; p->xtag[p->xtl]=0;
+                if(p->xopen&&!strcmp(p->xtag,"response")){ printf("\n\n[response] "); fflush(stdout); }
+            }
+            show=0;
+        } else if(p->xsup){
+            if(p->has_tok){ int n=tok_decode(p->tok,&t,1,p->buf,sizeof(p->buf)-1);
+                if(p->xtl+n<(int)sizeof(p->xtag)){ memcpy(p->xtag+p->xtl,p->buf,(size_t)n); p->xtl+=n; } }
+            show=0;
+        } else if(t==p->sp[3]) show=0;
+    }
+    if(show&&k3_net_rank()==0){
+        if(p->has_tok){ int n=tok_decode(p->tok,&t,1,p->buf,sizeof(p->buf)-1);
+            fwrite(p->buf,1,(size_t)n,stdout); fflush(stdout); }
+        else { printf("%d ",t); fflush(stdout); }
+    }
 }
 
 /* ---------- K3 XTML chat format (faithful to the shipped encoding_k3.py) --
@@ -2045,6 +2221,7 @@ static void model_state_reset(Model *m){
     }
     free(m->Lc); free(m->Rc);
     m->Lc=NULL; m->Rc=NULL; m->max_t=0;
+    m->state_pos=0;
 }
 
 static int serve_stdin_readable(void){
@@ -2283,6 +2460,16 @@ int main(int argc, char **argv){
     } else { fprintf(stderr,"no prompt and no --ids\n"); return 1; }
     fprintf(stderr,"[K3] prompt: %d tokens | ngen %d | temp %.2f\n",np,ngen,temp);
     int max_t=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):np+ngen;
+    int spec_k=getenv("K3_SPEC")?atoi(getenv("K3_SPEC")):0;
+    if(spec_k<0) spec_k=0; if(spec_k>48) spec_k=48;
+    if(ngen<=0) spec_k=0;                 /* validation prefill must remain complete */
+    if(spec_k&&temp!=0.f){
+        fprintf(stderr,"[K3/spec] K3_SPEC requires COLI_TEMP=0 (greedy verification)\n"); return 1;
+    }
+    if(spec_k&&np+ngen>65536){
+        fprintf(stderr,"[K3/spec] prompt+generation exceeds 65536-token harness context\n"); return 1;
+    }
+    if(spec_k) fprintf(stderr,"[K3/spec] depth %d, draft prompt-lookup (default remains off)\n",spec_k);
     kv_alloc(&m,max_t);
     if(getenv("K3_LOGITS")){
         g_lfp=fopen(getenv("K3_LOGITS"),"wb");
@@ -2295,59 +2482,111 @@ int main(int argc, char **argv){
         chunk=1;                       /* trace rows are token-major by contract */
         fprintf(stderr,"[K3] K3_TRACE set: prefill chunk forced to 1\n");
     }
+    /* Spec mode holds the prompt's final token pending. The first verify pass
+     * consumes it and predicts output token 0; state_pos is therefore always
+     * exactly one behind the live token context. */
+    int prefill_n=spec_k?np-1:np;
     double t0=now_s(); float *lo=NULL;
-    for(int i=0;i<np;i+=chunk){
-        int Cc=np-i<chunk?np-i:chunk;
+    for(int i=0;i<prefill_n;i+=chunk){
+        int Cc=prefill_n-i<chunk?prefill_n-i:chunk;
         if(lo) free(lo);
         lo=step_chunk(&m,ids+i,i,Cc);
-        fprintf(stderr,"\r[K3] prefill %d/%d (%.1fs)",i+Cc,np,now_s()-t0);
+        fprintf(stderr,"\r[K3] prefill %d/%d (%.1fs)",i+Cc,prefill_n,now_s()-t0);
     }
     if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
-    fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
-    if(!m.has_head||!lo){
+    fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,
+            prefill_n?prefill_n/(now_s()-t0):0.0);
+    if(!m.has_head||(!spec_k&&!lo)){
         fprintf(stderr,"[K3] no head — trace written, stopping after prefill\n");
         if(m.trace) fclose(m.trace);
         return 0;
     }
-    double tg=now_s(); int ntok=0;
-    char buf[512];
+    double tg=now_s(); int ntok=0; uint64_t token_hash=UINT64_C(1469598103934665603);
     /* chat print filter: hide the XTML structure, label the channels.
      * Structural runs are <|open|>/<|close|> TAGTEXT <|sep|> — suppress them
      * and print a channel banner when the response channel opens. */
-    int xsup=0, xopen=0; char xtag[64]; int xtl=0;
+    K3PrintState ps={.tok=&T,.has_tok=has_tok,.chat=chat,.sp=sp};
     if(chat&&think){ printf("[think] "); fflush(stdout); }
-    for(int s=0;s<ngen;s++){
-        int t=sample_tok(lo,m.c.vocab,temp,1.f);
+    K3SpecStats ss={0}; ss.hits0=m.hits; ss.miss0=m.miss; ss.bytes0=m.ebytes;
+    if(!spec_k){
+        for(int s=0;s<ngen;s++){
+            int t=sample_tok(lo,m.c.vocab,temp,1.f);
+            free(lo); lo=NULL;
+            k3_print_generated(&ps,t); token_hash=k3_token_hash_add(token_hash,t); ntok++;
+            int is_eos=0; for(int e=0;e<m.c.n_eos;e++) if(t==m.c.eos[e]) is_eos=1;
+            if(is_eos){ fprintf(stderr,"\n[K3] eos\n"); break; }
+            if(np+ntok>=max_t){ fprintf(stderr,"\n[K3] context full\n"); break; }
+            lo=step_chunk(&m,&t,np+ntok-1,1);
+            double el=now_s()-tg;
+            fprintf(stderr,"  [tok %d: %.1fs/tok, hit %.0f%%, %.1f GB read]\n",
+                    ntok,el/ntok,100.0*m.hits/(m.hits+m.miss+1e-9),m.ebytes/1e9);
+        }
+    } else {
         free(lo); lo=NULL;
-        int is_eos=0; for(int e=0;e<m.c.n_eos;e++) if(t==m.c.eos[e]) is_eos=1;
-        int show=1;
-        if(chat&&sp[0]>=0){
-            if(t==sp[0]||t==sp[1]){ xsup=1; xopen=(t==sp[0]); xtl=0; show=0; }
-            else if(t==sp[2]){
-                if(xsup){ xsup=0; xtag[xtl]=0;
-                    if(xopen&&!strcmp(xtag,"response")){ printf("\n\n[response] "); fflush(stdout); }
-                }
-                show=0;
-            } else if(xsup){
-                if(has_tok){ int n2=tok_decode(&T,&t,1,buf,sizeof(buf)-1);
-                    if(xtl+n2<(int)sizeof(xtag)){ memcpy(xtag+xtl,buf,n2); xtl+=n2; } }
-                show=0;
-            } else if(t==sp[3]) show=0;
+        K3Draft draft={k3_prompt_lookup,NULL,"prompt-lookup"};
+        K3StateSnapshot snapstate; k3_snapshot_init(&snapstate,&m);
+        int *proposal=malloc((size_t)spec_k*sizeof(int));
+        int *batch=malloc((size_t)(spec_k+1)*sizeof(int));
+        if(!proposal||!batch){ fprintf(stderr,"OOM speculative buffers\n"); return 1; }
+        int nctx=np, stop=0;
+        while(ntok<ngen&&!stop){
+            int cap=ngen-ntok-1; if(cap>spec_k) cap=spec_k; if(cap<0) cap=0;
+            int nd=cap?draft.propose(draft.ctx,ids,nctx,proposal,cap):0;
+            if(nd<0||nd>cap){ fprintf(stderr,"[K3/spec] draft returned invalid length %d/%d\n",nd,cap); exit(1); }
+            k3_draft_assert_equal(proposal,nd);
+            batch[0]=ids[nctx-1]; for(int i=0;i<nd;i++) batch[i+1]=proposal[i];
+            double ts=now_s(); k3_snapshot_take(&snapstate,&m); ss.snapshot_s+=now_s()-ts;
+            if(snapstate.pos!=nctx-1){
+                fprintf(stderr,"[K3/spec] pending invariant failed: state=%d context=%d\n",snapstate.pos,nctx); exit(1);
+            }
+            double ve0=m.t_eload;
+            double tv=now_s(); m.spec_verify=1;
+            float *rows=step_chunk_rows(&m,batch,nctx-1,nd+1,nd+1);
+            m.spec_verify=0; ss.verify_s+=now_s()-tv; ss.verify_eload+=m.t_eload-ve0;
+            int na=k3_accept_prefix(rows,m.c.vocab,proposal,nd);
+            int correction=k3_argmax(rows+(int64_t)na*m.c.vocab,m.c.vocab);
+            ss.proposed+=(uint64_t)nd; ss.accepted+=(uint64_t)na; ss.passes++;
+            ts=now_s(); k3_snapshot_restore(&m,&snapstate);
+            free(step_chunk_rows(&m,batch,nctx-1,na+1,0)); ss.replay_s+=now_s()-ts;
+            for(int i=0;i<na&&!stop;i++){
+                int t=proposal[i]; ids[nctx++]=t; k3_print_generated(&ps,t);
+                token_hash=k3_token_hash_add(token_hash,t); ntok++; ss.emitted++;
+                for(int e=0;e<m.c.n_eos;e++) if(t==m.c.eos[e]) stop=1;
+                if(nctx>=max_t) stop=1;
+            }
+            if(!stop){
+                ids[nctx++]=correction; k3_print_generated(&ps,correction);
+                token_hash=k3_token_hash_add(token_hash,correction); ntok++; ss.emitted++;
+                for(int e=0;e<m.c.n_eos;e++) if(correction==m.c.eos[e]) stop=1;
+                if(nctx>=max_t) stop=1;
+            }
+            free(rows);
+            double el=now_s()-tg;
+            fprintf(stderr,"  [spec tok %d: %.1fs/tok, accepted %d/%d, hit %.0f%%, %.1f GB read]\n",
+                    ntok,el/ntok,na,nd,100.0*m.hits/(m.hits+m.miss+1e-9),m.ebytes/1e9);
         }
-        if(show && k3_net_rank()==0){    /* every rank generates; only rank 0 speaks */
-            if(has_tok){ int n2=tok_decode(&T,&t,1,buf,sizeof(buf)-1); fwrite(buf,1,n2,stdout); fflush(stdout); }
-            else { printf("%d ",t); fflush(stdout); }
-        }
-        ntok++;
-        if(is_eos){ fprintf(stderr,"\n[K3] eos\n"); break; }
-        if(np+ntok>=max_t){ fprintf(stderr,"\n[K3] context full\n"); break; }
-        lo=step_chunk(&m,&t,np+ntok-1,1);
-        double el=now_s()-tg;
-        fprintf(stderr,"  [tok %d: %.1fs/tok, hit %.0f%%, %.1f GB read]\n",
-                ntok,el/ntok,100.0*m.hits/(m.hits+m.miss+1e-9),m.ebytes/1e9);
+        if(stop) fprintf(stderr,"\n[K3/spec] eos or context full\n");
+        uint64_t dh=m.hits-ss.hits0, dm=m.miss-ss.miss0, db=m.ebytes-ss.bytes0;
+        fprintf(stderr,"[K3/spec] proposed %llu accepted %llu | mean acceptance %.2f | verify passes %llu\n",
+                (unsigned long long)ss.proposed,(unsigned long long)ss.accepted,
+                ss.passes?(double)ss.accepted/ss.passes:0.0,(unsigned long long)ss.passes);
+        fprintf(stderr,"[K3/spec] experts/layer: C=1 %.2f, verify C=1+k %.2f | verify eload %.1fs / %.1fs (%.1f%%)\n",
+                m.spec_c1_rows?(double)m.spec_c1/m.spec_c1_rows:0.0,
+                m.spec_union_layers?(double)m.spec_union/m.spec_union_layers:0.0,
+                ss.verify_eload,ss.verify_s,ss.verify_s?100.0*ss.verify_eload/ss.verify_s:0.0);
+        if(ss.accepted)
+            fprintf(stderr,"[K3/spec] per accepted draft: hits %.1f misses %.1f streamed %.3f GB | snapshot %.1fs replay %.1fs\n",
+                    (double)dh/ss.accepted,(double)dm/ss.accepted,(double)db/ss.accepted/1e9,
+                    ss.snapshot_s,ss.replay_s);
+        else
+            fprintf(stderr,"[K3/spec] per accepted draft: n/a (0 accepted) | totals hits %llu misses %llu streamed %.1f GB | snapshot %.1fs replay %.1fs\n",
+                    (unsigned long long)dh,(unsigned long long)dm,db/1e9,ss.snapshot_s,ss.replay_s);
+        free(proposal); free(batch); k3_snapshot_free(&snapstate);
     }
     if(lo) free(lo);
     double dt=now_s()-tg;
+    fprintf(stderr,"\n[K3] token ids fnv64 %016llx (%d tokens)\n",
+            (unsigned long long)token_hash,ntok);
     fprintf(stderr,"\n[K3] decode %d tokens in %.1fs (%.2f tok/s) | expert hit %.1f%% (%llu/%llu) | %.1f GB streamed\n",
             ntok,dt,ntok/dt,100.0*m.hits/(m.hits+m.miss+1e-9),
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);

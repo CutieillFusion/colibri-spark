@@ -216,6 +216,7 @@ endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_rans$(EXE) tests/test_corpus_draft$(EXE)
 TEST_BINS += tests/test_k3_slice$(EXE)
+TEST_BINS += tests/test_k3_spec$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -433,6 +434,9 @@ tests/bench_k3_dense$(EXE): tests/bench_k3_dense.c backend_cuda.h backend_cuda_k
 # guard, so compiling this target keeps that configuration honest as well.
 tests/test_k3_slice$(EXE): tests/test_k3_slice.c kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h k3_net.h
 	$(CC) $(CFLAGS) tests/test_k3_slice.c -o tests/test_k3_slice$(EXE) $(LDFLAGS)
+
+tests/test_k3_spec$(EXE): tests/test_k3_spec.c kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h k3_net.h
+	$(CC) $(CFLAGS) tests/test_k3_spec.c -o tests/test_k3_spec$(EXE) $(LDFLAGS)
 
 backend_cuda_k3.o: backend_cuda_k3.cu backend_cuda_k3.h
 	$(GPUCC) $(GPUFLAGS) -c backend_cuda_k3.cu -o backend_cuda_k3.o
