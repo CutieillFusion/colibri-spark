@@ -215,6 +215,7 @@ PYTHON    ?= python3
 endif
 CUDA_OBJ  =
 TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_st_mirror$(EXE) tests/test_st_pread$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_schema_gbnf$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_grouped$(EXE) tests/test_stops$(EXE) tests/test_topp$(EXE) tests/test_sample_nan$(EXE) tests/test_temp_env$(EXE) tests/test_tok_o200k$(EXE) tests/test_kv_alloc$(EXE) tests/test_int3$(EXE) tests/test_int3_load$(EXE) tests/test_i4_acc512$(EXE) tests/test_compat_direct$(EXE) tests/test_dsa_select$(EXE) tests/test_logit_nan$(EXE) tests/test_router_nan$(EXE) tests/test_pipe_block$(EXE) tests/test_e8_kernel$(EXE) tests/test_rans$(EXE) tests/test_corpus_draft$(EXE)
+TEST_BINS += tests/test_k3_slice$(EXE)
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
@@ -416,6 +417,14 @@ inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ)
 
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h backend_cuda.h backend_cuda_k3.h $(CUDA_OBJ) $(K3_CUDA_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(K3_CUDA_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
+
+# Unit tests for the tensor-parallel head-slicing helpers: the bf16 KV codec,
+# the row compactor and the head-shard formula. Built WITHOUT CUDA on purpose --
+# the units under test are pure host code, and the CPU-only build is also the
+# path that broke once when tensor-parallel symbols sat inside the COLI_CUDA
+# guard, so compiling this target keeps that configuration honest as well.
+tests/test_k3_slice$(EXE): tests/test_k3_slice.c kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h k3_net.h
+	$(CC) $(CFLAGS) tests/test_k3_slice.c -o tests/test_k3_slice$(EXE) $(LDFLAGS)
 
 backend_cuda_k3.o: backend_cuda_k3.cu backend_cuda_k3.h
 	$(GPUCC) $(GPUFLAGS) -c backend_cuda_k3.cu -o backend_cuda_k3.o

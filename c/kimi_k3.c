@@ -101,8 +101,25 @@ static inline kvq   kv_enc(float f){ return f; }
 static inline float kv_dec(kvq h)  { return h; }
 #else
 typedef uint16_t kvq;
-static inline kvq   kv_enc(float f){ union{float f;uint32_t u;}b; b.f=f;
-                                     return (kvq)((b.u+0x8000u)>>16); }  /* round-to-nearest */
+static inline kvq kv_enc(float f){
+    union{float f;uint32_t u;}b; b.f=f;
+    uint32_t u=b.u;
+    /* Inf/NaN must survive. A blind (u+0x8000)>>16 carries out of the mantissa
+     * into the exponent and sign, so 0x7fffffff -> -0, 0xffffffff -> +0 and
+     * 0x7f800001 -> +Inf: an invalid value silently becomes a plausible finite
+     * one, which converts a numerical failure into quietly wrong output. Keep
+     * the top half verbatim and force the mantissa non-zero so a NaN stays a
+     * NaN rather than decaying to Inf. */
+    if((u&0x7F800000u)==0x7F800000u){
+        uint16_t h=(uint16_t)(u>>16);
+        if(u&0x007FFFFFu) h|=0x0040;         /* was NaN: keep it quiet-NaN */
+        return h;
+    }
+    /* round-to-nearest-EVEN, the IEEE default: ties go to the even mantissa
+     * instead of always up, so repeated store/load cycles do not drift. */
+    uint32_t lsb=(u>>16)&1u;
+    return (kvq)((u+0x7FFFu+lsb)>>16);
+}
 static inline float kv_dec(kvq h)  { union{uint32_t u;float f;}b; b.u=(uint32_t)h<<16; return b.f; }
 #endif
 
@@ -2141,6 +2158,22 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     fflush(stdout);
 }
 
+/* Dump the K3_ROUTE_STATS histogram. Called from BOTH exits: main's tail and
+ * serve mode, which returns straight out of main and used to bypass the write
+ * entirely -- losing exactly the long-running profile the option exists to
+ * collect. Serve mode also rewrites after every request rather than only at
+ * exit, because a server is usually killed rather than allowed to return, and
+ * 333 KB against a multi-second request is free. */
+static void k3_route_stats_write(const Model *m){
+    const char *p = getenv("K3_ROUTE_STATS");
+    if(!m->route_hist || !p) return;
+    FILE *rf=fopen(p,"wb");
+    if(!rf){ perror(p); return; }
+    fwrite(m->route_hist,sizeof(uint32_t),
+           (size_t)m->c.n_layers*m->c.n_experts,rf);
+    fclose(rf);
+}
+
 static void serve_loop(Model *m, Tok *T){
     setvbuf(stdin,NULL,_IONBF,0);
     fputs("\x01\x01READY\x01\x01\n",stdout);
@@ -2149,8 +2182,8 @@ static void serve_loop(Model *m, Tok *T){
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(&q,NULL); while(r==0);
-        if(r<0) return;
-        if(r==2){ serve_one(m,T,&q); free(q.payload); }
+        if(r<0){ k3_route_stats_write(m); return; }
+        if(r==2){ serve_one(m,T,&q); free(q.payload); k3_route_stats_write(m); }
     }
 }
 
@@ -2332,11 +2365,9 @@ int main(int argc, char **argv){
     k3_cuda_report();
 #endif
     if(m.route_hist && getenv("K3_ROUTE_STATS")){
-        FILE *rf=fopen(getenv("K3_ROUTE_STATS"),"wb");
-        if(rf){ fwrite(m.route_hist,sizeof(uint32_t),
-                       (size_t)m.c.n_layers*m.c.n_experts,rf); fclose(rf);
-            fprintf(stderr,"[K3] route stats -> %s (%d layers x %d experts)\n",
-                    getenv("K3_ROUTE_STATS"),m.c.n_layers,m.c.n_experts); }
+        k3_route_stats_write(&m);
+        fprintf(stderr,"[K3] route stats -> %s (%d layers x %d experts)\n",
+                getenv("K3_ROUTE_STATS"),m.c.n_layers,m.c.n_experts);
     }
     if(m.trace) fclose(m.trace);
     return 0;

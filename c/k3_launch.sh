@@ -26,6 +26,18 @@ UP=("" 10.10.12.1 192.168.0.159 10.10.34.1)     # per-rank upstream address
 COMMON="K3_WORLD=$WORLD K3_GROUP_SIZE=2 K3_MASTER_PORT=$PORT \
 K3_GPUS=0 K3_EXPERT_GPU=1 K3_EXPERT_GB=${K3_EGB:-28} K3_GPU_GB=${K3_GGB:-40} K3_MAXT=512 K3_TP_ATTN=${K3_TP_ATTN:-1} OMP_NUM_THREADS=20"
 
+# This list is EXPLICIT: a variable exported in the caller's shell does NOT reach
+# the ranks unless it is named here, and the run still looks completely normal
+# when one is dropped -- K3_TP_ATTN was silently lost this way once (caught only
+# because a collective count failed to change), and K3_ROUTE_STATS after it
+# (collected all run, wrote nothing). Anything the engine reads via getenv and a
+# caller may want to set has to be forwarded below.
+# Each rank writes to its own node-local /tmp, so per-rank paths do not collide.
+for v in K3_ROUTE_STATS K3_BITS K3_MLA_BITS K3_HEAD_BITS K3_THINK K3_TRACE; do
+  eval "val=\${$v:-}"
+  [ -n "$val" ] && COMMON="$COMMON $v=$val"
+done
+
 # Per-rank 2-bit expert store. Rank 0 keeps the FULL store: expert parallelism
 # means it only ever reads e%world==0, and full-store indexing already places
 # those correctly, so it needs no compacted shard. Every other rank carries just
