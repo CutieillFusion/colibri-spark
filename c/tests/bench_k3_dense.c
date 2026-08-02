@@ -8,6 +8,7 @@
  * result can't be a wrong one. Shapes are exactly what K3 runs at decode.
  *
  *   K3_DENSE_STAGE=0|1  force shared-memory staging off/on (default: auto)
+ *   K3_DENSE_EXACT=0|1  legacy warp / stock-order exact reduction (default 1)
  *   ./c/tests/bench_k3_dense
  */
 #include <math.h>
@@ -37,6 +38,10 @@ static Shape SH[] = {
 int main(void){
     const int gs = 64;
     int dev = 0;
+    /* This binary exists specifically to benchmark coli_k3_dense, so enable
+     * its bench-only override even when a caller has K3_DENSE_GPU=0 in their
+     * environment. The documented command must never report "k3 declined". */
+    setenv("K3_DENSE_BENCH","1",0);
     if(!coli_cuda_init(&dev,1)){ fprintf(stderr,"cuda init failed\n"); return 77; }
     if(!coli_k3_init(0, 3584, 3072)){ fprintf(stderr,"k3 init failed\n"); return 77; }
     printf("%-20s %7s %6s %10s %10s %9s %9s\n",

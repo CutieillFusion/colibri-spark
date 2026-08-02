@@ -45,6 +45,8 @@
  *   K3_PIPE=0|1          overlap expert loads with compute (default 1)
  *   K3_LOAD_THREADS=N    loader threads for K3_PIPE (default 4)
  *   K3_TOPP=F            keep routed experts to cumulative weight F (0 = off)
+ *   K3_DENSE_GPU=0|1     zero-copy dense decode GEMV (default 1)
+ *   K3_DENSE_EXACT=0|1   stock-order exact reduction (default 1)
  *   K3_CHUNK=N           prefill chunk size (default 32; 1 = token-at-a-time)
  *   K3_THINK=0|1         chat mode: open the think channel (default 1)
  *   K3_LAYERS=N          truncate to first N layers (validation; skips head)
@@ -298,13 +300,13 @@ static int    g_k3_cuda = 0;
  * Cleared on any failure so a run degrades to the CPU path rather than dying
  * mid-token. Declared here because k3_cuda_report() below reports the split. */
 static int      g_k3_expert_gpu = 0;
-/* K3_DENSE_GPU: zero-copy dense GEMV. OFF by default -- measured a LOSS.
- * The kernel is 5% faster in isolation (59.4 vs 56.5 GB/s) but reads weights
- * from host memory, and host-mapped reads degrade ~3.6x while the expert
- * loader is DMA-ing; the stock path keeps dense device-resident and is immune.
- * Gating the whole block matters: registering the buffers is itself costly
- * (~36 GB pinned) and cost 0.65 -> 0.55 tok/s even with the path disabled. */
-static int      g_k3_dense_gpu = 0;
+/* K3_DENSE_GPU: zero-copy dense GEMV. ON by default after the exact-order
+ * kernel took a 300-token 4-node run from 1.09 -> 1.21 tok/s: shared experts
+ * 43.9 -> 33.3 s, latent projections 16.8 -> 13.2 s, with bit-exact standalone
+ * outputs and token-identical generation. K3_DENSE_GPU=0 keeps the old
+ * device-mirror path for A/B. K3_DENSE_EXACT=0 selects the older warp reduction
+ * (slightly different arithmetic and therefore not suitable as the default). */
+static int      g_k3_dense_gpu = 1;
 static uint64_t g_k3_exp_gpu = 0, g_k3_exp_cpu = 0;
 static int      g_k3_expert_batch = 0;   /* K3_EXPERT_BATCH=1; see the note at its use */
 static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
@@ -1039,13 +1041,17 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * device from K3_GPUS; measured on GB10 this is where ~84% of decode time
      * sits, of which only ~14% is I/O. */
     g_k3_expert_batch = getenv("K3_EXPERT_BATCH")?atoi(getenv("K3_EXPERT_BATCH")):0;
-    g_k3_dense_gpu    = getenv("K3_DENSE_GPU")?atoi(getenv("K3_DENSE_GPU")):0;
+    g_k3_dense_gpu    = getenv("K3_DENSE_GPU")?atoi(getenv("K3_DENSE_GPU")):1;
     /* NOTE: g_k3_tp_attn is resolved EARLIER, before the weights load -- the
      * head-sliced loads below depend on it, and reading it here would be too
      * late (the projections would already be resident at full width). */
-    if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")) && g_k3_cuda)
-        g_k3_expert_gpu = coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter);
-    else if(getenv("K3_EXPERT_GPU") && atoi(getenv("K3_EXPERT_GPU")))
+    int want_expert_gpu=getenv("K3_EXPERT_GPU")&&atoi(getenv("K3_EXPERT_GPU"));
+    /* The zero-copy dense kernels share backend_cuda_k3's stream/scratch
+     * initialization but do not require routed experts to run on the GPU. */
+    int k3_ready=(g_k3_cuda&&(want_expert_gpu||g_k3_dense_gpu))
+                 ?coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter):0;
+    g_k3_expert_gpu=want_expert_gpu&&k3_ready;
+    if(want_expert_gpu&&!g_k3_cuda)
         fprintf(stderr,"[K3/EXP] K3_EXPERT_GPU needs K3_GPUS — staying on CPU\n");
 #endif
     /* expert LRU cache, per-layer slots from the global budget */

@@ -159,6 +159,8 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_PIPE` | 1 | overlap expert loads with compute (loader threads) |
 | `K3_LOAD_THREADS` | 4 | loader threads for `K3_PIPE` |
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
+| `K3_DENSE_GPU` | 1 | zero-copy CUDA dense GEMV during decode (0 = device-mirror path) |
+| `K3_DENSE_EXACT` | 1 | stock-order bit-exact reduction (0 = legacy warp reduction) |
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
 | `K3_THINK` | 1 | chat mode: open the structural think channel (0 = response-only) |
 | `K3_DIRS` | — | extra shard directories (multi-drive split, no duplication) |

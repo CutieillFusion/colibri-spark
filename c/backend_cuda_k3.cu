@@ -691,6 +691,58 @@ __global__ void k3_dense_i8(float *__restrict__ y, const float *__restrict__ x,
     if (lane == 0) y[o] = acc * scl[o];
 }
 
+/* Arithmetic-order-compatible zero-copy kernels.  These deliberately mirror
+ * backend_cuda.cu's quant_matmul decode loop and 256-thread tree reduction.
+ * The faster warp-per-row kernels above change the summation order; their
+ * relative error is tiny, but K3's close logits can still flip a greedy token.
+ * Keeping the stock order lets us isolate the unified-memory benefit of not
+ * duplicating resident weights without changing model arithmetic. */
+__global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restrict__ x,
+                                   const unsigned char *__restrict__ q4,
+                                   const float *__restrict__ scales,
+                                   int I, int O, int gs, int ng) {
+    int o = blockIdx.x;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+    const unsigned char *w = q4 + (size_t)o * rb;
+    const float *scl = scales + (size_t)o * ng;
+    float sum = 0.f;
+    for (int i = threadIdx.x; i < I; i += blockDim.x) {
+        unsigned char b = w[i >> 1];
+        int n = (i & 1) ? (b >> 4) : (b & 15);
+        int g = i / gs;
+        if (g >= ng) g = ng - 1;
+        sum += x[i] * (float)(n - 8) * scl[g];
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) y[o] = partial[0];
+}
+
+__global__ void k3_dense_i8_exact(float *__restrict__ y, const float *__restrict__ x,
+                                  const signed char *__restrict__ q8,
+                                  const float *__restrict__ scales, int I, int O) {
+    int o = blockIdx.x;
+    if (o >= O) return;
+    const signed char *w = q8 + (size_t)o * I;
+    float sum = 0.f;
+    for (int i = threadIdx.x; i < I; i += blockDim.x)
+        sum += x[i] * (float)w[i];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int n = blockDim.x >> 1; n; n >>= 1) {
+        if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) y[o] = partial[0] * scales[o];
+}
+
 static int    g_dense_attr = 0;
 static int    g_dense_shmax = 0;
 static float *g_dx = nullptr, *g_dy = nullptr;
@@ -719,8 +771,8 @@ static int ensure_dense_scratch(int I, int O) {
 extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const float *scales,
                              int fmt, int S, int I, int O, int gs) {
     static int en = -1;
-    if (en < 0) { const char *e = getenv("K3_DENSE_GPU"); en = e ? atoi(e) : 0; }
-    if (!en && !getenv("K3_DENSE_BENCH")) return 0;      /* off by default: see below */
+    if (en < 0) { const char *e = getenv("K3_DENSE_GPU"); en = e ? atoi(e) : 1; }
+    if (!en && !getenv("K3_DENSE_BENCH")) return 0;
     if (!g_ready || S != 1 || I <= 0 || O <= 0) return 0;
     /* Only stage when x is small enough that shared memory does not throttle
      * occupancy. 16 KB keeps >=4 blocks/SM; beyond that, global + L1 wins. */
@@ -755,8 +807,17 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     if (!ensure_dense_scratch(I, O)) return 0;
     if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)I * sizeof(float),
                             cudaMemcpyHostToDevice, g_stream), "dense x upload")) return 0;
+    int exact = 1;
+    { const char *fe = getenv("K3_DENSE_EXACT"); if (fe) exact = atoi(fe); }
     int blocks = (O + K3_WARPS - 1) / K3_WARPS;
-    if (fmt == 4) {
+    if (exact && fmt == 4) {
+        int ng = (I + gs - 1) / gs;
+        k3_dense_i4g_exact<<<O, 256, 0, g_stream>>>(
+            g_dy, g_dx, (const unsigned char *)w, scales, I, O, gs, ng);
+    } else if (exact) {
+        k3_dense_i8_exact<<<O, 256, 0, g_stream>>>(
+            g_dy, g_dx, (const signed char *)w, scales, I, O);
+    } else if (fmt == 4) {
         int ng = (I + gs - 1) / gs;
         k3_dense_i4g<<<blocks, K3_FAST_THREADS, shbytes, g_stream>>>(
             g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng, stage);

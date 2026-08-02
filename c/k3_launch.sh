@@ -33,7 +33,8 @@ K3_GPUS=0 K3_EXPERT_GPU=1 K3_EXPERT_GB=${K3_EGB:-28} K3_GPU_GB=${K3_GGB:-40} K3_
 # (collected all run, wrote nothing). Anything the engine reads via getenv and a
 # caller may want to set has to be forwarded below.
 # Each rank writes to its own node-local /tmp, so per-rank paths do not collide.
-for v in K3_ROUTE_STATS K3_BITS K3_MLA_BITS K3_HEAD_BITS K3_THINK K3_TRACE; do
+for v in K3_ROUTE_STATS K3_BITS K3_MLA_BITS K3_HEAD_BITS K3_THINK K3_TRACE \
+         K3_DENSE_GPU K3_DENSE_STAGE K3_DENSE_EXACT; do
   eval "val=\${$v:-}"
   [ -n "$val" ] && COMMON="$COMMON $v=$val"
 done
