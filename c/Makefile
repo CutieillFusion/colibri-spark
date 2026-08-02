@@ -418,6 +418,14 @@ inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ)
 kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h backend_cuda.h backend_cuda_k3.h $(CUDA_OBJ) $(K3_CUDA_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(K3_CUDA_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
+# Dense-GEMV microbenchmark: stock quant_matmul vs the K3 kernel at the real
+# Kimi-K3 decode shapes. Needs CUDA=1 (it links both backends). Iterating the
+# dense path through full-model runs is ~140s per load and noisy; the expert
+# kernel only got fixed once there was a microbenchmark, and this is the same
+# tool for the dense side. Not in TEST_BINS -- it is a benchmark, not a test.
+tests/bench_k3_dense$(EXE): tests/bench_k3_dense.c backend_cuda.h backend_cuda_k3.h $(CUDA_OBJ) $(K3_CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/bench_k3_dense.c $(CUDA_OBJ) $(K3_CUDA_OBJ) -o tests/bench_k3_dense$(EXE) $(LDFLAGS)
+
 # Unit tests for the tensor-parallel head-slicing helpers: the bf16 KV codec,
 # the row compactor and the head-shard formula. Built WITHOUT CUDA on purpose --
 # the units under test are pure host code, and the CPU-only build is also the

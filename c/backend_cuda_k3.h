@@ -18,6 +18,7 @@ int  coli_k3_init(int device, int latent, int inter);
  * the whole posix_memalign'd region. Returns 0 if the mapping cannot alias the
  * host pointer, in which case the caller must stay on the CPU path. */
 int  coli_k3_register(void *p, size_t bytes);
+void coli_k3_unregister(void *p);
 
 /* hz[latent] = w2 @ SiTU(w1 @ z, w3 @ z), reading the slot's native MXFP4.
  * The caller still does u += wk * hz, so this is a drop-in for the three

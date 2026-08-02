@@ -563,6 +563,18 @@ extern "C" int coli_k3_register(void *p, size_t bytes) {
     return 1;
 }
 
+/* Release a mapping made by coli_k3_register. The engine never needs this --
+ * expert slots live for the life of the process -- but any caller that frees a
+ * registered buffer MUST unregister first: the pages stay mapped after free(),
+ * so the next malloc reusing that address fails with "memory range is already
+ * mapped" and poisons every later CUDA call. That is exactly what made
+ * tests/bench_k3_dense report only its first shape. */
+extern "C" void coli_k3_unregister(void *p) {
+    if (!g_ready || !p) return;
+    cudaHostUnregister(p);
+    cudaGetLastError();          /* clear; do not let it stick to later launches */
+}
+
 extern "C" int coli_k3_expert(const void *w1p, const void *w1s,
                               const void *w2p, const void *w2s,
                               const void *w3p, const void *w3s,

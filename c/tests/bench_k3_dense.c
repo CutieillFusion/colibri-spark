@@ -87,6 +87,12 @@ int main(void){
         } else printf("  %s", okk3?"stock declined":"k3 declined");
         printf("\n");
         coli_cuda_tensor_free(t);
+        /* w and sc were cudaHostRegister'd above. free() alone leaves the pages
+         * MAPPED, so the next shape's malloc lands on a still-registered
+         * address and from there every CUDA call fails with "memory range is
+         * already mapped" -- which is why this benchmark used to report only
+         * its first row and decline all the rest. Unregister before freeing. */
+        coli_k3_unregister(w); coli_k3_unregister(sc);
         free(w); free(sc); free(x); free(y1); free(y2);
     }
     coli_k3_shutdown();
