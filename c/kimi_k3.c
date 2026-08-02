@@ -236,6 +236,28 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
     for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
 
+/* Tensor parallelism is a property of the multi-node split, NOT of the CUDA
+ * backend -- model_init, kda_forward and mla_forward all use these
+ * unconditionally, so they must live OUTSIDE the COLI_CUDA guard below or the
+ * CPU-only build fails to compile.
+ *
+ * K3_TP_ATTN=0 disables tensor-parallel attention, leaving dense replicated.
+ * TP attention adds a SECOND collective per layer (186/token instead of 93).
+ * At 2 nodes that was worth it (+12%, collective 1.37 ms). Measured again at 4
+ * nodes with the collective at 1.95 ms, TP ON still wins (0.87 vs 0.64 tok/s):
+ * the extra 93 reduces cost ~0.18 s/token against a larger sharding saving. */
+static int      g_k3_tp_attn = 1;
+/* Rank's head range [*h0, *h0+*hn) out of H heads. MUST match the split the
+ * kda/mla forwards compute, or a rank loads one slice and multiplies another;
+ * both derive it from this single formula for that reason. */
+static void k3_head_shard(int H, int *h0, int *hn){
+    int wsz = g_k3_tp_attn ? k3_net_world() : 1, wrk = k3_net_rank();
+    if(wsz<=1){ *h0=0; *hn=H; return; }
+    int per=(H+wsz-1)/wsz, a=wrk*per, b=a+per;
+    if(a>H) a=H; if(b>H) b=H;
+    *h0=a; *hn=b-a;
+}
+
 #ifdef COLI_CUDA
 /* ---------- optional GPU placement for the RESIDENT (dense) tensors ----------
  *
@@ -266,22 +288,6 @@ static int      g_k3_expert_gpu = 0;
  * Gating the whole block matters: registering the buffers is itself costly
  * (~36 GB pinned) and cost 0.65 -> 0.55 tok/s even with the path disabled. */
 static int      g_k3_dense_gpu = 0;
-/* K3_TP_ATTN=0 disables tensor-parallel attention, leaving dense replicated.
- * TP attention adds a SECOND collective per layer (186/token instead of 93).
- * At 2 nodes that was worth it (+12%, collective 1.37 ms). At 4 nodes the
- * collective costs 3.41 ms, so 93 extra of them is ~0.32 s/token against a
- * sharding saving of ~0.2 -- net negative. Keep it on for 2 nodes, off for 4. */
-static int      g_k3_tp_attn = 1;
-/* Rank's head range [*h0, *h0+*hn) out of H heads. MUST match the split the
- * kda/mla forwards compute, or a rank loads one slice and multiplies another;
- * both derive it from this single formula for that reason. */
-static void k3_head_shard(int H, int *h0, int *hn){
-    int wsz = g_k3_tp_attn ? k3_net_world() : 1, wrk = k3_net_rank();
-    if(wsz<=1){ *h0=0; *hn=H; return; }
-    int per=(H+wsz-1)/wsz, a=wrk*per, b=a+per;
-    if(a>H) a=H; if(b>H) b=H;
-    *h0=a; *hn=b-a;
-}
 static uint64_t g_k3_exp_gpu = 0, g_k3_exp_cpu = 0;
 static int      g_k3_expert_batch = 0;   /* K3_EXPERT_BATCH=1; see the note at its use */
 static int    g_k3_cuda_devs[COLI_CUDA_MAX_DEVICES];
@@ -1114,9 +1120,15 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         double kc0=now_s();
         float *wins[3]={m->cwq[li],m->cwk[li],m->cwv[li]};
         float *vecs[3]={qt,kt,tv}; float *taps[3]={a->conv_q,a->conv_k,a->conv_v};
+        /* SERIAL BY DESIGN -- do not restore the `omp parallel for` here. This
+         * is 4 taps over pn channels: ~30K ops per (layer,tensor), ~30us of
+         * arithmetic. Three regions per layer x 69 KDA layers = 207 fork/joins
+         * per token, and measured that cost 53.9s of a 475.8s 474-token run
+         * (11% of total) for 2.5 MFLOP of real work -- ~550us of barrier per
+         * region. Even at world=1 (pn=12288, ~120us serial) one fork/join
+         * costs more than the whole loop. */
         for(int w2=0;w2<3;w2++){
             float *win=wins[w2], *vec=vecs[w2]; const float *cw=taps[w2];
-            #pragma omp parallel for schedule(static)
             for(int d=p0;d<p0+pn;d++){
                 float *wd=win+(int64_t)d*K;
                 for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
