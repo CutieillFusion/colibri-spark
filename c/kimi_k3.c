@@ -360,6 +360,40 @@ static void k3_cuda_report(void){
  * way; instead the per-head outputs are all-reduced back to full width and
  * o_proj is computed redundantly. That leaves ~20% of KDA traffic unsharded
  * but avoids restructuring the loader. */
+/* Compact an already-loaded [O,I] tensor down to rows [R0,R0+NR).
+ *
+ * The quantizing path in w_load_rows reads only the rows it wants, but the
+ * pre-quantized U8 containers and the raw-f32 path read whole tensors, and
+ * with tensor-parallel attention on by default EVERY multi-node load of
+ * q/k/v/g asks for a partial range -- so refusing them would make repacked
+ * containers and K3_BITS=32 unusable on more than one node. Rows are
+ * contiguous in every format we carry (fmt=0 f32, fmt=1 int8 + per-row scale,
+ * fmt=4 int4 + per-group scale), so the slice is a memmove plus a shrink and
+ * those configurations keep the same memory saving, just after a full read.
+ *
+ * realloc is only shrinking here; if it ever declines, keeping the original
+ * (larger) buffer is still correct, so the result is dropped rather than
+ * treated as fatal. */
+static void w_keep_rows(W *w, int R0, int NR){
+    if(NR==w->O) return;
+    int64_t I=w->I;
+    #define KEEP_(p,elems,off) do{ if(p){ \
+        memmove((p),(char*)(p)+(size_t)(off),(size_t)(elems)); \
+        void *t_=realloc((p),(size_t)(elems)); if(t_) (p)=t_; } }while(0)
+    if(w->fmt==0){
+        KEEP_(w->f,(int64_t)NR*I*sizeof(float),(int64_t)R0*I*sizeof(float));
+    } else if(w->fmt==1){
+        KEEP_(w->q8,(int64_t)NR*I,(int64_t)R0*I);
+        KEEP_(w->s,(int64_t)NR*sizeof(float),(int64_t)R0*sizeof(float));
+    } else {
+        int64_t rb=((int64_t)I+1)/2, ng=((int64_t)I+w->gs-1)/w->gs;
+        KEEP_(w->q4,(int64_t)NR*rb,(int64_t)R0*rb);
+        KEEP_(w->s,(int64_t)NR*ng*sizeof(float),(int64_t)R0*ng*sizeof(float));
+    }
+    #undef KEEP_
+    w->O=NR;
+}
+
 /* Release a tensor's host-side buffers. Only safe once nothing can read them
  * again: no w_rows view aliases them (w_rows is a pointer view, w_cols copies),
  * no CPU helper reads them (w_addrow/w_rowdot on kv_b_proj), and either the
@@ -574,9 +608,7 @@ static void w_load_rows(Model *m, W *w, const char *name, int O, int I, int bits
     if(!t) st_die_missing(&m->S,nm);
     if(NR<0||R0<0||(int64_t)R0+NR>O){
         fprintf(stderr,"%s: bad row slice [%d,%d) of %d rows\n",nm,R0,R0+NR,O); exit(1); }
-    memset(w,0,sizeof(*w)); w->O=NR; w->I=I;
-    if(t->dtype==3 && NR!=O){
-        fprintf(stderr,"%s: row-slice load unsupported for the U8 container\n",nm); exit(1); }
+    memset(w,0,sizeof(*w)); w->O=O; w->I=I;   /* O until the slice is applied */
     if(t->dtype==3){
         /* repacked container (tools/k3_repack.py): pre-quantized U8 + .qs f32
          * scales — no load-time quantization, K3_BITS is ignored for these
@@ -610,6 +642,7 @@ static void w_load_rows(Model *m, W *w, const char *name, int O, int I, int bits
                             int v1=(int)lrintf(gp[i+1]*inv); if(v1>7)v1=7; if(v1<-8)v1=-8;
                             dst[(g*gs+i)>>1]=(uint8_t)((v0+8)|((v1+8)<<4)); } } }
                 free(q8); free(s8);
+                w_keep_rows(w,R0,NR);
                 return;
             }
             w->fmt=1; w->q8=malloc((size_t)O*I);
@@ -626,12 +659,13 @@ static void w_load_rows(Model *m, W *w, const char *name, int O, int I, int bits
             fprintf(stderr,"%s: U8 tensor is %lld bytes / %lld scales — matches neither int8 [%d,%d] nor int4-g64, refusing (untrusted container)\n",
                     nm,(long long)t->nbytes,(long long)ts->numel,O,I); exit(1);
         }
+        w_keep_rows(w,R0,NR);
         return;
     }
     if(t->numel!=(int64_t)O*I){ fprintf(stderr,"%s: numel %lld != %dx%d\n",nm,(long long)t->numel,O,I); exit(1); }
     if(bits>=32){
-        if(NR!=O){ fprintf(stderr,"%s: row-slice load unsupported at f32\n",nm); exit(1); }
-        w->fmt=0; w->f=falloc((int64_t)O*I); st_read_f32(&m->S,nm,w->f,0); return; }
+        w->fmt=0; w->f=falloc((int64_t)O*I); st_read_f32(&m->S,nm,w->f,0);
+        w_keep_rows(w,R0,NR); return; }
     int gs=64;
     if(bits<=4 && I%gs){ bits=8; }        /* int4-g64 wants I%64==0; fall back */
     float *scr=falloc((int64_t)QCHUNK*I);
@@ -660,6 +694,8 @@ static void w_load_rows(Model *m, W *w, const char *name, int O, int I, int bits
                         dst[(g*gs+i)>>1]=(uint8_t)((v0+8)|((v1+8)<<4)); } } } }
     }
     free(scr);
+    w->O=NR;   /* this path allocated and quantized only the slice, so no
+                * w_keep_rows compaction is needed -- it never read the rest */
 }
 
 static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
