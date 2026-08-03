@@ -164,8 +164,8 @@ typedef struct {                          /* KDA layer */
      * handle. The view must outlive the call for the placement to be reused. */
     W qs, ks, vs, gs, os, qkvg; int sh_ready, fuse;  /* qkvg = fused q|k|v|g */
     float *conv_q, *conv_k, *conv_v;      /* [proj*4] depthwise taps, oldest first */
-    float *fa, *fb;                       /* decay low-rank, f32 [hd,hidden] [proj,hd] */
-    float *bp;                            /* beta proj f32 [heads,hidden] */
+    W fa, fb;                             /* decay low-rank, f32 [hd,hidden] [proj,hd] */
+    W bp;                                 /* beta proj f32 [heads,hidden] */
     float *dt, *A, *onw;                  /* dt_bias[proj], exp(A_log)[heads], o_norm[hd] */
 } Kda;
 
@@ -231,6 +231,7 @@ typedef struct {
     double t_router, t_topk, t_latent, t_shared, t_expert, t_rnorm;
     double t_ekernel;                     /* GPU call only, inside t_expert */
     double t_kproj, t_kconv, t_khead, t_kout;  /* kda_forward breakdown */
+    double t_mproj, t_mcache, t_matt, t_mout;   /* mla_forward breakdown */
     uint64_t n_ekernel;
     FILE *trace;
 } Model;
@@ -967,9 +968,17 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             a->conv_q=f32_load(m,NM("model.layers.%d.self_attn.q_conv1d.weight",i),(int64_t)P*c->conv_k);
             a->conv_k=f32_load(m,NM("model.layers.%d.self_attn.k_conv1d.weight",i),(int64_t)P*c->conv_k);
             a->conv_v=f32_load(m,NM("model.layers.%d.self_attn.v_conv1d.weight",i),(int64_t)P*c->conv_k);
-            a->fa=f32_load(m,NM("model.layers.%d.self_attn.f_a_proj.weight",i),(int64_t)c->kda_hd*c->hidden);
-            a->fb=f32_load(m,NM("model.layers.%d.self_attn.f_b_proj.weight",i),(int64_t)P*c->kda_hd);
-            a->bp=f32_load(m,NM("model.layers.%d.self_attn.b_proj.weight",i),(int64_t)c->kda_heads*c->hidden);
+            /* These three projections are f32 in the checkpoint. Keep them as
+             * W objects so each rank retains only its head rows; the CPU path
+             * still calls the same f32 matmul and is arithmetic-identical. */
+            w_load(m,&a->fa,NM("model.layers.%d.self_attn.f_a_proj.weight",i),c->kda_hd,c->hidden,32);
+            w_load_rows(m,&a->fb,NM("model.layers.%d.self_attn.f_b_proj.weight",i),P,c->kda_hd,32,kr0,krn);
+            w_load_rows(m,&a->bp,NM("model.layers.%d.self_attn.b_proj.weight",i),c->kda_heads,c->hidden,32,kh0,khn);
+#ifdef COLI_CUDA
+            /* Parallel GPU reduction changed KDA routing and generated text;
+             * keep these strict-f32 control projections on the CPU. */
+            a->fa.cuda_failed=a->fb.cuda_failed=a->bp.cuda_failed=1;
+#endif
             a->dt=f32_load(m,NM("model.layers.%d.self_attn.dt_bias",i),P);
             a->onw=f32_load(m,NM("model.layers.%d.self_attn.o_norm.weight",i),c->kda_hd);
             { /* A_log in the checkpoint is [kda_hd] = per-head zero-padded */
@@ -1158,18 +1167,18 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         w_matmul(gp,x,&a->g,C);
         m->t_kproj+=now_s()-kp0;
     }
-    matmul(t1,x,a->fa,C,c->hidden,c->kda_hd);
+    double kf0=now_s();
+    w_matmul(t1,x,&a->fa,C);
     if(wsz>1){
         for(int t=0;t<C;t++){
-            matmul(graw+(int64_t)t*P+p0,t1+(int64_t)t*c->kda_hd,a->fb+(int64_t)p0*c->kda_hd,
-                   1,c->kda_hd,pn);
-            matmul(braw+(int64_t)t*H+h0,x+(int64_t)t*c->hidden,a->bp+(int64_t)h0*c->hidden,
-                   1,c->hidden,hn);
+            w_matmul(graw+(int64_t)t*P+p0,t1+(int64_t)t*c->kda_hd,&a->fb,1);
+            w_matmul(braw+(int64_t)t*H+h0,x+(int64_t)t*c->hidden,&a->bp,1);
         }
     } else {
-        matmul(graw,t1,a->fb,C,c->kda_hd,P);
-        matmul(braw,x,a->bp,C,c->hidden,H);
+        w_matmul(graw,t1,&a->fb,C);
+        w_matmul(braw,x,&a->bp,C);
     }
+    m->t_kproj+=now_s()-kf0;
     float qscale=1.f/sqrtf((float)hd);
     for(int t=0;t<C;t++){
         float *qt=q+(int64_t)t*P, *kt=k+(int64_t)t*P, *tv=v+(int64_t)t*P;
@@ -1293,6 +1302,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
     float *qa=falloc((int64_t)C*c->q_lora), *qv=falloc((int64_t)C*H*qh);
     float *ckv=falloc((int64_t)C*(kvl+qr));
     float *gv=falloc((int64_t)C*H*vh), *ctx=falloc((int64_t)C*H*vh);
+    double mt0=now_s();
     w_matmul(qa,x,&a->qa,C);
     for(int t=0;t<C;t++)
         rmsnorm_(qa+(int64_t)t*c->q_lora,qa+(int64_t)t*c->q_lora,a->qa_ln,c->q_lora,c->eps);
@@ -1315,7 +1325,9 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                                     (size_t)mhn*qh*sizeof(float));
         free(tq);
     } else w_matmul(qv,qa,&a->qb,C);
+    m->t_mproj+=now_s()-mt0; mt0=now_s();
     w_matmul(ckv,x,&a->kva,C);
+    m->t_mproj+=now_s()-mt0; mt0=now_s();
     for(int t=0;t<C;t++){                            /* append the whole chunk to the
                                                       * cache first: token t's scores
                                                       * only read rows 0..pos0+t */
@@ -1326,6 +1338,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
         for(int i=0;i<kvl;i++) Lrow[i]=kv_enc(lt[i]);
         for(int i=0;i<qr;i++)  Rrow[i]=kv_enc(cv[kvl+i]);  /* NoPE: cached raw, no rotation */
     }
+    m->t_mcache+=now_s()-mt0; mt0=now_s();
     if(wsz>1 && mhn>0){
         memset(gv,0,(size_t)C*H*vh*sizeof(float));
         float *tg=falloc((int64_t)C*mhn*vh);
@@ -1334,6 +1347,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                                     (size_t)mhn*vh*sizeof(float));
         free(tg);
     } else w_matmul(gv,x,&a->g,C);
+    m->t_mproj+=now_s()-mt0; mt0=now_s();
     for(int tt=0;tt<C;tt++){
         int nt=pos0+tt+1;
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
@@ -1363,6 +1377,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                 cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
         }
     }
+    m->t_matt+=now_s()-mt0; mt0=now_s();
     if(wsz>1 && mhn>0){
         float *cc=falloc((int64_t)C*mhn*vh);
         for(int t=0;t<C;t++) memcpy(cc+(int64_t)t*mhn*vh,ctx+(int64_t)t*H*vh+mh0*vh,
@@ -1374,6 +1389,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
         memset(out,0,(size_t)C*c->hidden*sizeof(float));
         k3_net_allreduce(out,(size_t)C*c->hidden);
     } else w_matmul(out,ctx,&a->o,C);
+    m->t_mout+=now_s()-mt0;
     free(qa);free(qv);free(ckv);free(gv);free(ctx);
 }
 
@@ -2111,6 +2127,16 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         int C=np-i<chunk?np-i:chunk;
         free(lo); lo=step_chunk(m,ids+i,i,C);
     }
+    /* Decode-only snapshots.  The existing PROF line deliberately includes
+     * prefill, which is useful for request accounting but obscures B=1 token
+     * latency.  PROF2 excludes prefill and breaks the warm decode path into
+     * terms that can actually guide kernel/collective work. */
+    double da0=m->t_attn, de0=m->t_moe, dd0=m->t_eload, dh0=m->t_head;
+    double dr0=m->t_router, dtop0=m->t_topk, dl0=m->t_latent;
+    double ds0=m->t_shared, dx0=m->t_expert, dn0=m->t_rnorm;
+    double dkpr0=m->t_kproj, dkc0=m->t_kconv, dkh0=m->t_khead, dko0=m->t_kout;
+    double dmpr0=m->t_mproj, dmc0=m->t_mcache, dma0=m->t_matt, dmo0=m->t_mout;
+    double dnet0=k3_net_secs(); uint64_t dnc0=k3_net_calls();
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
     char buf[512], xtag[64];
     double tg=now_s();
@@ -2161,6 +2187,16 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double moe=m->t_moe-e0, disk=m->t_eload-d0;
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
+    printf("PROF2 attn=%.3f moe=%.3f load=%.3f head=%.3f net=%.3f/%llu "
+           "router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
+           "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f "
+           "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f\n",
+           m->t_attn-da0,m->t_moe-de0,m->t_eload-dd0,m->t_head-dh0,
+           k3_net_secs()-dnet0,(unsigned long long)(k3_net_calls()-dnc0),
+           m->t_router-dr0,m->t_topk-dtop0,m->t_latent-dl0,
+           m->t_shared-ds0,m->t_expert-dx0,m->t_rnorm-dn0,
+           m->t_kproj-dkpr0,m->t_kconv-dkc0,m->t_khead-dkh0,m->t_kout-dko0,
+           m->t_mproj-dmpr0,m->t_mcache-dmc0,m->t_matt-dma0,m->t_mout-dmo0);
     fflush(stdout);
 }
 
