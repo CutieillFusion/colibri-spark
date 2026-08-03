@@ -66,6 +66,7 @@ int  coli_k3_expert_w1(const void *w1p, const void *w1s,
  * Returns null when it declines; the caller then keeps its zero-copy pointer. */
 void  *coli_k3_devmirror(const void *host, size_t bytes);
 size_t coli_k3_devmirror_used(void);
+void   coli_k3_devmirror_report(void);
 
 void coli_k3_shutdown(void);
 

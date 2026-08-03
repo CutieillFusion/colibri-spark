@@ -2262,6 +2262,9 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double moe=m->t_moe-e0, disk=m->t_eload-d0;
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
+#ifdef COLI_CUDA
+    { static int once=0; if(!once){ once=1; coli_k3_devmirror_report(); } }
+#endif
     printf("PROF2 attn=%.3f moe=%.3f load=%.3f head=%.3f net=%.3f/%llu "
            "router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
            "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f "

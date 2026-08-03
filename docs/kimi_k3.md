@@ -161,7 +161,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_DENSE_GPU` | 1 | zero-copy CUDA dense GEMV during decode (0 = device-mirror path) |
 | `K3_DENSE_EXACT` | 1 | stock-order bit-exact reduction (0 = legacy warp reduction) |
-| `K3_DENSE_DEV_GB` | 0 | device-mirror budget for exact dense weights (28 on the four-Spark config) |
+| `K3_DENSE_DEV_GB` | 0 | device-mirror budget for exact dense weights (16 on the four-Spark config) |
 | `K3_KDA_OVERLAP` | 1 with CUDA | run strict-f32 KDA control projections on a CPU worker underneath the independent GPU q/k/v/g projections (0 = synchronous fused CPU path) |
 | `K3_OMP_THREADS` | 10 | OpenMP workers used by `k3_launch.sh`; on GB10 this lets B=1 work occupy the 10 X925 cores while CUDA/network helpers can spill onto the 10 A725 cores |
 | `K3_NET_RD2` | 1 at 4 nodes | two-phase recursive-doubling collective for the paired Spark topology (0 restores the hierarchical tree) |
@@ -287,10 +287,17 @@ turns negative (see lm_head).
 |---:|---:|---:|
 | 0 | 3.525 / 3.524 | 13.225 |
 | 12 GB | 3.574 / 3.591 | 12.791 |
-| **28 GB** | **3.596 / 3.604** | **12.435** |
+| 28 GB | 3.596 / 3.604 | 12.435 |
+| **16 GB** | **3.605 / 3.609** | — |
 
-Expert hit rate stayed 99.5% at every setting. Mirroring costs RAM the expert
-cache would otherwise hold, so it is opt-in; 28 GB is the tuned value here.
+Expert hit rate stayed 99.5% at every setting. The budget stops binding at
+**15.36 GB**: the engine reports `15.36 GB placed, 0.00 GB skipped for budget,
+1.54 GB skipped over the 64 MB cap`, so 16, 28 and 40 GB all mirror exactly the
+same tensors and only 16 is worth reserving. The 1.54 GB refused by the cap is
+lm_head and friends, which measured SLOWER mirrored -- the cap is doing its job.
+
+Mirroring costs RAM the expert cache would otherwise hold, so it stays opt-in;
+16 GB is the tuned value here.
 
 ### Decode is not GPU-bound
 

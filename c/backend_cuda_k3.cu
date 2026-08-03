@@ -851,9 +851,16 @@ static int ensure_dense_scratch(int I, int O) {
  * the point where it stops paying. Mirroring costs RAM the expert cache would
  * otherwise hold, which is why this is a budget and not a default-everything. */
 static size_t g_devmir_left = 0, g_devmir_used = 0;
+static size_t g_devmir_cap_skip = 0, g_devmir_budget_skip = 0;
 static int    g_devmir_init = 0;
 
 extern "C" size_t coli_k3_devmirror_used(void) { return g_devmir_used; }
+/* Which limit actually bound: the byte budget, or the per-tensor cap. */
+extern "C" void coli_k3_devmirror_report(void) {
+    fprintf(stderr, "[K3/EXP] dense mirrors: %.2f GB placed, %.2f GB skipped for budget, "
+                    "%.2f GB skipped over the 64 MB cap\n",
+            g_devmir_used/1e9, g_devmir_budget_skip/1e9, g_devmir_cap_skip/1e9);
+}
 
 /* Returns a device copy, or null when it declines (budget spent, too large,
  * or allocation failed). Never fails the caller: they keep the host pointer. */
@@ -869,8 +876,8 @@ extern "C" void *coli_k3_devmirror(const void *host, size_t bytes) {
     }
     /* Past ~64 MB a tensor cannot stay cache-resident and the mapping stops
      * mattering; lm_head measured SLOWER mirrored. */
-    if (bytes > (size_t)64 * 1024 * 1024) return nullptr;
-    if (bytes > g_devmir_left) return nullptr;
+    if (bytes > (size_t)64 * 1024 * 1024) { g_devmir_cap_skip += bytes; return nullptr; }
+    if (bytes > g_devmir_left) { g_devmir_budget_skip += bytes; return nullptr; }
     void *d = nullptr;
     if (cudaMalloc(&d, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
     if (cudaMemcpy(d, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
