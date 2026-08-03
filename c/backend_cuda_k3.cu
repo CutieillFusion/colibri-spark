@@ -774,6 +774,55 @@ __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restric
     }
 }
 
+/* 4-wide consecutive fold: 64 physical threads, thread p owning logical lanes
+ * 4p..4p+3 in four accumulators merged only at the very end.
+ *
+ * Exact because the stock 256-lane tree combines lane bit 7 first and bits 1
+ * then 0 LAST. Grouping lanes by their high bits therefore leaves the last two
+ * edges to be replayed as (V0+V2)+(V1+V3), and each chain's own reduction over
+ * the 64 threads (n=32..1) is exactly lane bits 7..2 in the stock order.
+ *
+ * Worth doing because those four lanes are four CONSECUTIVE elements: one
+ * float4 of activations, two adjacent weight bytes, and -- since gs is a
+ * multiple of 4 -- a single group scale. Four loads per four elements instead
+ * of the twelve the {t, t+128} fold needs. 64 threads still reaches full
+ * occupancy (24 blocks x 64 = 1536), unlike the earlier 64-thread fold over
+ * {0,128,64,192} which shared nothing and only cost warps. */
+__global__ void k3_dense_i4g_exact4(float *__restrict__ y, const float *__restrict__ x,
+                                    const unsigned char *__restrict__ q4,
+                                    const float *__restrict__ scales,
+                                    int I, int O, int gsh, int ng) {
+    int o = blockIdx.x;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+    const unsigned char *w = q4 + (size_t)o * rb;
+    const float *scl = scales + (size_t)o * ng;
+    int p = (int)threadIdx.x;
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int i = p * 4; i + 3 < I; i += 256) {
+        float4 xx = *(const float4 *)(x + i);          /* i%4==0 => 16B aligned */
+        unsigned char b0 = w[i >> 1], b1 = w[(i >> 1) + 1];
+        int g = i >> gsh;
+        if (g >= ng) g = ng - 1;
+        float sc = scl[g];
+        a0 += xx.x * (float)((int)(b0 & 15) - 8) * sc;
+        a1 += xx.y * (float)((int)(b0 >> 4)  - 8) * sc;
+        a2 += xx.z * (float)((int)(b1 & 15) - 8) * sc;
+        a3 += xx.w * (float)((int)(b1 >> 4)  - 8) * sc;
+    }
+    __shared__ float sh[4][64];
+    sh[0][p] = a0; sh[1][p] = a1; sh[2][p] = a2; sh[3][p] = a3;
+    __syncthreads();
+    for (int n = 32; n >= 1; n >>= 1) {                /* lane bits 7..2 */
+        if (p < n) {
+            sh[0][p] += sh[0][p+n]; sh[1][p] += sh[1][p+n];
+            sh[2][p] += sh[2][p+n]; sh[3][p] += sh[3][p+n];
+        }
+        __syncthreads();
+    }
+    if (!p) y[o] = (sh[0][0] + sh[2][0]) + (sh[1][0] + sh[3][0]);  /* bit 1, then bit 0 */
+}
+
 __global__ void k3_dense_i8_exact(float *__restrict__ y, const float *__restrict__ x,
                                   const signed char *__restrict__ q8,
                                   const float *__restrict__ scales, int I, int O) {
@@ -931,10 +980,16 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     int exact = 1;
     { const char *fe = getenv("K3_DENSE_EXACT"); if (fe) exact = atoi(fe); }
     int blocks = (O + K3_WARPS - 1) / K3_WARPS;
+    static int i4w = -1;
+    if (i4w < 0) { const char *e = getenv("K3_DENSE_I4W"); i4w = e ? atoi(e) : 4; }
     if (exact && fmt == 4) {
         int ng = (I + gs - 1) / gs;
-        k3_dense_i4g_exact<<<O, 128, 0, g_stream>>>(
-            g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
+        if (i4w == 4 && gs >= 4 && !(I & 3))
+            k3_dense_i4g_exact4<<<O, 64, 0, g_stream>>>(
+                g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
+        else
+            k3_dense_i4g_exact<<<O, 128, 0, g_stream>>>(
+                g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
     } else if (exact) {
         k3_dense_i8_exact<<<O, 128, 0, g_stream>>>(
             g_dy, g_dx, (const signed char *)w, scales, I, O);

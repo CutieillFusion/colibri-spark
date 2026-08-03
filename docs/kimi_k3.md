@@ -259,6 +259,40 @@ part's **235 GB/s** achievable read bandwidth (measured; 273 GB/s theoretical â€
 note `cudaDevAttrMemoryClockRate` reports LPDDR5X's 8533 MT/s data rate, so
 doubling it overstates peak by 2x). `lat_up` already reaches 94%.
 
+### The 4-wide fold, and why it only pays once the mapping is fixed
+
+Exactness forces a thread to own logical lanes that the stock tree combines
+LAST. It combines lane bit 7 first and bits 1 then 0 last, so a thread may own
+lanes 4p..4p+3 with four accumulators merged at the end as (V0+V2)+(V1+V3),
+while each chain's own reduction over the 64 threads (n=32..1) replays lane bits
+7..2 in the stock order. Those four lanes are four CONSECUTIVE elements, so the
+pair costs one float4, two adjacent weight bytes and -- since gs is a multiple
+of 4 -- a single group scale: four loads per four elements instead of twelve.
+
+On zero-copy weights this is worth **nothing** (0.332 vs 0.333 ms), which is the
+same answer the 2-wide pair fold and the shared-memory scale staging gave, and
+for the same reason: that path is bound by the weight stream from DRAM, so
+instruction count is invisible.
+
+On device mirrors it is worth a lot:
+
+| shape | 2-wide | 4-wide |
+|---|---:|---:|
+| KDA q/k/v/g 12288x7168 | 182.7 GB/s | **242.6** |
+| KDA o_proj 7168x12288 | 173.5 | **238.9** |
+| shared gate 6144x7168 | 255.1 | **403.1** |
+| lat_up 7168x3584 | 238.0 | **374.1** |
+
+Fixing the page mapping removes the DRAM wall, and the load count immediately
+becomes the limit. End to end with `K3_DENSE_DEV_GB=16`: **3.780/3.778 against
+3.605/3.609**, with `shared` 5.117 -> 4.312, `latent` 1.845 -> 1.596 and `moe`
+12.882 -> 11.946 s/100 tokens.
+
+The lesson generalises: three separate load-reduction ideas measured neutral
+while the memory path was the bottleneck, and the one that survived only did so
+after the bottleneck moved. Re-measure a rejected optimisation when you change
+what limits it.
+
 ### Zero-copy is not free for the dense weights
 
 The dense path reads its weights zero-copy so the bytes stay available to the
