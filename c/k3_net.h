@@ -38,6 +38,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,6 +179,51 @@ static void k3_reduce_from(int fd, float *v, size_t n) {
     for (size_t i = 0; i < n; i++) v[i] += g_net_scratch[i];
 }
 
+/* Exchange pair-local sums in both directions at once.  The two-group
+ * topology used by the Spark cluster is full duplex, but the generic rooted
+ * reduction below serialises its cross-group traffic: peer -> root, then the
+ * completed root result -> peer.  Here both leaders send their local sum and
+ * receive the other pair's sum concurrently, then perform the same final
+ * floating-point add locally.  MSG_DONTWAIT plus poll keeps this safe for
+ * prefill payloads larger than the socket send buffer (two blocking sends
+ * could otherwise deadlock).
+ */
+static void k3_exchange_add(int fd, float *v, size_t n) {
+    if (g_net_scratch_n < n) {
+        g_net_scratch = (float*)realloc(g_net_scratch, n*sizeof(float));
+        if (!g_net_scratch) { fprintf(stderr,"[K3/NET] OOM scratch\n"); exit(1); }
+        g_net_scratch_n = n;
+    }
+    const char *tx = (const char*)v;
+    char *rx = (char*)g_net_scratch;
+    size_t bytes=n*sizeof(float), ns=0, nr=0;
+    while (ns<bytes || nr<bytes) {
+        int progress=0;
+        if (ns<bytes) {
+            ssize_t k=send(fd,tx+ns,bytes-ns,MSG_DONTWAIT|MSG_NOSIGNAL);
+            if (k>0) { ns+=(size_t)k; progress=1; }
+            else if (k<0 && errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR) {
+                fprintf(stderr,"[K3/NET] exchange send\n"); exit(1); }
+        }
+        if (nr<bytes) {
+            ssize_t k=recv(fd,rx+nr,bytes-nr,MSG_DONTWAIT);
+            if (k>0) { nr+=(size_t)k; progress=1; }
+            else if (k==0) { fprintf(stderr,"[K3/NET] exchange EOF\n"); exit(1); }
+            else if (errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR) {
+                fprintf(stderr,"[K3/NET] exchange recv\n"); exit(1); }
+        }
+        if (!progress) {
+            struct pollfd p={.fd=fd,.events=0,.revents=0};
+            if (ns<bytes) p.events|=POLLOUT;
+            if (nr<bytes) p.events|=POLLIN;
+            int pr;
+            do pr=poll(&p,1,-1); while (pr<0 && errno==EINTR);
+            if (pr<0) { fprintf(stderr,"[K3/NET] exchange poll\n"); exit(1); }
+        }
+    }
+    for (size_t i=0;i<n;i++) v[i]+=g_net_scratch[i];
+}
+
 /* v[0..n) := elementwise sum over all ranks. Blocking; every rank must call it
  * the same number of times in the same order. */
 static void k3_net_allreduce(float *v, size_t n) {
@@ -194,7 +240,11 @@ static void k3_net_allreduce(float *v, size_t n) {
 
     /* 2. across groups: leaders only — the single hop over the slow bridge */
     if (g_net_isleader) {
-        if (g_net_rank == 0) {
+        int ngroups=(g_net_world+g_net_gsize-1)/g_net_gsize;
+        if (ngroups==2) {
+            int fd = g_net_rank==0 ? g_net_fd[g_net_gsize] : g_net_up;
+            k3_exchange_add(fd,v,n);
+        } else if (g_net_rank == 0) {
             for (int L = g_net_gsize; L < g_net_world; L += g_net_gsize)
                 k3_reduce_from(g_net_fd[L], v, n);
             for (int L = g_net_gsize; L < g_net_world; L += g_net_gsize)
