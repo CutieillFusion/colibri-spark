@@ -258,6 +258,39 @@ of its 7.61 s in calls >= 400 us, which are **prefill** (`coli_k3_dense`
 declines S != 1); decode-sized calls total only 0.78 s. And `cudaMemcpyAsync`
 dominates the CUDA-runtime table purely by count (108k calls), not by cost.
 
+### An OpenMP region costs ~58 us in the engine, not the ~2 us a microbenchmark shows
+
+This is the single most misleading measurement in this codebase, and it has now
+produced three wrong predictions in a row. A tight loop around an empty
+`#pragma omp parallel` on this box reports **1.95 us**. In the engine the same
+region costs roughly **58 us**, because between regions there is GPU work,
+syscalls and collective waits, so the GOMP team exhausts its spin count, sleeps,
+and has to be woken.
+
+Measured by parallelising three provably bit-exact loops at once -- the
+shared-expert SiTU activation (elementwise), `res_mix`'s scoring loop (split
+over entries so each inner double reduction stays sequential) and `out += sd`
+(elementwise). Isolated harnesses predicted 6.60 -> 2.49 ms/token for `res_mix`
+and 1.60 -> 0.20 s/100 for SiTU, about 8.8 ms/token in total. The four-Spark
+result went the other way: **3.269/3.268 against 3.485/3.480**, a ~6%
+regression, i.e. ~18 ms/token lost across ~463 new regions per token.
+
+So the `SERIAL BY DESIGN` note on the KDA conv loop generalises: do not
+parallelise a region on the decode path unless it is worth *well over* 58 us of
+work, and do not trust a hot-team microbenchmark to tell you whether it is.
+
+The same class of error has now appeared three times, always because a harness
+reproduced the arithmetic but not the machine state:
+
+| harness said | engine said | what the harness got wrong |
+|---|---|---|
+| int4 group scales cost +21-57% | no change | probe used device memory; production is zero-copy |
+| KDA control is 0.11 ms/layer | ~1.14 ms/layer exposed | one 5.93 MB working set stayed L2-hot |
+| omp region is 1.95 us | ~58 us | tight loop kept the team spinning |
+
+Reproduce production conditions -- registered host memory, a cold working set,
+and realistic gaps between regions -- or measure end to end.
+
 ### The strict-f32 KDA control is memory-bound, and overlap is what saves it
 
 `kda_control_b1` reads 5.93 MB of f32 weights per KDA layer -- `f_a` [128,7168],
