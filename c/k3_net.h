@@ -20,6 +20,12 @@
  *   phase 2  leaders  <-> root              (cross-pair, 1 GbE, ONE exchange)
  *   phase 3  leader   -> members            (intra-pair, 200 GbE)
  *
+ * On the exact 4-rank/2-per-group Spark topology, K3_NET_RD2=1 adds a direct
+ * Ethernet socket between ranks 1 and 3.  Both ranks in each fast pair first
+ * exchange-add, then the two corresponding ranks exchange-add across pairs.
+ * That recursive-doubling special case takes two phases and has no broadcast;
+ * the launcher enables it by default for four nodes only.
+ *
  * Set K3_GROUP_SIZE=1 or =K3_WORLD to degenerate back to a flat star.
  *
  * Environment (the launcher computes these per rank):
@@ -32,6 +38,8 @@
  *                   `ssh sparkN` names resolve to tailscale, not the fabric,
  *                   so pass 10.10.12.x / 10.10.34.x here.
  *   K3_MASTER_PORT  TCP port every leader listens on (default 29555)
+ *   K3_NET_RD2      enable the specialized 4-rank/2-group two-phase path
+ *   K3_CROSS_HOST   lower-pair Ethernet address for ranks 2 and 3 in RD2
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -54,6 +62,8 @@ static int    g_net_rank = 0, g_net_world = 1, g_net_gsize = 1;
 static int    g_net_leader = 0, g_net_isleader = 1;
 static int    g_net_fd[K3_NET_MAX];        /* downstream: members, and (root) peer leaders */
 static int    g_net_up = -1;               /* upstream: leader, or root for a leader */
+static int    g_net_cross = -1;            /* optional rank r <-> r+2 direct bridge */
+static int    g_net_rd2 = 0;               /* two-phase 4-rank recursive doubling */
 static float *g_net_scratch = NULL;
 static size_t g_net_scratch_n = 0;
 static double g_net_secs = 0;              /* time parked in collectives */
@@ -118,6 +128,10 @@ static int k3_net_init(void) {
     g_net_leader   = (g_net_rank / g_net_gsize) * g_net_gsize;
     g_net_isleader = (g_net_rank == g_net_leader);
     int port = getenv("K3_MASTER_PORT") ? atoi(getenv("K3_MASTER_PORT")) : 29555;
+    g_net_rd2 = getenv("K3_NET_RD2") ? atoi(getenv("K3_NET_RD2")) : 0;
+    if (g_net_rd2 && (g_net_world != 4 || g_net_gsize != 2)) {
+        fprintf(stderr,"[K3/NET] K3_NET_RD2 requires world=4, group=2\n"); exit(1);
+    }
     for (int i = 0; i < K3_NET_MAX; i++) g_net_fd[i] = -1;
 
     /* How many inbound connections this rank owns: its group members, plus --
@@ -164,8 +178,38 @@ static int k3_net_init(void) {
         if (!k3_send_all(g_net_up,&g_net_rank,sizeof(g_net_rank))) { fprintf(stderr,"[K3/NET] hello\n"); exit(1); }
     }
     if (ls >= 0) close(ls);
-    fprintf(stderr,"[K3/NET] rank %d/%d group=%d leader=%d%s ready\n",
-            g_net_rank,g_net_world,g_net_gsize,g_net_leader,g_net_isleader?" (leader)":"");
+
+    /* The 4-Spark topology has Ethernet on every node, not just the two pair
+     * leaders.  Add one direct r<->r+2 socket so the all-reduce can do an
+     * intra-pair exchange followed by two cross-pair exchanges in parallel.
+     * This removes the third (leader->member) phase from the critical path.
+     * Keep it opt-in: the generic hierarchy remains valid for every topology. */
+    if (g_net_rd2) {
+        int cp = port + 1;
+        if (g_net_rank < 2) {
+            int cs = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+            setsockopt(cs, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            struct sockaddr_in a; memset(&a,0,sizeof(a));
+            a.sin_family=AF_INET; a.sin_addr.s_addr=INADDR_ANY; a.sin_port=htons((uint16_t)cp);
+            if (bind(cs,(struct sockaddr*)&a,sizeof(a)) || listen(cs,1)) {
+                fprintf(stderr,"[K3/NET] cross bind/listen :%d: %s\n",cp,strerror(errno)); exit(1); }
+            g_net_cross=accept(cs,NULL,NULL); close(cs);
+            if (g_net_cross<0) { fprintf(stderr,"[K3/NET] cross accept: %s\n",strerror(errno)); exit(1); }
+            int peer=-1;
+            if (!k3_recv_all(g_net_cross,&peer,sizeof(peer)) || peer!=g_net_rank+2) {
+                fprintf(stderr,"[K3/NET] bad cross hello\n"); exit(1); }
+            k3_nodelay(g_net_cross);
+        } else {
+            const char *ch=getenv("K3_CROSS_HOST");
+            if (!ch) { fprintf(stderr,"[K3/NET] rank %d: K3_CROSS_HOST unset\n",g_net_rank); exit(1); }
+            g_net_cross=k3_connect_retry(ch,cp);
+            if (!k3_send_all(g_net_cross,&g_net_rank,sizeof(g_net_rank))) {
+                fprintf(stderr,"[K3/NET] cross hello\n"); exit(1); }
+        }
+    }
+    fprintf(stderr,"[K3/NET] rank %d/%d group=%d leader=%d%s%s ready\n",
+            g_net_rank,g_net_world,g_net_gsize,g_net_leader,g_net_isleader?" (leader)":"",
+            g_net_rd2?" rd2":"");
     return g_net_world;
 }
 
@@ -229,6 +273,18 @@ static void k3_exchange_add(int fd, float *v, size_t n) {
 static void k3_net_allreduce(float *v, size_t n) {
     if (g_net_world <= 1) return;
     double t0 = k3_now();
+
+    if (g_net_rd2) {
+        /* Recursive doubling specialized to the two isolated fast pairs.
+         * Phase 1 leaves the pair sum on BOTH ranks; phase 2 uses two separate
+         * Ethernet links concurrently, so every rank obtains the global sum
+         * without a leader broadcast. */
+        int pairfd = g_net_isleader ? g_net_fd[g_net_rank+1] : g_net_up;
+        k3_exchange_add(pairfd,v,n);
+        k3_exchange_add(g_net_cross,v,n);
+        g_net_secs += k3_now() - t0; g_net_calls++;
+        return;
+    }
 
     /* 1. intra-group: members -> leader (fast link) */
     if (g_net_isleader) {
@@ -323,6 +379,7 @@ static void k3_net_finalize(void) {
     if (g_net_world <= 1) return;
     for (int i = 0; i < K3_NET_MAX; i++) if (g_net_fd[i] >= 0) close(g_net_fd[i]);
     if (g_net_up >= 0) close(g_net_up);
+    if (g_net_cross >= 0) close(g_net_cross);
     free(g_net_scratch); g_net_scratch = NULL; g_net_scratch_n = 0;
 }
 

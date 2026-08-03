@@ -22,9 +22,12 @@ S="ssh -o BatchMode=yes -o StrictHostKeyChecking=no"
 
 HOSTS=(spark1 spark2 spark3 spark4)
 UP=("" 10.10.12.1 192.168.0.159 10.10.34.1)     # per-rank upstream address
+CROSS=("" "" 192.168.0.159 192.168.0.230)        # r2->r0 and r3->r1 Ethernet
 
 COMMON="K3_WORLD=$WORLD K3_GROUP_SIZE=2 K3_MASTER_PORT=$PORT \
-K3_GPUS=0 K3_EXPERT_GPU=1 K3_EXPERT_GB=${K3_EGB:-28} K3_GPU_GB=${K3_GGB:-40} K3_MAXT=512 K3_TP_ATTN=${K3_TP_ATTN:-1} OMP_NUM_THREADS=20"
+K3_GPUS=0 K3_EXPERT_GPU=1 K3_EXPERT_GB=${K3_EGB:-28} K3_GPU_GB=${K3_GGB:-40} K3_MAXT=512 K3_TP_ATTN=${K3_TP_ATTN:-1} OMP_NUM_THREADS=${K3_OMP_THREADS:-19}"
+if [ "$WORLD" = 4 ]; then RD2=${K3_NET_RD2:-1}; else RD2=${K3_NET_RD2:-0}; fi
+COMMON="$COMMON K3_NET_RD2=$RD2"
 
 # This list is EXPLICIT: a variable exported in the caller's shell does NOT reach
 # the ranks unless it is named here, and the run still looks completely normal
@@ -54,6 +57,7 @@ pids=()
 for ((r=0; r<WORLD; r++)); do
   env_r="$COMMON K3_RANK=$r"
   [ -n "${UP[$r]}" ] && env_r="$env_r K3_UP_HOST=${UP[$r]}"
+  [ "$RD2" != 0 ] && [ -n "${CROSS[$r]}" ] && env_r="$env_r K3_CROSS_HOST=${CROSS[$r]}"
   if [ -n "${W1[$r]:-}" ]; then
     env_r="$env_r K3_W1_DIR=${W1[$r]}"
     [ "$r" != 0 ] && env_r="$env_r K3_W2_SHARD=${W2SHARD[$r]}"

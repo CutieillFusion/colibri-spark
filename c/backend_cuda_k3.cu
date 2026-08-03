@@ -700,7 +700,7 @@ __global__ void k3_dense_i8(float *__restrict__ y, const float *__restrict__ x,
 __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restrict__ x,
                                    const unsigned char *__restrict__ q4,
                                    const float *__restrict__ scales,
-                                   int I, int O, int gs, int ng) {
+                                   int I, int O, int gsh, int ng) {
     int o = blockIdx.x;
     if (o >= O) return;
     size_t rb = (size_t)((I + 1) >> 1);
@@ -710,18 +710,23 @@ __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restric
     for (int i = threadIdx.x; i < I; i += blockDim.x) {
         unsigned char b = w[i >> 1];
         int n = (i & 1) ? (b >> 4) : (b & 15);
-        int g = i / gs;
+        int g = i >> gsh;
         if (g >= ng) g = ng - 1;
         sum += x[i] * (float)(n - 8) * scl[g];
     }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
     __syncthreads();
-    for (int n = blockDim.x >> 1; n; n >>= 1) {
+    for (int n = blockDim.x >> 1; n >= 32; n >>= 1) {
         if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
         __syncthreads();
     }
-    if (!threadIdx.x) y[o] = partial[0];
+    if (threadIdx.x < 32) {
+        float v=partial[threadIdx.x];
+        #pragma unroll
+        for (int n=16;n;n>>=1) v+=__shfl_down_sync(0xffffffffu,v,n);
+        if (!threadIdx.x) y[o]=v;
+    }
 }
 
 __global__ void k3_dense_i8_exact(float *__restrict__ y, const float *__restrict__ x,
@@ -736,11 +741,16 @@ __global__ void k3_dense_i8_exact(float *__restrict__ y, const float *__restrict
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
     __syncthreads();
-    for (int n = blockDim.x >> 1; n; n >>= 1) {
+    for (int n = blockDim.x >> 1; n >= 32; n >>= 1) {
         if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
         __syncthreads();
     }
-    if (!threadIdx.x) y[o] = partial[0] * scales[o];
+    if (threadIdx.x < 32) {
+        float v=partial[threadIdx.x];
+        #pragma unroll
+        for (int n=16;n;n>>=1) v+=__shfl_down_sync(0xffffffffu,v,n);
+        if (!threadIdx.x) y[o]=v*scales[o];
+    }
 }
 
 static int    g_dense_attr = 0;
@@ -813,7 +823,7 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     if (exact && fmt == 4) {
         int ng = (I + gs - 1) / gs;
         k3_dense_i4g_exact<<<O, 256, 0, g_stream>>>(
-            g_dy, g_dx, (const unsigned char *)w, scales, I, O, gs, ng);
+            g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
     } else if (exact) {
         k3_dense_i8_exact<<<O, 256, 0, g_stream>>>(
             g_dy, g_dx, (const signed char *)w, scales, I, O);
