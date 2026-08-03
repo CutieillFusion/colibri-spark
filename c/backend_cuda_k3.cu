@@ -706,18 +706,29 @@ __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restric
     size_t rb = (size_t)((I + 1) >> 1);
     const unsigned char *w = q4 + (size_t)o * rb;
     const float *scl = scales + (size_t)o * ng;
-    float sum = 0.f;
-    for (int i = threadIdx.x; i < I; i += blockDim.x) {
+    /* Preserve the stock 256-lane reduction tree on 128 physical threads:
+     * s0 and s1 are exactly original partial[t] and partial[t+128], and their
+     * addition is exactly the tree's first edge. This can double resident
+     * blocks without changing a floating-point association. */
+    float s0 = 0.f, s1 = 0.f;
+    for (int i = threadIdx.x; i < I; i += 256) {
         unsigned char b = w[i >> 1];
         int n = (i & 1) ? (b >> 4) : (b & 15);
         int g = i >> gsh;
         if (g >= ng) g = ng - 1;
-        sum += x[i] * (float)(n - 8) * scl[g];
+        s0 += x[i] * (float)(n - 8) * scl[g];
     }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
+    for (int i = threadIdx.x + 128; i < I; i += 256) {
+        unsigned char b = w[i >> 1];
+        int n = (i & 1) ? (b >> 4) : (b & 15);
+        int g = i >> gsh;
+        if (g >= ng) g = ng - 1;
+        s1 += x[i] * (float)(n - 8) * scl[g];
+    }
+    __shared__ float partial[128];
+    partial[threadIdx.x] = s0+s1;
     __syncthreads();
-    for (int n = blockDim.x >> 1; n >= 32; n >>= 1) {
+    for (int n = 64; n >= 32; n >>= 1) {
         if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
         __syncthreads();
     }
@@ -822,7 +833,7 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     int blocks = (O + K3_WARPS - 1) / K3_WARPS;
     if (exact && fmt == 4) {
         int ng = (I + gs - 1) / gs;
-        k3_dense_i4g_exact<<<O, 256, 0, g_stream>>>(
+        k3_dense_i4g_exact<<<O, 128, 0, g_stream>>>(
             g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
     } else if (exact) {
         k3_dense_i8_exact<<<O, 256, 0, g_stream>>>(
