@@ -424,6 +424,23 @@ extern "C" int coli_k3_expert_batch_w2(const void *const *w1p, const void *const
  * multiplies once per group. 32 values = 4 bytes. */
 __constant__ float c_w1a[1];
 
+/* x is staged with a 33-float stride per 32-value group, not 32.
+ *
+ * At the natural stride, lane L owns group L+32k and reads shx[32L + 1024k + j],
+ * so every lane in the warp lands on bank j: a 32-way shared-memory bank
+ * conflict on each of the 32 loads per group. A probe that kept the loads but
+ * removed the arithmetic ran at exactly the same speed as the real kernel
+ * (0.0515 ms both), while a version that dropped only the shared reads ran 5x
+ * faster -- the ALU was free and shared memory was the whole cost. Padding to
+ * 33 makes lane L read bank (L + j) % 32, all 32 distinct. Same values in the
+ * same order; 66 -> 168 GB/s of weight bytes.
+ *
+ * warp_row_dot_w2 has the identical indexing and therefore the identical
+ * conflict. It is left alone only because the 2-bit store is not what this
+ * deployment runs, so the fix could not be validated end to end here. */
+#define K3_W1_SHSTRIDE 33
+#define K3_W1_SHFLOATS(I) ((size_t)((I) >> 5) * K3_W1_SHSTRIDE)
+
 __device__ __forceinline__ float warp_row_dot_w1(const unsigned char *__restrict__ pk,
                                                  const unsigned char *__restrict__ sc,
                                                  const float *__restrict__ x,
@@ -431,7 +448,7 @@ __device__ __forceinline__ float warp_row_dot_w1(const unsigned char *__restrict
     float acc = 0.f;
     for (int g = lane; g < ng; g += 32) {
         unsigned int v = *(const unsigned int *)(pk + (g << 2));   /* 32 bits */
-        const float *xs = x + (g << 5);
+        const float *xs = x + g * K3_W1_SHSTRIDE;
         /* Branchless sign flip: XOR bit 31 when the weight bit is 0. The
          * obvious `bit ? x : -x` costs a select per weight and 32 serial loop
          * iterations per group -- versus 8 iterations x 4 values in the 2-bit
@@ -462,7 +479,7 @@ __global__ void k3_w1_gate_up_fast(float *__restrict__ gate,
                                    const unsigned char *__restrict__ w3s,
                                    const float *__restrict__ z,
                                    int I, int O, float beta1, float beta2) {
-    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i] = z[i];
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i + (i >> 5)] = z[i];
     __syncthreads();
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int o = blockIdx.x * K3_WARPS + warp;
@@ -480,7 +497,7 @@ __global__ void k3_w1_down_fast(float *__restrict__ hz,
                                 const unsigned char *__restrict__ w2p,
                                 const unsigned char *__restrict__ w2s,
                                 const float *__restrict__ gate, int I, int O) {
-    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i] = gate[i];
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i + (i >> 5)] = gate[i];
     __syncthreads();
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int o = blockIdx.x * K3_WARPS + warp;
@@ -499,10 +516,12 @@ extern "C" int coli_k3_expert_w1(const void *w1p, const void *w1s,
     if (!ck(cudaMemcpyAsync(g_z, z, (size_t)latent*sizeof(float),
                             cudaMemcpyHostToDevice, g_stream), "z upload")) return 0;
     int gu = (inter + K3_WARPS - 1) / K3_WARPS, dn = (latent + K3_WARPS - 1) / K3_WARPS;
-    k3_w1_gate_up_fast<<<gu, K3_FAST_THREADS, latent*sizeof(float), g_stream>>>(
+    k3_w1_gate_up_fast<<<gu, K3_FAST_THREADS,
+                         K3_W1_SHFLOATS(latent)*sizeof(float), g_stream>>>(
         g_gate, (const unsigned char*)w1p, (const unsigned char*)w1s,
         (const unsigned char*)w3p, (const unsigned char*)w3s, g_z, latent, inter, beta1, beta2);
-    k3_w1_down_fast<<<dn, K3_FAST_THREADS, inter*sizeof(float), g_stream>>>(
+    k3_w1_down_fast<<<dn, K3_FAST_THREADS,
+                      K3_W1_SHFLOATS(inter)*sizeof(float), g_stream>>>(
         g_hz, (const unsigned char*)w2p, (const unsigned char*)w2s, g_gate, inter, latent);
     if (!ck(cudaMemcpyAsync(hz, g_hz, (size_t)latent*sizeof(float),
                             cudaMemcpyDeviceToHost, g_stream), "hz download")) return 0;
