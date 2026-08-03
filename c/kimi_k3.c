@@ -232,6 +232,7 @@ typedef struct {
     double t_ekernel;                     /* GPU call only, inside t_expert */
     double t_kproj, t_kconv, t_khead, t_kout;  /* kda_forward breakdown */
     double t_ctl, t_ctljoin;                   /* control work vs join wait */
+    double t_net_kda, t_net_mla, t_net_moe;     /* EXPOSED collective time by site */
     double t_mproj, t_mcache, t_matt, t_mout;   /* mla_forward breakdown */
     uint64_t n_ekernel;
     FILE *trace;
@@ -1340,10 +1341,10 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         for(int t=0;t<C;t++) memcpy(cmp+(int64_t)t*pn,on+(int64_t)t*P+p0,(size_t)pn*sizeof(float));
         w_matmul(out,cmp,&a->os,C);
         free(cmp);
-        k3_net_allreduce(out,(size_t)C*c->hidden);
+        { double na=now_s(); k3_net_allreduce(out,(size_t)C*c->hidden); m->t_net_kda+=now_s()-na; }
     } else if(wsz>1){
         memset(out,0,(size_t)C*c->hidden*sizeof(float));
-        k3_net_allreduce(out,(size_t)C*c->hidden);
+        { double na=now_s(); k3_net_allreduce(out,(size_t)C*c->hidden); m->t_net_kda+=now_s()-na; }
     } else w_matmul(out,on,&a->o,C);
     m->t_kout+=now_s()-ko0;
     free(q);free(k);free(v);free(gp);free(on);free(t1);free(graw);free(braw);
@@ -1439,10 +1440,10 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                                     (size_t)mhn*vh*sizeof(float));
         w_matmul(out,cc,&a->os,C);
         free(cc);
-        k3_net_allreduce(out,(size_t)C*c->hidden);
+        { double na=now_s(); k3_net_allreduce(out,(size_t)C*c->hidden); m->t_net_mla+=now_s()-na; }
     } else if(wsz>1){
         memset(out,0,(size_t)C*c->hidden*sizeof(float));
-        k3_net_allreduce(out,(size_t)C*c->hidden);
+        { double na=now_s(); k3_net_allreduce(out,(size_t)C*c->hidden); m->t_net_mla+=now_s()-na; }
     } else w_matmul(out,ctx,&a->o,C);
     m->t_mout+=now_s()-mt0;
     free(qa);free(qv);free(ckv);free(gv);free(ctx);
@@ -1836,7 +1837,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
     w_matmul(sd,sg,&o->sh_down,C);
     m->t_shared+=now_s()-tp0;
-    k3_net_allreduce_wait();
+    { double na=now_s(); k3_net_allreduce_wait(); m->t_net_moe+=now_s()-na; }
     tp0=now_s();
     for(int t=0;t<C;t++)
         rmsnorm_(u+(int64_t)t*LT,u+(int64_t)t*LT,o->lat_norm,LT,c->eps);
@@ -2191,6 +2192,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double ds0=m->t_shared, dx0=m->t_expert, dn0=m->t_rnorm;
     double dkpr0=m->t_kproj, dkc0=m->t_kconv, dkh0=m->t_khead, dko0=m->t_kout;
     double dcj0=m->t_ctljoin, dcw0=g_ctl_secs;
+    double dnk0=m->t_net_kda, dnm0=m->t_net_mla, dnx0=m->t_net_moe;
     double dmpr0=m->t_mproj, dmc0=m->t_mcache, dma0=m->t_matt, dmo0=m->t_mout;
     double dnet0=k3_net_secs(); uint64_t dnc0=k3_net_calls();
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
@@ -2246,14 +2248,16 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     printf("PROF2 attn=%.3f moe=%.3f load=%.3f head=%.3f net=%.3f/%llu "
            "router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
            "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f "
-           "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f ctlwork=%.3f ctljoin=%.3f\n",
+           "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f ctlwork=%.3f ctljoin=%.3f "
+           "netkda=%.3f netmla=%.3f netmoe=%.3f\n",
            m->t_attn-da0,m->t_moe-de0,m->t_eload-dd0,m->t_head-dh0,
            k3_net_secs()-dnet0,(unsigned long long)(k3_net_calls()-dnc0),
            m->t_router-dr0,m->t_topk-dtop0,m->t_latent-dl0,
            m->t_shared-ds0,m->t_expert-dx0,m->t_rnorm-dn0,
            m->t_kproj-dkpr0,m->t_kconv-dkc0,m->t_khead-dkh0,m->t_kout-dko0,
            m->t_mproj-dmpr0,m->t_mcache-dmc0,m->t_matt-dma0,m->t_mout-dmo0,
-           g_ctl_secs-dcw0,m->t_ctljoin-dcj0);
+           g_ctl_secs-dcw0,m->t_ctljoin-dcj0,
+           m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0);
     fflush(stdout);
 }
 

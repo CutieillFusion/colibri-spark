@@ -317,6 +317,46 @@ To make this path viable you would need materially more independent rows --
 `t1`. Sharding it would add a collective per KDA layer, which at ~0.82 ms is far
 more than the whole control costs.
 
+### Exposed collective time, measured per site
+
+PROF2 reports `netkda`, `netmla` and `netmoe` -- the collective time actually on
+the critical path, as opposed to the inclusive `net` timer. Warm four-Spark:
+
+| site | s/100 tokens | ms/token |
+|---|---:|---:|
+| `netkda` (KDA attention all-reduce) | 3.315 | 33.2 |
+| `netmla` (MLA all-reduce) | 1.045 | 10.5 |
+| `netmoe` (latent wait, the rest hides under shared experts) | 0.838 | 8.4 |
+| **exposed total** | **5.198** | **52.0** |
+
+`net` itself is 8.291 s/100, so about 31 ms/token of collective genuinely does
+hide. `kout` is 4.016 of which `netkda` is 3.315, i.e. ~83% collective and only
+~7 ms/token of actual o_proj.
+
+**This bounds what the network is worth.** At 283 ms/token, deleting every
+exposed collective leaves 231 ms/token = **4.33 tok/s**. Uniform fabric alone
+does not reach 5 tok/s; that also needs ~31 ms/token off compute.
+
+### Why the control runs on a helper thread: pageable D2H is synchronous
+
+`ctljoin` was 19.1 ms/token while only ~4 ms is genuine imbalance (control 31 ms
+against 27 ms of q/k/v/g), so most of it looked like pthread creation and
+scheduling latency. The apparently clean fix is to drop the helper thread
+entirely: queue the four q/k/v/g GEMVs without syncing, run the control on the
+main thread underneath them, and flush once.
+
+It measured **2.797/2.808 against 3.536/3.528**. `ctljoin` did go to exactly
+0.000 as designed, but `kproj` rose 4.686 -> 5.758 and `netkda` 3.315 -> 5.054.
+
+The reason is that `cudaMemcpyAsync` device-to-host into **pageable** memory is
+synchronous. The engine's activation buffers are plain `malloc`, so the deferred
+calls never deferred; the control simply ran serially afterwards, and the extra
+4x staging buffer and added skew made it worse still. Making this work needs
+pinned host buffers throughout the dense path, which is a much larger change.
+
+That is also the answer to why a helper thread exists at all: with pageable
+destinations there is no other way to overlap CPU work with a dense GEMV.
+
 ### The KDA control's cost is contention, not thread churn
 
 PROF2 now reports `ctlwork` (time inside `kda_control_b1`, wherever it runs) and
