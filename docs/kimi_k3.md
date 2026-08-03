@@ -217,6 +217,26 @@ shared memory and no change to a single value or summation order.
 Measured on the real expert shape: 0.089 -> 0.041 ms hot (57.8 -> 126.5 GB/s),
 0.092 -> 0.057 ms cold-cycled, and `expert` 4.219 -> 2.937 s/100 tokens.
 
+A second step takes the stride from 33 to **36**. 33 fixes the conflict for
+scalar loads but is not 16-byte aligned, so it forbids vector loads. 36 floats
+= 144 B is aligned AND still conflict-free for 128-bit accesses, because the
+hardware splits a warp's float4 loads into four phases of eight lanes and eight
+lanes x four banks covers exactly the 32 banks. The 32 scalar shared loads per
+group become 8 float4 loads, in the same order:
+
+| gate_up variant | ms | GB/s |
+|---|---:|---:|
+| stride 32 (original) | 0.0513 | 67.1 |
+| stride 33, scalar | 0.0205 | 168.0 |
+| **stride 36, float4** | **0.0153** | **224.5** |
+| no activation reads at all (floor) | 0.0102 | 336.0 |
+
+Real expert shape 0.041 -> 0.036 ms hot, 0.057 -> 0.055 cold, `expert`
+2.937 -> 2.782 s/100 tokens. Note the cold gain is far smaller than the hot one:
+cold is bound by the weight stream from DRAM, so end to end this is +0.8%
+(3.494/3.488 -> 3.523/3.511), inside run-to-run noise even though the PROF2
+term it targets moves cleanly.
+
 Two things this ruled out along the way: zero-copy is not a factor (weights in
 `cudaMalloc` memory measured 58.6 GB/s against 57.8 zero-copy, and cycling 48
 distinct slots gave 56.3, so neither the mapped-host path nor cache residency

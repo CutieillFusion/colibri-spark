@@ -438,7 +438,15 @@ __constant__ float c_w1a[1];
  * warp_row_dot_w2 has the identical indexing and therefore the identical
  * conflict. It is left alone only because the 2-bit store is not what this
  * deployment runs, so the fix could not be validated end to end here. */
-#define K3_W1_SHSTRIDE 33
+/* Stride 36, not 33. 33 fixes the bank conflict for SCALAR loads but is not
+ * 16-byte aligned, so it forbids vector loads. 36 floats = 144 B is 16-byte
+ * aligned AND stays conflict-free for 128-bit accesses: the hardware splits a
+ * warp's float4 loads into four phases of eight lanes, and eight lanes x four
+ * banks each covers exactly the 32 banks. That turns the 32 scalar shared
+ * loads per group into 8 float4 loads. Measured on the gate_up shape:
+ * stride 33 scalar 0.0205 ms / 168 GB/s -> stride 36 vector 0.0153 ms /
+ * 225 GB/s, against 0.0102 ms for a variant that reads no activation at all. */
+#define K3_W1_SHSTRIDE 36
 #define K3_W1_SHFLOATS(I) ((size_t)((I) >> 5) * K3_W1_SHSTRIDE)
 
 __device__ __forceinline__ float warp_row_dot_w1(const unsigned char *__restrict__ pk,
@@ -448,7 +456,14 @@ __device__ __forceinline__ float warp_row_dot_w1(const unsigned char *__restrict
     float acc = 0.f;
     for (int g = lane; g < ng; g += 32) {
         unsigned int v = *(const unsigned int *)(pk + (g << 2));   /* 32 bits */
-        const float *xs = x + g * K3_W1_SHSTRIDE;
+        /* 8 float4 loads cover the group's 32 activations; q0..q3 keep them in
+         * the same order the four partial sums consumed them before. */
+        const float4 *x4 = (const float4 *)(x + g * K3_W1_SHSTRIDE);
+        float4 a0=x4[0],a1=x4[1],a2=x4[2],a3=x4[3],a4=x4[4],a5=x4[5],a6=x4[6],a7=x4[7];
+        const float q0[8]={a0.x,a0.y,a0.z,a0.w,a1.x,a1.y,a1.z,a1.w};
+        const float q1[8]={a2.x,a2.y,a2.z,a2.w,a3.x,a3.y,a3.z,a3.w};
+        const float q2[8]={a4.x,a4.y,a4.z,a4.w,a5.x,a5.y,a5.z,a5.w};
+        const float q3[8]={a6.x,a6.y,a6.z,a6.w,a7.x,a7.y,a7.z,a7.w};
         /* Branchless sign flip: XOR bit 31 when the weight bit is 0. The
          * obvious `bit ? x : -x` costs a select per weight and 32 serial loop
          * iterations per group -- versus 8 iterations x 4 values in the 2-bit
@@ -460,10 +475,10 @@ __device__ __forceinline__ float warp_row_dot_w1(const unsigned char *__restrict
         for (int j = 0; j < 8; j++) {
             unsigned int b0 = (~v >> (j))      & 1u, b1 = (~v >> (j + 8))  & 1u;
             unsigned int b2 = (~v >> (j + 16)) & 1u, b3 = (~v >> (j + 24)) & 1u;
-            p0 += __uint_as_float(__float_as_uint(xs[j])      ^ (b0 << 31));
-            p1 += __uint_as_float(__float_as_uint(xs[j + 8])  ^ (b1 << 31));
-            p2 += __uint_as_float(__float_as_uint(xs[j + 16]) ^ (b2 << 31));
-            p3 += __uint_as_float(__float_as_uint(xs[j + 24]) ^ (b3 << 31));
+            p0 += __uint_as_float(__float_as_uint(q0[j]) ^ (b0 << 31));
+            p1 += __uint_as_float(__float_as_uint(q1[j]) ^ (b1 << 31));
+            p2 += __uint_as_float(__float_as_uint(q2[j]) ^ (b2 << 31));
+            p3 += __uint_as_float(__float_as_uint(q3[j]) ^ (b3 << 31));
         }
         acc += ((p0 + p1) + (p2 + p3)) * mx4_scale_dev(sc[g]);
     }
@@ -479,7 +494,7 @@ __global__ void k3_w1_gate_up_fast(float *__restrict__ gate,
                                    const unsigned char *__restrict__ w3s,
                                    const float *__restrict__ z,
                                    int I, int O, float beta1, float beta2) {
-    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i + (i >> 5)] = z[i];
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[(i >> 5) * K3_W1_SHSTRIDE + (i & 31)] = z[i];
     __syncthreads();
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int o = blockIdx.x * K3_WARPS + warp;
@@ -497,7 +512,7 @@ __global__ void k3_w1_down_fast(float *__restrict__ hz,
                                 const unsigned char *__restrict__ w2p,
                                 const unsigned char *__restrict__ w2s,
                                 const float *__restrict__ gate, int I, int O) {
-    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[i + (i >> 5)] = gate[i];
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[(i >> 5) * K3_W1_SHSTRIDE + (i & 31)] = gate[i];
     __syncthreads();
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int o = blockIdx.x * K3_WARPS + warp;
