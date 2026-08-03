@@ -258,6 +258,45 @@ of its 7.61 s in calls >= 400 us, which are **prefill** (`coli_k3_dense`
 declines S != 1); decode-sized calls total only 0.78 s. And `cudaMemcpyAsync`
 dominates the CUDA-runtime table purely by count (108k calls), not by cost.
 
+### The KDA control cannot move to the GPU: only 152 independent rows
+
+The exact CPU order was solved. `kda_control_b1`'s dot is
+`float v=0; for(i) v+=x[i]*w[i];`, which GCC at `-O3 -march=native` turns into a
+vector `fmul` plus **scalar** `fadd`s -- products rounded before accumulation,
+and no `fmla`. Linking the real CPU object against candidate CUDA orderings over
+200 random 7168-length trials:
+
+| GPU ordering | bit-exact |
+|---|---|
+| `__fmul_rn` then `__fadd_rn`, sequential | **200/200** |
+| 4-wide products added back in lane order | **200/200** |
+| `fmaf` (FFMA) | 11/200 |
+| plain `v += x[i]*w[i]` (nvcc contracts it) | 11/200 |
+
+That 11/200 is almost certainly why an earlier operation-ordered CUDA oracle
+looked exact on sampled shapes and still changed full-model routing. Anyone
+retrying this must use the explicit intrinsics.
+
+It still does not work, for a reason that has nothing to do with arithmetic.
+Exactness forces one thread per output row, and part 1 has only `hd + hn` = 152
+rows. Five warps cannot keep enough loads in flight to stream 4.36 MB: measured
+**0.443 ms/layer at 9.8 GB/s** cold, against 235 GB/s achievable. Unrolling to
+eight loads deep changed nothing (0.436 ms, 10.0 GB/s) because the limit is the
+bandwidth-delay product -- 5 warps x 8 loads x 128 B is ~5 KB in flight where
+saturating 235 GB/s at DRAM latency needs ~117 KB. Ten CPU cores, with
+out-of-order execution and hardware prefetch, simply do better on this shape.
+
+End to end the full path measured **2.751/2.743 against 3.485/3.480**. Reverted.
+
+Note the hot/cold gap once more: the same kernel timed 0.170 ms/layer reusing a
+single buffer and 0.443 ms/layer cycling 69 of them, which is what the engine
+does.
+
+To make this path viable you would need materially more independent rows --
+`f_a` is [128, hidden] and is NOT sharded, so every rank recomputes the same
+`t1`. Sharding it would add a collective per KDA layer, which at ~0.82 ms is far
+more than the whole control costs.
+
 ### An OpenMP region costs ~58 us in the engine, not the ~2 us a microbenchmark shows
 
 This is the single most misleading measurement in this codebase, and it has now
