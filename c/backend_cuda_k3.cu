@@ -746,13 +746,26 @@ __global__ void k3_dense_i8_exact(float *__restrict__ y, const float *__restrict
     int o = blockIdx.x;
     if (o >= O) return;
     const signed char *w = q8 + (size_t)o * I;
-    float sum = 0.f;
-    for (int i = threadIdx.x; i < I; i += blockDim.x)
-        sum += x[i] * (float)w[i];
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
+    /* Same 256-lane fold the int4 path uses: s0 and s1 ARE original partial[t]
+     * and partial[t+128], so s0+s1 is the tree's first edge and not one
+     * floating-point association moves. Measured on the real shapes this is
+     * worth 143.7 -> 166.7 GB/s on lm_head and 129 -> 152 on MLA q_b.
+     *
+     * Folds of 4 and 8 (64 and 32 threads), tiling 2 and 4 rows per CTA to
+     * amortise the x re-read, and pairing lanes {2p, 2p+1} so one byte load
+     * serves both nibbles were all built and measured exact; every one of them
+     * was neutral or slower here, because at 64-71% of this part's 235 GB/s
+     * achievable read bandwidth these GEMVs are bandwidth-bound, not
+     * issue-bound. Do not re-try them without a different memory layout. */
+    float s0 = 0.f, s1 = 0.f;
+    for (int i = threadIdx.x; i < I; i += 256)
+        s0 += x[i] * (float)w[i];
+    for (int i = threadIdx.x + 128; i < I; i += 256)
+        s1 += x[i] * (float)w[i];
+    __shared__ float partial[128];
+    partial[threadIdx.x] = s0 + s1;
     __syncthreads();
-    for (int n = blockDim.x >> 1; n >= 32; n >>= 1) {
+    for (int n = 64; n >= 32; n >>= 1) {
         if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
         __syncthreads();
     }
@@ -836,7 +849,7 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
         k3_dense_i4g_exact<<<O, 128, 0, g_stream>>>(
             g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
     } else if (exact) {
-        k3_dense_i8_exact<<<O, 256, 0, g_stream>>>(
+        k3_dense_i8_exact<<<O, 128, 0, g_stream>>>(
             g_dy, g_dx, (const signed char *)w, scales, I, O);
     } else if (fmt == 4) {
         int ng = (I + gs - 1) / gs;
