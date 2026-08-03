@@ -349,13 +349,40 @@ It measured **2.797/2.808 against 3.536/3.528**. `ctljoin` did go to exactly
 0.000 as designed, but `kproj` rose 4.686 -> 5.758 and `netkda` 3.315 -> 5.054.
 
 The reason is that `cudaMemcpyAsync` device-to-host into **pageable** memory is
-synchronous. The engine's activation buffers are plain `malloc`, so the deferred
-calls never deferred; the control simply ran serially afterwards, and the extra
-4x staging buffer and added skew made it worse still. Making this work needs
-pinned host buffers throughout the dense path, which is a much larger change.
+synchronous, and the engine's activation buffers are plain `malloc`, so the
+deferred calls never deferred.
+
+Redone properly -- deferred downloads landing in a PINNED staging pool with the
+host-side copy-out moved to the flush -- the overlap does work, and it still
+loses:
+
+| term | helper thread | pinned defer + inline control |
+|---|---:|---:|
+| `kproj` | 4.521 | **3.685** |
+| `ctljoin` | 1.790 | **0.000** |
+| `khead` | 0.760 | 2.012 |
+| `netkda` | 3.459 | 5.039 |
+
+2.977/2.961 against 3.530/3.522. `kproj` fell by the predicted 8.4 ms/token and
+`ctljoin` went to exactly zero, but running the control on the main thread
+streams 5.93 MB immediately before `khead`, whose per-layer KDA state is 6.3 MB,
+and it desynchronises the ranks -- `khead` and `netkda` together give back twice
+what `kproj` saved.
+
+Deferring the four GEMVs on their own, with the control left on its helper
+thread, is **neutral**: 3.527/3.530, `kproj` unchanged. That is expected once
+you look at the numbers -- the four GEMVs are issued back to back on one stream
+and execute in that order regardless, and nsys puts `cudaStreamSynchronize` at
+about 0.6 us, so removing three of them per layer saves nothing. The blocking
+was always in the download waiting for a kernel that has to run anyway.
+
+So the deferred-sync machinery only pays if there is independent CPU work to run
+underneath, and the only candidate -- the control projections -- costs more
+elsewhere than it saves. Both were reverted.
 
 That is also the answer to why a helper thread exists at all: with pageable
-destinations there is no other way to overlap CPU work with a dense GEMV.
+destinations there is no other way to overlap CPU work with a dense GEMV, and
+with pinned ones the only work available to overlap makes things worse.
 
 ### The KDA control's cost is contention, not thread churn
 
