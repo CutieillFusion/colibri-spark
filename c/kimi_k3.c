@@ -231,6 +231,7 @@ typedef struct {
     double t_router, t_topk, t_latent, t_shared, t_expert, t_rnorm;
     double t_ekernel;                     /* GPU call only, inside t_expert */
     double t_kproj, t_kconv, t_khead, t_kout;  /* kda_forward breakdown */
+    double t_ctl, t_ctljoin;                   /* control work vs join wait */
     double t_mproj, t_mcache, t_matt, t_mout;   /* mla_forward breakdown */
     uint64_t n_ekernel;
     FILE *trace;
@@ -292,7 +293,10 @@ static void kda_control_b1(KdaCtrlJob *j){
     }
 }
 
-static void *kda_control_worker(void *p){ kda_control_b1((KdaCtrlJob*)p); return NULL; }
+static double g_ctl_secs=0;                 /* diagnostic: control work only */
+static void *kda_control_worker(void *p){ double a=now_s(); kda_control_b1((KdaCtrlJob*)p);
+                                          g_ctl_secs+=now_s()-a; return NULL; }
+
 
 /* Tensor parallelism is a property of the multi-node split, NOT of the CUDA
  * backend -- model_init, kda_forward and mla_forward all use these
@@ -1215,7 +1219,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     }
     double kf0=now_s();
     if(ctl_active) pthread_join(ctlth,NULL);
-    else if(C==1) kda_control_b1(&cj);
+    else if(C==1){ double a=now_s(); kda_control_b1(&cj); g_ctl_secs+=now_s()-a; }
     else {
         w_matmul(t1,x,&a->fa,C);
         if(wsz>1){
@@ -1228,6 +1232,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
             w_matmul(braw,x,&a->bp,C);
         }
     }
+    m->t_ctljoin+=now_s()-kf0;
     m->t_kproj+=now_s()-kf0;
     float qscale=1.f/sqrtf((float)hd);
     for(int t=0;t<C;t++){
@@ -2185,6 +2190,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double dr0=m->t_router, dtop0=m->t_topk, dl0=m->t_latent;
     double ds0=m->t_shared, dx0=m->t_expert, dn0=m->t_rnorm;
     double dkpr0=m->t_kproj, dkc0=m->t_kconv, dkh0=m->t_khead, dko0=m->t_kout;
+    double dcj0=m->t_ctljoin, dcw0=g_ctl_secs;
     double dmpr0=m->t_mproj, dmc0=m->t_mcache, dma0=m->t_matt, dmo0=m->t_mout;
     double dnet0=k3_net_secs(); uint64_t dnc0=k3_net_calls();
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
@@ -2240,13 +2246,14 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     printf("PROF2 attn=%.3f moe=%.3f load=%.3f head=%.3f net=%.3f/%llu "
            "router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
            "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f "
-           "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f\n",
+           "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f ctlwork=%.3f ctljoin=%.3f\n",
            m->t_attn-da0,m->t_moe-de0,m->t_eload-dd0,m->t_head-dh0,
            k3_net_secs()-dnet0,(unsigned long long)(k3_net_calls()-dnc0),
            m->t_router-dr0,m->t_topk-dtop0,m->t_latent-dl0,
            m->t_shared-ds0,m->t_expert-dx0,m->t_rnorm-dn0,
            m->t_kproj-dkpr0,m->t_kconv-dkc0,m->t_khead-dkh0,m->t_kout-dko0,
-           m->t_mproj-dmpr0,m->t_mcache-dmc0,m->t_matt-dma0,m->t_mout-dmo0);
+           m->t_mproj-dmpr0,m->t_mcache-dmc0,m->t_matt-dma0,m->t_mout-dmo0,
+           g_ctl_secs-dcw0,m->t_ctljoin-dcj0);
     fflush(stdout);
 }
 

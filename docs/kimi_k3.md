@@ -317,6 +317,47 @@ To make this path viable you would need materially more independent rows --
 `t1`. Sharding it would add a collective per KDA layer, which at ~0.82 ms is far
 more than the whole control costs.
 
+### The KDA control's cost is contention, not thread churn
+
+PROF2 now reports `ctlwork` (time inside `kda_control_b1`, wherever it runs) and
+`ctljoin` (the exposed wait). Warm four-Spark decode:
+
+| | s/100 tokens |
+|---|---:|
+| `ctlwork` | 3.085 |
+| `ctljoin` | 1.868 |
+| `kproj` (contains ctljoin plus the q/k/v/g GEMVs) | 4.600 |
+
+The same work standalone, streaming 69 distinct weight sets so nothing stays
+cached, is **0.74 s/100 tokens at 55 GB/s**. So the work is cheap and the engine
+pays 4x for it. The obvious suspect is that the old form creates a pthread per
+KDA layer and each builds its own OpenMP team -- roughly 760 thread creations
+per token.
+
+That suspect is wrong. Replacing it with one long-lived worker fed by a
+condition variable (so its team is built once and reused, and it blocks rather
+than spins between layers) measured **2.982/2.932 against 3.544/3.536**, and the
+breakdown says why:
+
+| term | pthread per layer | persistent worker |
+|---|---:|---:|
+| `ctlwork` | 3.085 | 3.355 |
+| `ctljoin` | 1.868 | 1.987 |
+| `kproj` | 4.600 | 4.675 |
+| **`attn`** | **13.726** | **17.417** |
+
+`kproj` is flat; `attn` grows by 37 ms/token. The persistent thread keeps a
+second 10-thread OpenMP team resident, and that team contends with the main
+thread's regions (`khead`, the conv sweeps) even though it is asleep. The
+transient per-layer thread is cheaper precisely BECAUSE its team dies with it.
+This confirms the earlier "hot team stole CPU" rejection on a warm measurement,
+not just the cold one.
+
+The remaining 4x on `ctlwork` is therefore contention for LPDDR with the GPU,
+which is streaming its own weights throughout. Shrinking the 409 MB stream is
+the only lever left on it, and that means changing the stored precision of
+`f_a`/`f_b`/`b_proj` -- a numerics change, not an exact one.
+
 ### An OpenMP region costs ~58 us in the engine, not the ~2 us a microbenchmark shows
 
 This is the single most misleading measurement in this codebase, and it has now
