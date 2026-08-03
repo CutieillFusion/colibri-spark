@@ -197,6 +197,34 @@ static void test_head_shard_matches_forward(void){
     g_net_world=saved_w; g_net_rank=saved_r; g_k3_tp_attn=saved_tp;
 }
 
+/* ---------- 4. fused B=1 KDA control projections ---------- */
+
+static void test_kda_control_b1_exact(void){
+    /* The optimized path shares one OpenMP team for f_a, beta and f_b, and may
+     * execute concurrently with CUDA q/k/v/g. Its per-row arithmetic must stay
+     * byte-identical to the original three strict-f32 matmul calls. */
+    enum { D=64, HD=8, PN=12, HN=3, P=20, H=8, P0=4, H0=2 };
+    Kda a; memset(&a,0,sizeof a);
+    a.fa.f=falloc((int64_t)HD*D); a.fb.f=falloc((int64_t)PN*HD);
+    a.bp.f=falloc((int64_t)HN*D);
+    float *x=falloc(D), *tr=falloc(HD), *tf=falloc(HD);
+    float *gr=fcalloc(P), *gf=fcalloc(P), *br=fcalloc(H), *bf=fcalloc(H);
+    for(int i=0;i<D;i++) x[i]=(float)((i*17)%31-15)/19.f;
+    for(int i=0;i<HD*D;i++) a.fa.f[i]=(float)((i*13)%37-18)/23.f;
+    for(int i=0;i<PN*HD;i++) a.fb.f[i]=(float)((i*11)%29-14)/17.f;
+    for(int i=0;i<HN*D;i++) a.bp.f[i]=(float)((i*7)%41-20)/27.f;
+    matmul(tr,x,a.fa.f,1,D,HD);
+    matmul(gr+P0,tr,a.fb.f,1,HD,PN);
+    matmul(br+H0,x,a.bp.f,1,D,HN);
+    KdaCtrlJob j={&a,x,tf,gf,bf,D,HD,P0,PN,H0,HN};
+    kda_control_b1(&j);
+    CHECK(!memcmp(tr,tf,sizeof(float)*HD),"KDA f_a fused output changed");
+    CHECK(!memcmp(gr,gf,sizeof(float)*P), "KDA f_b fused output changed");
+    CHECK(!memcmp(br,bf,sizeof(float)*H), "KDA beta fused output changed");
+    free(x);free(tr);free(tf);free(gr);free(gf);free(br);free(bf);
+    w_free_host(&a.fa);w_free_host(&a.fb);w_free_host(&a.bp);
+}
+
 int main(void){
     test_kv_special();
     test_kv_exact();
@@ -207,6 +235,7 @@ int main(void){
     test_keep_rows_identity();
     test_head_shard_partition();
     test_head_shard_matches_forward();
+    test_kda_control_b1_exact();
     if(g_fail){ fprintf(stderr,"test_k3_slice: %d failure(s)\n",g_fail); return 1; }
     printf("test_k3_slice: all checks passed\n");
     return 0;

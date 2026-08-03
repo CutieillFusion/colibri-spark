@@ -256,6 +256,44 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
     for(int i=0;i<D;i++) out[i]=x[i]*r*w[i];
 }
 
+/* B=1 KDA control projections. f_a and beta are independent and share one
+ * OpenMP team; f_b follows after the team's implicit barrier. Keeping the dot
+ * loop text identical to quant.h's f32 matmul preserves its strict accumulation
+ * order while removing two fork/join pairs per KDA layer. The whole job is also
+ * independent of q/k/v/g and may run on a pthread underneath their GPU calls. */
+typedef struct {
+    const Kda *a; const float *x;
+    float *t1, *graw, *braw;
+    int hidden, hd, p0, pn, h0, hn;
+} KdaCtrlJob;
+
+static void kda_control_b1(KdaCtrlJob *j){
+    #pragma omp parallel
+    {
+        #pragma omp for schedule(static)
+        for(int o=0;o<j->hd+j->hn;o++){
+            const float *w; const float *x; float *dst; int I;
+            if(o<j->hd){
+                w=j->a->fa.f+(int64_t)o*j->hidden; x=j->x;
+                dst=j->t1+o; I=j->hidden;
+            } else {
+                int r=o-j->hd;
+                w=j->a->bp.f+(int64_t)r*j->hidden; x=j->x;
+                dst=j->braw+j->h0+r; I=j->hidden;
+            }
+            float v=0; for(int i=0;i<I;i++) v+=x[i]*w[i]; *dst=v;
+        }
+        #pragma omp for schedule(static)
+        for(int r=0;r<j->pn;r++){
+            const float *w=j->a->fb.f+(int64_t)r*j->hd;
+            float v=0; for(int i=0;i<j->hd;i++) v+=j->t1[i]*w[i];
+            j->graw[j->p0+r]=v;
+        }
+    }
+}
+
+static void *kda_control_worker(void *p){ kda_control_b1((KdaCtrlJob*)p); return NULL; }
+
 /* Tensor parallelism is a property of the multi-node split, NOT of the CUDA
  * backend -- model_init, kda_forward and mla_forward all use these
  * unconditionally, so they must live OUTSIDE the COLI_CUDA guard below or the
@@ -1118,6 +1156,14 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
                memset(v,0,(size_t)C*P*sizeof(float)); memset(gp,0,(size_t)C*P*sizeof(float));
                memset(graw,0,(size_t)C*P*sizeof(float)); memset(braw,0,(size_t)C*H*sizeof(float));
                memset(on,0,(size_t)C*P*sizeof(float)); }
+    KdaCtrlJob cj={a,x,t1,graw,braw,c->hidden,hd,p0,pn,h0,hn};
+    pthread_t ctlth; int ctl_active=0;
+#ifdef COLI_CUDA
+    int ctl_wanted=1;
+    { const char *e=getenv("K3_KDA_OVERLAP"); if(e) ctl_wanted=atoi(e); }
+    int ctl_overlap=C==1 && g_k3_cuda && g_k3_dense_gpu && ctl_wanted;
+    if(ctl_overlap && pthread_create(&ctlth,NULL,kda_control_worker,&cj)==0) ctl_active=1;
+#endif
     if(wsz>1 && hn>0){
         if(!a->sh_ready){
             /* offset 0: w_load_rows already loaded only [p0,p0+pn), so the
@@ -1168,15 +1214,19 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         m->t_kproj+=now_s()-kp0;
     }
     double kf0=now_s();
-    w_matmul(t1,x,&a->fa,C);
-    if(wsz>1){
-        for(int t=0;t<C;t++){
-            w_matmul(graw+(int64_t)t*P+p0,t1+(int64_t)t*c->kda_hd,&a->fb,1);
-            w_matmul(braw+(int64_t)t*H+h0,x+(int64_t)t*c->hidden,&a->bp,1);
+    if(ctl_active) pthread_join(ctlth,NULL);
+    else if(C==1) kda_control_b1(&cj);
+    else {
+        w_matmul(t1,x,&a->fa,C);
+        if(wsz>1){
+            for(int t=0;t<C;t++){
+                w_matmul(graw+(int64_t)t*P+p0,t1+(int64_t)t*c->kda_hd,&a->fb,1);
+                w_matmul(braw+(int64_t)t*H+h0,x+(int64_t)t*c->hidden,&a->bp,1);
+            }
+        } else {
+            w_matmul(graw,t1,&a->fb,C);
+            w_matmul(braw,x,&a->bp,C);
         }
-    } else {
-        w_matmul(graw,t1,&a->fb,C);
-        w_matmul(braw,x,&a->bp,C);
     }
     m->t_kproj+=now_s()-kf0;
     float qscale=1.f/sqrtf((float)hd);

@@ -161,6 +161,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_DENSE_GPU` | 1 | zero-copy CUDA dense GEMV during decode (0 = device-mirror path) |
 | `K3_DENSE_EXACT` | 1 | stock-order bit-exact reduction (0 = legacy warp reduction) |
+| `K3_KDA_OVERLAP` | 1 with CUDA | run strict-f32 KDA control projections on a CPU worker underneath the independent GPU q/k/v/g projections (0 = synchronous fused CPU path) |
 | `K3_OMP_THREADS` | 10 | OpenMP workers used by `k3_launch.sh`; on GB10 this lets B=1 work occupy the 10 X925 cores while CUDA/network helpers can spill onto the 10 A725 cores |
 | `K3_NET_RD2` | 1 at 4 nodes | two-phase recursive-doubling collective for the paired Spark topology (0 restores the hierarchical tree) |
 | `K3_CHUNK` | 32 | prefill chunk size (1 = token-at-a-time; forced 1 under `K3_TRACE`) |
@@ -177,9 +178,11 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 For the 1-bit per-rank expert stores, `K3_EGB=80` holds the observed working
 set for the benchmark prompt. With four nodes, RD2, the default 10 OpenMP
 workers, and a warmed persistent server, the measured 100-token B=1 decode is
-2.07 tok/s with 100% expert hits. The same generated text is byte-identical to
-the 19-thread reference. This is a workload working-set result, not a claim
-that 80 GB can hold all 224 experts per layer; arbitrary prompts may still
+2.82–2.83 tok/s with 100% expert hits (`K3_KDA_OVERLAP=1`), and 1.71–1.73
+tok/s on the cold-cache pass. Two consecutive warm passes and the cold pass
+produced byte-identical text to the synchronous reference. This is a workload
+working-set result, not a claim that 80 GB can hold all 224 experts per layer;
+arbitrary prompts may still
 miss and stream from NVMe.
 
 ## Chunked prefill
