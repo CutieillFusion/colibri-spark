@@ -238,6 +238,59 @@ part's **235 GB/s** achievable read bandwidth (measured; 273 GB/s theoretical â€
 note `cudaDevAttrMemoryClockRate` reports LPDDR5X's 8533 MT/s data rate, so
 doubling it overstates peak by 2x). `lat_up` already reaches 94%.
 
+### Decode is not GPU-bound
+
+Measured with `nsys profile --trace=cuda,osrt` on rank 0 over a 26.5 s decode
+slice (78,473 kernels), after the four-Spark B1 config reached 3.505 tok/s:
+
+| | |
+|---|---:|
+| GPU busy in kernels | 6.01 s -- **22.7%** |
+| GPU idle between kernels | 20.46 s -- **77.3%** |
+| median inter-kernel gap | 21 us |
+| gaps > 200 us | 7,554 of them, 17.98 s = **67.9% of the window** |
+
+Kernel work is roughly 92 ms of a ~285 ms token. Further GEMV tuning therefore
+has little left to give; the time is in the gaps, which are collectives and CPU
+phases. Two things that look alarming in a raw kernel summary are not:
+`quant_matmul` shows as 48% of GPU time, but splitting by duration puts 6.83 s
+of its 7.61 s in calls >= 400 us, which are **prefill** (`coli_k3_dense`
+declines S != 1); decode-sized calls total only 0.78 s. And `cudaMemcpyAsync`
+dominates the CUDA-runtime table purely by count (108k calls), not by cost.
+
+### The strict-f32 KDA control is memory-bound, and overlap is what saves it
+
+`kda_control_b1` reads 5.93 MB of f32 weights per KDA layer -- `f_a` [128,7168],
+`b_proj` [24,7168] and `f_b` [3072,128] -- which is **409 MB per token**, the
+largest CPU memory stream in decode. Under `K3_KDA_OVERLAP` it runs on its own
+pthread while the main thread blocks in `pthread_join`; the OSRT trace shows
+4,225 joins totalling 10.4 s in that 26.5 s window.
+
+That overlap is worth a great deal: **`K3_KDA_OVERLAP=0` measured 2.748/2.719
+tok/s against 3.510/3.505**. Do not remove it to avoid the per-layer thread
+churn -- the churn is real (~760 thread creations per token counting the
+OpenMP teams) but it is far cheaper than exposing the control work.
+
+Beware benchmarking this in isolation: a standalone harness that loops over one
+5.93 MB working set reports 0.11 ms/layer (47-54 GB/s) because it is L2-hot.
+In the engine the stream is cold every token AND contends with the GPU for the
+same LPDDR, which is why exposing it costs ~79 ms/token rather than ~8.
+
+Giving the region more workers does not help, and the schedule is not why:
+
+| control threads | schedule | warm tok/s |
+|---|---|---:|
+| 10 (ambient `OMP_NUM_THREADS`) | static | **3.510 / 3.505** |
+| 18 | static | 3.123 / 3.128 |
+| 18 | dynamic | 3.141 / 3.146 |
+
+GB10 is 10 Cortex-X925 + 10 Cortex-A725, so the obvious reading is that a
+static split makes an efficiency core the critical path -- but `dynamic`
+scheduling recovers almost none of it. The region is bandwidth-bound and
+already contending with the GPU, so extra cores add contention rather than
+throughput. Shrinking the 409 MB stream (or moving it to the GPU with an
+order-exact f32 GEMV) is the only lever here; adding parallelism is not.
+
 ### Where the remaining decode time is
 
 Decode is dominated by collective *latency*, not bandwidth or dense compute.
