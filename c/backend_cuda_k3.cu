@@ -774,53 +774,76 @@ __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restric
     }
 }
 
-/* 4-wide consecutive fold: 64 physical threads, thread p owning logical lanes
- * 4p..4p+3 in four accumulators merged only at the very end.
+/* W-wide consecutive fold: 256/W physical threads, thread p owning logical
+ * lanes W*p .. W*p+W-1 in W accumulators merged only at the very end.
  *
- * Exact because the stock 256-lane tree combines lane bit 7 first and bits 1
- * then 0 LAST. Grouping lanes by their high bits therefore leaves the last two
- * edges to be replayed as (V0+V2)+(V1+V3), and each chain's own reduction over
- * the 64 threads (n=32..1) is exactly lane bits 7..2 in the stock order.
+ * Exact because the stock 256-lane tree combines lane bit 7 FIRST and the low
+ * bits LAST. Grouping lanes by their high bits therefore leaves exactly the
+ * bottom log2(W) edges to replay, which is
+ *     for (step = W/2; step >= 1; step >>= 1) V[j] += V[j+step], j < step
+ * -- for W=4 that is (V0+V2)+(V1+V3), for W=8
+ * ((V0+V4)+(V2+V6))+((V1+V5)+(V3+V7)) -- while each chain's own reduction over
+ * the 256/W threads replays lane bits 7..log2(W) in the stock order.
  *
- * Worth doing because those four lanes are four CONSECUTIVE elements: one
- * float4 of activations, two adjacent weight bytes, and -- since gs is a
- * multiple of 4 -- a single group scale. Four loads per four elements instead
- * of the twelve the {t, t+128} fold needs. 64 threads still reaches full
- * occupancy (24 blocks x 64 = 1536), unlike the earlier 64-thread fold over
- * {0,128,64,192} which shared nothing and only cost warps. */
-__global__ void k3_dense_i4g_exact4(float *__restrict__ y, const float *__restrict__ x,
+ * The point is that those W lanes are W CONSECUTIVE elements, so one step costs
+ * W/4 float4 loads, W/2 bytes of int4 weight (a uint once W>=8) and, since gs is
+ * a multiple of W, ONE group scale. W=4 is 4 loads per 4 elements against the
+ * twelve the {t, t+128} fold needs.
+ *
+ * W=8 halves the loads again and is bit-exact, but measured SLOWER on mirrors
+ * (shared gate 377 -> 296 GB/s, lat_up 379 -> 311): 32 threads is one warp, so
+ * 24 blocks/SM reaches only 768 threads. W=4 is the sweet spot. */
+template<int W>
+__global__ void k3_dense_i4g_exactW(float *__restrict__ y, const float *__restrict__ x,
                                     const unsigned char *__restrict__ q4,
                                     const float *__restrict__ scales,
                                     int I, int O, int gsh, int ng) {
+    enum { T = 256 / W };
     int o = blockIdx.x;
     if (o >= O) return;
     size_t rb = (size_t)((I + 1) >> 1);
     const unsigned char *w = q4 + (size_t)o * rb;
     const float *scl = scales + (size_t)o * ng;
     int p = (int)threadIdx.x;
-    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-    for (int i = p * 4; i + 3 < I; i += 256) {
-        float4 xx = *(const float4 *)(x + i);          /* i%4==0 => 16B aligned */
-        unsigned char b0 = w[i >> 1], b1 = w[(i >> 1) + 1];
+    float a[W];
+    #pragma unroll
+    for (int j = 0; j < W; j++) a[j] = 0.f;
+    for (int i = p * W; i + W - 1 < I; i += 256) {
         int g = i >> gsh;
         if (g >= ng) g = ng - 1;
         float sc = scl[g];
-        a0 += xx.x * (float)((int)(b0 & 15) - 8) * sc;
-        a1 += xx.y * (float)((int)(b0 >> 4)  - 8) * sc;
-        a2 += xx.z * (float)((int)(b1 & 15) - 8) * sc;
-        a3 += xx.w * (float)((int)(b1 >> 4)  - 8) * sc;
+        #pragma unroll
+        for (int q = 0; q < W / 4; q++) {
+            float4 xx = *(const float4 *)(x + i + q * 4);
+            unsigned char b0 = w[(i >> 1) + q * 2], b1 = w[(i >> 1) + q * 2 + 1];
+            a[q*4+0] += xx.x * (float)((int)(b0 & 15) - 8) * sc;
+            a[q*4+1] += xx.y * (float)((int)(b0 >> 4)  - 8) * sc;
+            a[q*4+2] += xx.z * (float)((int)(b1 & 15) - 8) * sc;
+            a[q*4+3] += xx.w * (float)((int)(b1 >> 4)  - 8) * sc;
+        }
     }
-    __shared__ float sh[4][64];
-    sh[0][p] = a0; sh[1][p] = a1; sh[2][p] = a2; sh[3][p] = a3;
+    __shared__ float sh[W][T];
+    #pragma unroll
+    for (int j = 0; j < W; j++) sh[j][p] = a[j];
     __syncthreads();
-    for (int n = 32; n >= 1; n >>= 1) {                /* lane bits 7..2 */
+    for (int n = T / 2; n >= 1; n >>= 1) {            /* lane bits 7..log2(W) */
         if (p < n) {
-            sh[0][p] += sh[0][p+n]; sh[1][p] += sh[1][p+n];
-            sh[2][p] += sh[2][p+n]; sh[3][p] += sh[3][p+n];
+            #pragma unroll
+            for (int j = 0; j < W; j++) sh[j][p] += sh[j][p+n];
         }
         __syncthreads();
     }
-    if (!p) y[o] = (sh[0][0] + sh[2][0]) + (sh[1][0] + sh[3][0]);  /* bit 1, then bit 0 */
+    if (!p) {
+        float v[W];
+        #pragma unroll
+        for (int j = 0; j < W; j++) v[j] = sh[j][0];
+        #pragma unroll
+        for (int step = W / 2; step >= 1; step >>= 1) {
+            #pragma unroll
+            for (int j = 0; j < step; j++) v[j] += v[j + step];
+        }
+        y[o] = v[0];
+    }
 }
 
 __global__ void k3_dense_i8_exact(float *__restrict__ y, const float *__restrict__ x,
@@ -1028,7 +1051,7 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     if (exact && fmt == 4) {
         int ng = (I + gs - 1) / gs;
         if (i4w == 4 && gs >= 4 && !(I & 3))
-            k3_dense_i4g_exact4<<<O, 64, 0, g_stream>>>(
+            k3_dense_i4g_exactW<4><<<O, 64, 0, g_stream>>>(
                 g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
         else
             k3_dense_i4g_exact<<<O, 128, 0, g_stream>>>(

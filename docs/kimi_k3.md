@@ -259,6 +259,33 @@ part's **235 GB/s** achievable read bandwidth (measured; 273 GB/s theoretical â€
 note `cudaDevAttrMemoryClockRate` reports LPDDR5X's 8533 MT/s data rate, so
 doubling it overstates peak by 2x). `lat_up` already reaches 94%.
 
+### Both major GEMV paths are now at their memory walls
+
+Probes that hold the memory pattern fixed and vary the work, run COLD (cycling
+48 distinct weight banks so nothing stays in L2 -- the hot form of this probe
+was misleading twice):
+
+| 1-bit expert gate_up variant | hot | cold |
+|---|---:|---:|
+| stride 32 (original, bank-conflicted) | 66.8 GB/s | 67.2 |
+| stride 33, scalar | 167.9 | 166.3 |
+| **stride 36, float4 (current)** | 223.9 | **201.9** |
+| weights + scales only, no activation reads (floor) | 336.2 | **191.9** |
+
+Cold, the production kernel is at the floor: there is nothing left to win in it.
+The hot column had suggested a 2x gap that does not exist once the working set
+streams.
+
+The dense path lands the same way. With mirrors and the 4-wide fold, KDA
+q/k/v/g measures 246.7 GB/s against ~235 GB/s achievable, so the big shapes are
+back at the DRAM wall; that is also why the 8-wide fold, which halves the loads
+again and is bit-exact, measured slower (shared gate 377 -> 296 GB/s) -- 32
+threads is one warp and 24 blocks/SM reaches only 768 threads.
+
+Device mirrors do NOT generalise to the expert slots: with the fixed kernel they
+measure 145.7 GB/s zero-copy against 148.3 device, i.e. no difference. The
+SMMU page effect is specific to the dense weights.
+
 ### The 4-wide fold, and why it only pays once the mapping is fixed
 
 Exactness forces a thread to own logical lanes that the stock tree combines
