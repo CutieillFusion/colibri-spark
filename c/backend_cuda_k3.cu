@@ -860,6 +860,46 @@ __global__ void k3_dense_i8_exact(float *__restrict__ y, const float *__restrict
     }
 }
 
+/* Same 4-wide fold for int8. Four consecutive elements means one float4 of
+ * activations and FOUR ADJACENT weight bytes -- a single uint when the row base
+ * happens to be 4-byte aligned, which is two loads per four elements against
+ * the eight the {t, t+128} fold needs. The alignment test is per-block uniform
+ * (w depends only on blockIdx), so the branch is free. */
+__global__ void k3_dense_i8_exact4(float *__restrict__ y, const float *__restrict__ x,
+                                   const signed char *__restrict__ q8,
+                                   const float *__restrict__ scales, int I, int O) {
+    int o = blockIdx.x;
+    if (o >= O) return;
+    const signed char *w = q8 + (size_t)o * I;
+    int p = (int)threadIdx.x;
+    int aligned = (((uintptr_t)w & 3u) == 0);
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    for (int i = p * 4; i + 3 < I; i += 256) {
+        float4 xx = *(const float4 *)(x + i);
+        int w0, w1, w2, w3;
+        if (aligned) {
+            unsigned int u = *(const unsigned int *)(w + i);
+            w0 = (int)(signed char)(u & 0xFF);         w1 = (int)(signed char)((u >> 8)  & 0xFF);
+            w2 = (int)(signed char)((u >> 16) & 0xFF); w3 = (int)(signed char)((u >> 24) & 0xFF);
+        } else {
+            w0 = w[i]; w1 = w[i+1]; w2 = w[i+2]; w3 = w[i+3];
+        }
+        a0 += xx.x * (float)w0; a1 += xx.y * (float)w1;
+        a2 += xx.z * (float)w2; a3 += xx.w * (float)w3;
+    }
+    __shared__ float sh[4][64];
+    sh[0][p] = a0; sh[1][p] = a1; sh[2][p] = a2; sh[3][p] = a3;
+    __syncthreads();
+    for (int n = 32; n >= 1; n >>= 1) {
+        if (p < n) {
+            sh[0][p] += sh[0][p+n]; sh[1][p] += sh[1][p+n];
+            sh[2][p] += sh[2][p+n]; sh[3][p] += sh[3][p+n];
+        }
+        __syncthreads();
+    }
+    if (!p) y[o] = ((sh[0][0] + sh[2][0]) + (sh[1][0] + sh[3][0])) * scales[o];
+}
+
 static int    g_dense_attr = 0;
 static int    g_dense_shmax = 0;
 static float *g_dx = nullptr, *g_dy = nullptr;
@@ -923,9 +963,12 @@ extern "C" void *coli_k3_devmirror(const void *host, size_t bytes) {
         if (g_devmir_left)
             fprintf(stderr, "[K3/EXP] dense device-mirror budget %.1f GB\n", gb);
     }
-    /* Past ~64 MB a tensor cannot stay cache-resident and the mapping stops
-     * mattering; lm_head measured SLOWER mirrored. */
-    if (bytes > (size_t)64 * 1024 * 1024) { g_devmir_cap_skip += bytes; return nullptr; }
+    /* The cap used to be 64 MB because lm_head measured SLOWER mirrored. That
+     * was an artefact of the 2-wide fold: with the 4-wide kernel the same
+     * tensor goes 166.7 GB/s zero-copy -> 234.5 mirrored, so the large-page
+     * mapping pays even for a 1.17 GB stream that cannot stay cache-resident.
+     * The cap now only guards against a single tensor eating the whole budget. */
+    if (bytes > (size_t)2048 * 1024 * 1024) { g_devmir_cap_skip += bytes; return nullptr; }
     if (bytes > g_devmir_left) { g_devmir_budget_skip += bytes; return nullptr; }
     void *d = nullptr;
     if (cudaMalloc(&d, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
@@ -991,8 +1034,12 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
             k3_dense_i4g_exact<<<O, 128, 0, g_stream>>>(
                 g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
     } else if (exact) {
-        k3_dense_i8_exact<<<O, 128, 0, g_stream>>>(
-            g_dy, g_dx, (const signed char *)w, scales, I, O);
+        if (i4w == 4 && !(I & 3))
+            k3_dense_i8_exact4<<<O, 64, 0, g_stream>>>(
+                g_dy, g_dx, (const signed char *)w, scales, I, O);
+        else
+            k3_dense_i8_exact<<<O, 128, 0, g_stream>>>(
+                g_dy, g_dx, (const signed char *)w, scales, I, O);
     } else if (fmt == 4) {
         int ng = (I + gs - 1) / gs;
         k3_dense_i4g<<<blocks, K3_FAST_THREADS, shbytes, g_stream>>>(

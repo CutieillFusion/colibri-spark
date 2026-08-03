@@ -161,7 +161,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_DENSE_GPU` | 1 | zero-copy CUDA dense GEMV during decode (0 = device-mirror path) |
 | `K3_DENSE_EXACT` | 1 | stock-order bit-exact reduction (0 = legacy warp reduction) |
-| `K3_DENSE_DEV_GB` | 0 | device-mirror budget for exact dense weights (16 on the four-Spark config) |
+| `K3_DENSE_DEV_GB` | 0 | device-mirror budget for exact dense weights (18 on the four-Spark config) |
 | `K3_KDA_OVERLAP` | 1 with CUDA | run strict-f32 KDA control projections on a CPU worker underneath the independent GPU q/k/v/g projections (0 = synchronous fused CPU path) |
 | `K3_OMP_THREADS` | 10 | OpenMP workers used by `k3_launch.sh`; on GB10 this lets B=1 work occupy the 10 X925 cores while CUDA/network helpers can spill onto the 10 A725 cores |
 | `K3_NET_RD2` | 1 at 4 nodes | two-phase recursive-doubling collective for the paired Spark topology (0 restores the hierarchical tree) |
@@ -308,21 +308,28 @@ granularity; `cudaMalloc`'d memory uses large pages. Same kernel, same
 | KDA q/k/v/g 12288x7168 int4 | 150.9 | 180.6 |
 | KDA o_proj 7168x12288 int4 | 153.5 | 172.5 |
 | lat_up 7168x3584 int4 | 201.2 | 212.2 |
-| lm_head 163840x7168 int8 | 166.4 | 153.1 (**slower**) |
+| lm_head 163840x7168 int8 | 166.4 | 153.1 (2-wide) / **234.5** (4-wide) |
 
 The engine could not exploit this because `w_matmul` offered only two
 combinations: the fast exact kernel with zero-copy, or a device mirror with the
 stock `quant_matmul` (59 GB/s). `K3_DENSE_DEV_GB` adds the missing one -- the
-exact kernel reading a device mirror -- under a byte budget, skipping anything
-over 64 MB because past that a tensor cannot stay cache-resident and mirroring
-turns negative (see lm_head).
+exact kernel reading a device mirror -- under a byte budget.
+
+The per-tensor cap started at 64 MB because lm_head measured slower mirrored.
+That turned out to be an artefact of the 2-wide fold: with the 4-wide kernel the
+same tensor goes 166.7 GB/s zero-copy -> 234.5 mirrored, so the large-page
+mapping pays even for a 1.17 GB stream that cannot stay cache-resident. The cap
+is now 2 GB and exists only to stop one tensor eating the whole budget; at
+18 GB the engine reports `16.95 GB placed, 0.00 skipped` and `head` falls from
+0.708 to 0.508 s/100 tokens.
 
 | budget | warm tok/s | `moe` s/100 |
 |---:|---:|---:|
 | 0 | 3.525 / 3.524 | 13.225 |
 | 12 GB | 3.574 / 3.591 | 12.791 |
 | 28 GB | 3.596 / 3.604 | 12.435 |
-| **16 GB** | **3.605 / 3.609** | — |
+| 16 GB | 3.605 / 3.609 | — |
+| **18 GB + 4-wide + 2 GB cap** | **3.790 / 3.847** | 11.720 |
 
 Expert hit rate stayed 99.5% at every setting. The budget stops binding at
 **15.36 GB**: the engine reports `15.36 GB placed, 0.00 GB skipped for budget,
