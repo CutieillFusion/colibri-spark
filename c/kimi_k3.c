@@ -153,6 +153,11 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
      * identical. */
     ColiCudaTensor *cuda; int cuda_device; int8_t cuda_failed, cuda_placed;
     int8_t k3_reg, k3_dense_off;      /* zero-copy dense path: registered / declined */
+    /* Optional device copies for the exact dense kernel. Host-registered pages
+     * reach the GPU through the SMMU at 4 KB granularity; cudaMalloc'd memory
+     * uses large pages, which measured up to 1.65x on the SAME kernel. Null
+     * when the budget declined -- the zero-copy pointers are still valid. */
+    void *k3_dw, *k3_ds; int8_t k3_dev_tried;
 #endif
 } W;
 
@@ -472,7 +477,7 @@ static W w_rows(const W *w, int r0, int nrows){
     W v = *w;
     v.O = nrows;
 #ifdef COLI_CUDA
-    v.cuda = NULL; v.cuda_placed = 0; v.cuda_failed = 0; v.k3_reg = 0; v.k3_dense_off = 0;
+    v.cuda = NULL; v.cuda_placed = 0; v.cuda_failed = 0; v.k3_reg = 0; v.k3_dense_off = 0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
 #endif
     if(w->fmt==0)      v.f  = w->f  + (int64_t)r0*w->I;
     else if(w->fmt==1){ v.q8 = w->q8 + (int64_t)r0*w->I; v.s = w->s + r0; }
@@ -498,7 +503,7 @@ static W w_cols(const W *w, int i0, int n){
     W v = *w;
     v.I = n;
 #ifdef COLI_CUDA
-    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0;
+    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
 #endif
     int64_t O=w->O;
     if(w->fmt==0){
@@ -541,7 +546,7 @@ static W w_concat4(const W *a, const W *b, const W *c, const W *d, int r0, int n
     const W *src[4]={a,b,c,d};
     W v=*a; v.O=4*n;
 #ifdef COLI_CUDA
-    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0;
+    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
 #endif
     if(a->fmt==1){
         v.q8=malloc((size_t)4*n*a->I); v.s=falloc((int64_t)4*n);
@@ -579,7 +584,19 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
             else mw->k3_dense_off=1;
         }
         if(mw->k3_reg){
-            if(coli_k3_dense(y,x,w_blob(w),w->s,w->fmt,S,w->I,w->O,w->gs)) return;
+            if(!mw->k3_dev_tried){
+                int64_t rb=(w->fmt==4)?((int64_t)w->I+1)/2:(int64_t)w->I;
+                int64_t nsc=(w->fmt==4)?((int64_t)w->I+w->gs-1)/w->gs:1;
+                void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
+                if(dw){
+                    void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
+                    if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; }   /* both or neither */
+                }
+                mw->k3_dev_tried=1;
+            }
+            const void *bl = mw->k3_dw ? mw->k3_dw : w_blob(w);
+            const float *sc = mw->k3_dw ? (const float*)mw->k3_ds : w->s;
+            if(coli_k3_dense(y,x,bl,sc,w->fmt,S,w->I,w->O,w->gs)) return;
             mw->k3_dense_off=1;   /* declined for a stable reason; stop retrying */
         }
     }

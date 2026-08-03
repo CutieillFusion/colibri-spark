@@ -834,6 +834,52 @@ static int ensure_dense_scratch(int I, int O) {
     return 1;
 }
 
+/* ---- device mirrors for the exact dense path ------------------------------
+ * The dense weights are read zero-copy so their bytes stay available to the
+ * expert cache, and on this integrated part that was assumed free. It is not:
+ * host-registered pages reach the GPU through the SMMU at 4 KB granularity,
+ * while cudaMalloc'd memory uses large pages. Same DRAM, measurably different
+ * rate on the SAME kernel (K3_DENSE_EXACT=1, rel=0.0e+00 either way):
+ *
+ *   shared gate 6144x7168 int4   153.5 -> 214.9 GB/s
+ *   MLA q_b     18432x1536 int8  145.1 -> 239.2
+ *   KDA q/k/v/g 12288x7168 int4  150.9 -> 180.6
+ *   lm_head    163840x7168 int8  166.4 -> 153.1   (mirroring HURTS: 1.17 GB,
+ *                                                  far past any cache)
+ *
+ * So mirror selectively, under a byte budget, and never for tensors bigger than
+ * the point where it stops paying. Mirroring costs RAM the expert cache would
+ * otherwise hold, which is why this is a budget and not a default-everything. */
+static size_t g_devmir_left = 0, g_devmir_used = 0;
+static int    g_devmir_init = 0;
+
+extern "C" size_t coli_k3_devmirror_used(void) { return g_devmir_used; }
+
+/* Returns a device copy, or null when it declines (budget spent, too large,
+ * or allocation failed). Never fails the caller: they keep the host pointer. */
+extern "C" void *coli_k3_devmirror(const void *host, size_t bytes) {
+    if (!g_ready || !host || !bytes) return nullptr;
+    if (!g_devmir_init) {
+        const char *e = getenv("K3_DENSE_DEV_GB");
+        double gb = e ? atof(e) : 0.0;
+        g_devmir_left = (size_t)(gb * 1e9);
+        g_devmir_init = 1;
+        if (g_devmir_left)
+            fprintf(stderr, "[K3/EXP] dense device-mirror budget %.1f GB\n", gb);
+    }
+    /* Past ~64 MB a tensor cannot stay cache-resident and the mapping stops
+     * mattering; lm_head measured SLOWER mirrored. */
+    if (bytes > (size_t)64 * 1024 * 1024) return nullptr;
+    if (bytes > g_devmir_left) return nullptr;
+    void *d = nullptr;
+    if (cudaMalloc(&d, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    if (cudaMemcpy(d, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError(); cudaFree(d); return nullptr;
+    }
+    g_devmir_left -= bytes; g_devmir_used += bytes;
+    return d;
+}
+
 /* S==1 only (decode GEMV). Returns 0 when it cannot help, so the caller keeps
  * its existing path for prefill and for shapes whose x will not fit shared. */
 extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const float *scales,

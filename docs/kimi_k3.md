@@ -161,6 +161,7 @@ Judge quantization choices on real-text logits, not synthetic-vector norms.
 | `K3_TOPP` | 0 | keep routed experts to cumulative weight p (0 = off) |
 | `K3_DENSE_GPU` | 1 | zero-copy CUDA dense GEMV during decode (0 = device-mirror path) |
 | `K3_DENSE_EXACT` | 1 | stock-order bit-exact reduction (0 = legacy warp reduction) |
+| `K3_DENSE_DEV_GB` | 0 | device-mirror budget for exact dense weights (28 on the four-Spark config) |
 | `K3_KDA_OVERLAP` | 1 with CUDA | run strict-f32 KDA control projections on a CPU worker underneath the independent GPU q/k/v/g projections (0 = synchronous fused CPU path) |
 | `K3_OMP_THREADS` | 10 | OpenMP workers used by `k3_launch.sh`; on GB10 this lets B=1 work occupy the 10 X925 cores while CUDA/network helpers can spill onto the 10 A725 cores |
 | `K3_NET_RD2` | 1 at 4 nodes | two-phase recursive-doubling collective for the paired Spark topology (0 restores the hierarchical tree) |
@@ -257,6 +258,39 @@ neutral or slower. The reason is that these GEMVs already run at 64–71% of thi
 part's **235 GB/s** achievable read bandwidth (measured; 273 GB/s theoretical —
 note `cudaDevAttrMemoryClockRate` reports LPDDR5X's 8533 MT/s data rate, so
 doubling it overstates peak by 2x). `lat_up` already reaches 94%.
+
+### Zero-copy is not free for the dense weights
+
+The dense path reads its weights zero-copy so the bytes stay available to the
+expert cache, and on an integrated part that looks free -- it is the same DRAM.
+It is not. Host-registered pages reach the GPU through the SMMU at 4 KB
+granularity; `cudaMalloc`'d memory uses large pages. Same kernel, same
+`K3_DENSE_EXACT=1`, `rel=0.0e+00` either way:
+
+| shape | zero-copy | device-resident |
+|---|---:|---:|
+| shared gate 6144x7168 int4 | 153.5 GB/s | **214.9** |
+| MLA q_b 18432x1536 int8 | 145.1 | **239.2** |
+| KDA q/k/v/g 12288x7168 int4 | 150.9 | 180.6 |
+| KDA o_proj 7168x12288 int4 | 153.5 | 172.5 |
+| lat_up 7168x3584 int4 | 201.2 | 212.2 |
+| lm_head 163840x7168 int8 | 166.4 | 153.1 (**slower**) |
+
+The engine could not exploit this because `w_matmul` offered only two
+combinations: the fast exact kernel with zero-copy, or a device mirror with the
+stock `quant_matmul` (59 GB/s). `K3_DENSE_DEV_GB` adds the missing one -- the
+exact kernel reading a device mirror -- under a byte budget, skipping anything
+over 64 MB because past that a tensor cannot stay cache-resident and mirroring
+turns negative (see lm_head).
+
+| budget | warm tok/s | `moe` s/100 |
+|---:|---:|---:|
+| 0 | 3.525 / 3.524 | 13.225 |
+| 12 GB | 3.574 / 3.591 | 12.791 |
+| **28 GB** | **3.596 / 3.604** | **12.435** |
+
+Expert hit rate stayed 99.5% at every setting. Mirroring costs RAM the expert
+cache would otherwise hold, so it is opt-in; 28 GB is the tuned value here.
 
 ### Decode is not GPU-bound
 

@@ -62,6 +62,11 @@ int  coli_k3_expert_w1(const void *w1p, const void *w1s,
                        float *hz, const float *z,
                        int latent, int inter, float beta1, float beta2);
 
+/* Optional device copy of a dense weight/scale blob, under K3_DENSE_DEV_GB.
+ * Returns null when it declines; the caller then keeps its zero-copy pointer. */
+void  *coli_k3_devmirror(const void *host, size_t bytes);
+size_t coli_k3_devmirror_used(void);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus

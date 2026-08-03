@@ -37,7 +37,8 @@ COMMON="$COMMON K3_NET_RD2=$RD2"
 # caller may want to set has to be forwarded below.
 # Each rank writes to its own node-local /tmp, so per-rank paths do not collide.
 for v in K3_ROUTE_STATS K3_BITS K3_MLA_BITS K3_HEAD_BITS K3_THINK K3_TRACE \
-         K3_DENSE_GPU K3_DENSE_STAGE K3_DENSE_EXACT K3_KDA_OVERLAP; do
+         K3_DENSE_GPU K3_DENSE_STAGE K3_DENSE_EXACT K3_KDA_OVERLAP \
+         K3_DENSE_DEV_GB; do
   eval "val=\${$v:-}"
   [ -n "$val" ] && COMMON="$COMMON $v=$val"
 done
