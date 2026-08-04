@@ -573,6 +573,57 @@ single one of those three under bit-exactness: the memory budget is nearly
 spent, a fifth of the collective budget is wire time, and the CPU budget is
 gated on quality rather than on speed.
 
+### Per-kernel durations by grid size, and a correction
+
+`ncu` is permission-blocked, but the nsys SQLite export has per-launch
+durations, and grouping `k3_dense_i4g_exactW<4>` by `gridX` separates the
+tensors by their output row count:
+
+| grid (O) | tensor | n | avg | GB/s |
+|---|---|---|---|---|
+| 6144 | sh_gate / sh_up | 6,672 | 123 us | 179 |
+| 7168 | lat_up + sh_down | 9,208 | 93.2 us | ~180 |
+| 3584 | lat_down | 3,335 | 76.8 us | 167 |
+| 3072 | kproj shards | 10,000 | 68.3 us | -- |
+| 33792 | dense-layer gate/up | 72 | 601 us | -- |
+
+This killed a hypothesis and then a conclusion. The hypothesis was that
+`lat_up` runs at 78 GB/s, computed from `t_latent` and its byte count; the
+kernel actually runs at ~180 GB/s like everything else, so the gap was never in
+the kernel.
+
+The conclusion that replaced it was also wrong. Dense kernels summed to 2661 ms
+in a 30 s window, and dividing by 30 s x 4.28 tok/s = 128 tokens gave 20.8
+ms/token against the 91.6 ms PROF2 charges -- an apparent 70 ms/token of pure
+wrapper, which would have been the largest finding in this log. But the window
+did not contain 128 tokens: nsys instrumentation slows the run, and 29,287
+kernel instances at the censused 920 dense calls per token is **31.8 tokens**.
+Dense kernel time is therefore 83.6 ms/token against 91.6 charged -- the path
+is about **91% kernel**, with ~8 ms of wrapper.
+
+The lesson is that a profiling window must be measured in units the profile
+itself provides -- kernel instances divided by calls per token -- never in
+wall-clock seconds times the *unprofiled* throughput.
+
+That correction also explains two failed experiments at once. Pinned staging
+was a wash and mapped activations were worse, because there was never 70 ms of
+copy overhead to remove.
+
+### Mapped activations are worse, and the reason is the access pattern
+
+`cudaHostAllocMapped` lets the kernel dereference host memory directly, so the
+dense path can drop both `cudaMemcpyAsync` calls. Measured 4.060/4.038 against
+4.299/4.294, with `shared` going 4.28 -> 5.24 s/100.
+
+The mechanism is that **x is read once per block, not once per call**: every
+one of the O blocks reads the whole activation vector. In device memory those
+O re-reads are L2 hits; through a mapped host pointer each one pays SMMU 4 KB
+page translation, which is the same effect that made device mirroring worth 12%
+on the weights, applied in the wrong direction. An asymmetric variant is
+possible in principle -- upload x normally, write y mapped, since y is written
+exactly once per block -- but with the wrapper now known to be ~8 ms/token
+there is not enough there to be worth the risk.
+
 ### The chip is power-capped, which changes what "optimization" means
 
 `nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours

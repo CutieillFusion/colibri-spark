@@ -60,6 +60,9 @@ Two more facts that shape the list:
       `options nvidia NVreg_RestrictProfilingToAdminUsers=0` + module reload
 - [x] float4 shared loads for the w2 expert kernel: ALREADY DONE -- k3_w1_down_fast
       shares warp_row_dot_w1 with the gate/up kernel, so both got stride-36 float4
+- [x] short-row dispatch: I<=4096 uses 4 rows/block, latent 1.596 -> 1.555, 6/6 exact
+- [ ] REJECTED: mapped activations (cudaHostAllocMapped) -- 4.06 vs 4.30; x is
+      re-read once per block, so it must stay L2-resident in device memory
 - [ ] OPEN: router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
       cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to

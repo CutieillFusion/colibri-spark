@@ -793,6 +793,74 @@ __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restric
  * W=8 halves the loads again and is bit-exact, but measured SLOWER on mirrors
  * (shared gate 377 -> 296 GB/s, lat_up 379 -> 311): 32 threads is one warp, so
  * 24 blocks/SM reaches only 768 threads. W=4 is the sweet spot. */
+
+/* Same arithmetic as k3_dense_i4g_exactW<W>, R rows per block.
+ *
+ * A short row underfills the one-row-per-block launch: lat_up is [7168, 3584],
+ * so each block reads 1792 bytes and runs the 4-wide loop about 3.5 times with
+ * only 64 threads. Each row keeps a PRIVATE 256-lane tree over its own
+ * T = 256/W threads, so no summation order changes and the result stays
+ * bit-exact -- this only raises warps per block, the one occupancy knob left
+ * once W is pinned at 4 by the width sweep.
+ *
+ * Applied to every shape it was a wash (4.234 vs 4.258). Applied only to short
+ * rows it takes latent from 1.596 to 1.555 s/100 and is neutral to slightly
+ * positive end to end, verified 6/6 byte-identical. */
+template<int W, int R>
+__global__ void k3_dense_i4g_exactR(float *__restrict__ y, const float *__restrict__ x,
+                                    const unsigned char *__restrict__ q4,
+                                    const float *__restrict__ scales,
+                                    int I, int O, int gsh, int ng) {
+    enum { T = 256 / W };
+    int sub = (int)threadIdx.x / T;
+    int o = blockIdx.x * R + sub;
+    int p = (int)threadIdx.x % T;
+    __shared__ float sh[R][W][T];
+    if (o < O) {
+        size_t rb = (size_t)((I + 1) >> 1);
+        const unsigned char *w = q4 + (size_t)o * rb;
+        const float *scl = scales + (size_t)o * ng;
+        float a[W];
+        #pragma unroll
+        for (int j = 0; j < W; j++) a[j] = 0.f;
+        for (int i = p * W; i + W - 1 < I; i += 256) {
+            int g = i >> gsh;
+            if (g >= ng) g = ng - 1;
+            float sc = scl[g];
+            #pragma unroll
+            for (int q = 0; q < W / 4; q++) {
+                float4 xx = *(const float4 *)(x + i + q * 4);
+                unsigned char b0 = w[(i >> 1) + q * 2], b1 = w[(i >> 1) + q * 2 + 1];
+                a[q*4+0] += xx.x * (float)((int)(b0 & 15) - 8) * sc;
+                a[q*4+1] += xx.y * (float)((int)(b0 >> 4)  - 8) * sc;
+                a[q*4+2] += xx.z * (float)((int)(b1 & 15) - 8) * sc;
+                a[q*4+3] += xx.w * (float)((int)(b1 >> 4)  - 8) * sc;
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < W; j++) sh[sub][j][p] = a[j];
+    }
+    __syncthreads();
+    for (int n = T / 2; n >= 1; n >>= 1) {
+        if (o < O && p < n) {
+            #pragma unroll
+            for (int j = 0; j < W; j++) sh[sub][j][p] += sh[sub][j][p+n];
+        }
+        __syncthreads();
+    }
+    if (o < O && !p) {
+        float v[W];
+        #pragma unroll
+        for (int j = 0; j < W; j++) v[j] = sh[sub][j][0];
+        #pragma unroll
+        for (int step = W / 2; step >= 1; step >>= 1) {
+            #pragma unroll
+            for (int j = 0; j < step; j++) v[j] += v[j + step];
+        }
+        y[o] = v[0];
+    }
+}
+
 template<int W>
 __global__ void k3_dense_i4g_exactW(float *__restrict__ y, const float *__restrict__ x,
                                     const unsigned char *__restrict__ q4,
@@ -1066,7 +1134,14 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     if (i4w < 0) { const char *e = getenv("K3_DENSE_I4W"); i4w = e ? atoi(e) : 4; }
     if (exact && fmt == 4) {
         int ng = (I + gs - 1) / gs;
-        if (i4w == 4 && gs >= 4 && !(I & 3))
+        /* Short rows underfill one-row-per-block; four rows gives 256 threads
+         * and the same bit-exact per-row tree. K3_DENSE_RTHRESH=0 disables. */
+        static int rthr = -1;
+        if (rthr < 0) { const char *e = getenv("K3_DENSE_RTHRESH"); rthr = e ? atoi(e) : 4096; }
+        if (i4w == 4 && gs >= 4 && !(I & 3) && I <= rthr)
+            k3_dense_i4g_exactR<4,4><<<(O + 3) / 4, 256, 0, g_stream>>>(
+                g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
+        else if (i4w == 4 && gs >= 4 && !(I & 3))
             k3_dense_i4g_exactW<4><<<O, 64, 0, g_stream>>>(
                 g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
         else
