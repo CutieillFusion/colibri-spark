@@ -69,6 +69,15 @@ Two more facts that shape the list:
 - [x] ~~Control inline under deferred GEMVs~~ — `khead` and `netkda` regress
 - [x] ~~Deferred GEMV sync alone~~ — neutral; one stream, back-to-back anyway
 - [x] ~~Parallelising SiTU / `res_mix` / `out+=sd`~~ — omp region costs ~58 us in-engine
+- [x] ~~Parallelising SiTU ALONE~~ — retried on the theory that the earlier loss
+      was the bundled region count (463 added regions). It is not: the loop is
+      ~67 us of work per layer against a ~58 us region, so there is nothing to
+      win, and contention with the concurrent latent all-reduce makes it worse.
+      4.104/4.120 against 4.284/4.273, `shared` 4.262 -> 5.092.
+- [x] ~~Caching the block-snapshot RMS in `res_mix`~~ — genuinely redundant
+      computation (snapshots are fixed, their RMS was recomputed ~36x each), but
+      no gain: 0.474 -> 0.462 s/100, end to end inside noise. That loop is bound
+      by reading the snapshots, not by the double arithmetic.
 - [x] ~~More control threads (18) / dynamic schedule~~ — but FEWER (6) is a large win, see above
 - [x] ~~`OMP_NUM_THREADS`=12, `GOMP_SPINCOUNT`=0~~ — both worse
 - [x] ~~Bounded spin before `poll()` in the collective~~ — inside noise
