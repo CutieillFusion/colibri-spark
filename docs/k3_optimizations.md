@@ -74,6 +74,12 @@ Two more facts that shape the list:
       ~67 us of work per layer against a ~58 us region, so there is nothing to
       win, and contention with the concurrent latent all-reduce makes it worse.
       4.104/4.120 against 4.284/4.273, `shared` 4.262 -> 5.092.
+- [x] ~~`khead` memset sizing + `__restrict__` on the ARM path~~ — the memsets
+      cleared the full 512-float scratch when only hd=128 entries are used, and
+      the AVX2 block is x86-only so ARM takes the scalar branch. Both fixed,
+      no gain (khead 0.986 -> 1.016, end to end inside noise): GCC already
+      vectorises that loop (16 NEON FMAs in the body) and the extra memset is
+      negligible against the 424 MB/token of state the loop sweeps.
 - [x] ~~Caching the block-snapshot RMS in `res_mix`~~ — genuinely redundant
       computation (snapshots are fixed, their RMS was recomputed ~36x each), but
       no gain: 0.474 -> 0.462 s/100, end to end inside noise. That loop is bound
