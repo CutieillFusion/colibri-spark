@@ -74,24 +74,40 @@ Two more facts that shape the list:
 Ordered by risk-adjusted value: activation-only ulp differences first, routing
 last. Each must be landed and gated SEPARATELY so a failure is attributable.
 
-- [~] **1. SiTU fused into the shared-expert GPU epilogue** (~10 ms/token)
-      ATTEMPTED, REVERTED — speedup real, quality gate FAILED, cause not yet
-      explained. Speed: **4.001/3.995 against 3.903/3.898 (+2.5%)**, `shared`
-      4.310 -> 3.477 s/100 with `netmoe` 1.013 -> 1.302 (a faster shared expert
-      exposes more of the collective it was hiding, so ~3 ms of the ~10 comes
-      back). Quality: teacher-forced **top-1 agreement 54.7%**, max |dlogit|
-      **11.4** — orders of magnitude beyond a `tanhf`/`expf` ulp difference, so
-      this is a BUG, not the expected precision cost.
-      Next step: the S==1 and S>1 paths behave differently. Free-running
-      (S==1 only) diverged mildly (`gen_first_div` 0.81, consistent with ulp
-      effects compounding), while prefill (S>1, the loop added for gate
-      coverage) diverged massively. Suspect the S>1 loop over tokens rather
-      than the kernel. Verify the fused result against
-      `w_matmul`+`situf_` elementwise at S=1 and S=64 separately before
-      retrying.
+- [!] **1. SiTU fused into the shared-expert GPU epilogue** (~10 ms/token)
+      KERNEL CORRECT, MODEL DIVERGES. Do not ship without a scored eval.
+      Speed: **4.001/3.995 against 3.903/3.898 (+2.5%)**, `shared` 4.310 ->
+      3.477 s/100 with `netmoe` 1.013 -> 1.302 (a faster shared expert exposes
+      more of the collective it was hiding, so ~3 of the ~10 ms comes back).
+      Correctness of the kernel is established twice over:
+        * `tests/bench_k3_situ` isolates it against `coli_k3_dense` x2 plus the
+          CPU `situf_` at the real 6144x7168 shape: worst |diff| **1.46e-11**
+          (rel 7e-08) at both S=1 and S=8.
+        * an in-engine verifier recomputing the reference per layer: worst
+          **5.96e-07** on values of order 1-4, i.e. float32 ulp.
+      And yet end to end the model moves a long way: **top-1 agreement 54.7%**,
+      max |dlogit| **11.4**, and only **80.2%** of route-histogram bins
+      unchanged. Reproduced on a clean capture, so it is not a capture artefact.
+      **This is the finding, and it generalises.** K3 selects top-16 of 896
+      experts on a sigmoid router. A ulp-level activation change flips
+      borderline selections, a different expert runs, and the difference
+      compounds over 92 layers. So for THIS model, "numerically correct" does
+      not imply "close output" -- divergence metrics cannot distinguish a good
+      non-exact change from a bad one, and neither can reading samples (the
+      candidate's sqrt(2) proof is a different but equally valid proof).
+      Consequence for the whole non-exact list below: accepting any of it
+      requires a SCORED EVAL (benchmark accuracy on a held-out set), not a
+      similarity gate. `tools/k3_quality.py` remains the right instrument for
+      catching regressions and reward-hacking, but it cannot license a change
+      that legitimately relocates the model.
+      Code is kept: the kernel and `coli_k3_gate_up_situ` stay in
+      `backend_cuda_k3.cu` with `tests/bench_k3_situ` exercising them, but they
+      are NOT wired into `moe_forward`, so decode is untouched.
+
 - [ ] **2. KDA conv + SiLU on the GPU** (~8 ms/token)
-      Risk: LOW-MED. `expf` ulp. Small work per launch, so it must be fused
-      with a neighbour rather than launched alone.
+      Risk: reassess. Item 1 shows ulp-level changes relocate this model
+      wholesale, so "LOW risk because it is only `expf`" was wrong. Needs the
+      same scored eval.
 - [ ] **3. Device-resident activations across a layer** (up to ~20-40 ms/token)
       Risk: MED. No arithmetic change by itself, but only becomes possible
       once 1, 2, 6 and 7 remove the CPU steps in the middle. This is the 23%

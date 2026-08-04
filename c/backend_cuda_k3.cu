@@ -1076,3 +1076,83 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
                             cudaMemcpyDeviceToHost, g_stream), "dense y download")) return 0;
     return ck(cudaStreamSynchronize(g_stream), "dense sync");
 }
+
+/* Fused shared-expert gate/up + SiTU. NOT bit-exact (CUDA vs glibc
+ * tanhf/expf); gate with tools/k3_quality.py, never the reference hash. */
+__global__ void k3_dense_gate_up_situ(float *__restrict__ gate,
+                                      const float *__restrict__ x,
+                                      const unsigned char *__restrict__ w1p,
+                                      const float *__restrict__ w1s,
+                                      const unsigned char *__restrict__ w3p,
+                                      const float *__restrict__ w3s,
+                                      int I, int O, int gsh, int ng,
+                                      float beta1, float beta2) {
+    enum { W = 4, T = 256 / W };
+    int o = blockIdx.x;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+    int p = (int)threadIdx.x;
+    __shared__ float sh[2][W][T];
+    for (int m = 0; m < 2; m++) {
+        const unsigned char *w = (m ? w3p : w1p) + (size_t)o * rb;
+        const float *scl      = (m ? w3s : w1s) + (size_t)o * ng;
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        for (int i = p * W; i + W - 1 < I; i += 256) {
+            int g = i >> gsh;
+            if (g >= ng) g = ng - 1;
+            float sc = scl[g];
+            float4 xx = *(const float4 *)(x + i);
+            unsigned char c0 = w[i >> 1], c1 = w[(i >> 1) + 1];
+            a0 += xx.x * (float)((int)(c0 & 15) - 8) * sc;
+            a1 += xx.y * (float)((int)(c0 >> 4)  - 8) * sc;
+            a2 += xx.z * (float)((int)(c1 & 15) - 8) * sc;
+            a3 += xx.w * (float)((int)(c1 >> 4)  - 8) * sc;
+        }
+        sh[m][0][p] = a0; sh[m][1][p] = a1; sh[m][2][p] = a2; sh[m][3][p] = a3;
+    }
+    __syncthreads();
+    for (int n = T / 2; n >= 1; n >>= 1) {
+        if (p < n) {
+            #pragma unroll
+            for (int m = 0; m < 2; m++)
+                #pragma unroll
+                for (int j = 0; j < W; j++) sh[m][j][p] += sh[m][j][p + n];
+        }
+        __syncthreads();
+    }
+    if (!p) {
+        float r[2];
+        #pragma unroll
+        for (int m = 0; m < 2; m++) {
+            float v0 = sh[m][0][0], v1 = sh[m][1][0], v2 = sh[m][2][0], v3 = sh[m][3][0];
+            v0 += v2; v1 += v3;      /* bit 1 */
+            r[m] = v0 + v1;          /* bit 0 */
+        }
+        float g = r[0], u = r[1];
+        gate[o] = beta1 * tanhf(g / beta1) * (1.f / (1.f + expf(-g)))
+                * beta2 * tanhf(u / beta2);
+    }
+}
+
+extern "C" int coli_k3_gate_up_situ(float *gate, const float *x,
+                                    const void *w1p, const float *w1s,
+                                    const void *w3p, const float *w3s,
+                                    int S, int I, int O, int gs,
+                                    float beta1, float beta2) {
+    if (!g_ready || I <= 0 || O <= 0 || S <= 0 || (I & 3)) return 0;
+    if (gs < 4 || (gs & (gs - 1)) || (I & (gs - 1))) return 0;
+    int gsh = 0; while ((1 << gsh) < gs) gsh++;
+    if (!ensure_dense_scratch(I, O)) return 0;
+    for (int t = 0; t < S; t++) {
+        if (!ck(cudaMemcpyAsync(g_dx, x + (size_t)t * I, (size_t)I * sizeof(float),
+                                cudaMemcpyHostToDevice, g_stream), "situ x")) return 0;
+        k3_dense_gate_up_situ<<<O, 64, 0, g_stream>>>(
+            g_dy, g_dx, (const unsigned char *)w1p, w1s,
+            (const unsigned char *)w3p, w3s, I, O, gsh, (I + gs - 1) / gs, beta1, beta2);
+        if (!ck(cudaGetLastError(), "situ launch")) return 0;
+        if (!ck(cudaMemcpyAsync(gate + (size_t)t * O, g_dy, (size_t)O * sizeof(float),
+                                cudaMemcpyDeviceToHost, g_stream), "situ y")) return 0;
+        if (!ck(cudaStreamSynchronize(g_stream), "situ sync")) return 0;
+    }
+    return 1;
+}

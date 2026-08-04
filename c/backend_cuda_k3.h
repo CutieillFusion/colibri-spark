@@ -68,6 +68,11 @@ void  *coli_k3_devmirror(const void *host, size_t bytes);
 size_t coli_k3_devmirror_used(void);
 void   coli_k3_devmirror_report(void);
 
+int  coli_k3_gate_up_situ(float *gate, const float *x,
+                          const void *w1p, const float *w1s,
+                          const void *w3p, const float *w3s,
+                          int S, int I, int O, int gs, float beta1, float beta2);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus
