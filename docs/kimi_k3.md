@@ -522,6 +522,42 @@ That is also the answer to why a helper thread exists at all: with pageable
 destinations there is no other way to overlap CPU work with a dense GEMV, and
 with pinned ones the only work available to overlap makes things worse.
 
+### ctljoin is not thread startup -- measured, not inferred
+
+After the dense path got mirrors and the 4-wide fold, `ctljoin` grew from 1.79
+to 2.21 s/100 tokens. That is expected and not a regression: `kproj` is
+max(control, GPU) and the GPU side shrank, so the control is now unambiguously
+the critical path there and GPU work in `kproj` is worth nothing.
+
+The obvious reading -- that the gap is the per-layer `pthread_create` plus a
+fresh OpenMP team, roughly 760 thread creations per token -- is **wrong**.
+PROF2 now reports `ctlstart`, the spawn-to-work-start latency:
+
+| term | s/100 tokens |
+|---|---:|
+| `ctlwork` | 3.179 |
+| `ctljoin` | 2.210 |
+| **`ctlstart`** | **0.177** |
+
+1.8 ms/token, i.e. 26 us per layer, which is just `pthread_create`. Startup is
+not the problem, so a persistent worker pool cannot fix this -- and that
+measurement is what stopped it being built a second time.
+
+What remains is `ctlwork` itself: 31.8 ms/token in-engine against 7.4 ms
+standalone cold. That 4x is contention for LPDDR with the GPU, and two more
+attempts confirm it is not a parallelism problem:
+
+| setting | warm tok/s | `ctlwork` |
+|---|---:|---:|
+| **OMP=10, default spin** | **3.896 / 3.896** | **3.179** |
+| OMP=12 | 3.673 / 3.677 | 3.763 |
+| OMP=10, `GOMP_SPINCOUNT=0` | 3.740 / 3.733 | 3.433 |
+
+More threads make the control *slower*, which is the signature of a
+bandwidth-bound region. Passive waiting hurts everything else too (`khead`
+0.609 -> 1.218). The only remaining lever on this term is fewer bytes, i.e. the
+stored precision of `f_a`/`f_b`/`b_proj` -- a numerics change, not an exact one.
+
 ### The KDA control's cost is contention, not thread churn
 
 PROF2 now reports `ctlwork` (time inside `kda_control_b1`, wherever it runs) and

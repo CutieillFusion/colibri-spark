@@ -243,6 +243,7 @@ typedef struct {
     double t_ekernel;                     /* GPU call only, inside t_expert */
     double t_kproj, t_kconv, t_khead, t_kout;  /* kda_forward breakdown */
     double t_ctl, t_ctljoin;                   /* control work vs join wait */
+    double t_ctlstart;                         /* create -> work actually begins */
     double t_net_kda, t_net_mla, t_net_moe;     /* EXPOSED collective time by site */
     double t_mproj, t_mcache, t_matt, t_mout;   /* mla_forward breakdown */
     uint64_t n_ekernel;
@@ -305,8 +306,10 @@ static void kda_control_b1(KdaCtrlJob *j){
     }
 }
 
-static double g_ctl_secs=0;                 /* diagnostic: control work only */
-static void *kda_control_worker(void *p){ double a=now_s(); kda_control_b1((KdaCtrlJob*)p);
+static double g_ctl_secs=0, g_ctl_start=0;  /* work only / spawn-to-start latency */
+static double g_ctl_spawn=0;
+static void *kda_control_worker(void *p){ double a=now_s(); g_ctl_start+=a-g_ctl_spawn;
+                                          kda_control_b1((KdaCtrlJob*)p);
                                           g_ctl_secs+=now_s()-a; return NULL; }
 
 
@@ -1190,6 +1193,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     int ctl_wanted=1;
     { const char *e=getenv("K3_KDA_OVERLAP"); if(e) ctl_wanted=atoi(e); }
     int ctl_overlap=C==1 && g_k3_cuda && g_k3_dense_gpu && ctl_wanted;
+    g_ctl_spawn=now_s();
     if(ctl_overlap && pthread_create(&ctlth,NULL,kda_control_worker,&cj)==0) ctl_active=1;
 #endif
     if(wsz>1 && hn>0){
@@ -2261,6 +2265,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double dkpr0=m->t_kproj, dkc0=m->t_kconv, dkh0=m->t_khead, dko0=m->t_kout;
     double dcj0=m->t_ctljoin, dcw0=g_ctl_secs;
     double dnk0=m->t_net_kda, dnm0=m->t_net_mla, dnx0=m->t_net_moe;
+    double dcs0=g_ctl_start;
     double dmpr0=m->t_mproj, dmc0=m->t_mcache, dma0=m->t_matt, dmo0=m->t_mout;
     double dnet0=k3_net_secs(); uint64_t dnc0=k3_net_calls();
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
@@ -2321,7 +2326,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            "router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
            "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f "
            "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f ctlwork=%.3f ctljoin=%.3f "
-           "netkda=%.3f netmla=%.3f netmoe=%.3f\n",
+           "netkda=%.3f netmla=%.3f netmoe=%.3f ctlstart=%.3f\n",
            m->t_attn-da0,m->t_moe-de0,m->t_eload-dd0,m->t_head-dh0,
            k3_net_secs()-dnet0,(unsigned long long)(k3_net_calls()-dnc0),
            m->t_router-dr0,m->t_topk-dtop0,m->t_latent-dl0,
@@ -2329,7 +2334,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            m->t_kproj-dkpr0,m->t_kconv-dkc0,m->t_khead-dkh0,m->t_kout-dko0,
            m->t_mproj-dmpr0,m->t_mcache-dmc0,m->t_matt-dma0,m->t_mout-dmo0,
            g_ctl_secs-dcw0,m->t_ctljoin-dcj0,
-           m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0);
+           m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0,g_ctl_start-dcs0);
     fflush(stdout);
 }
 
