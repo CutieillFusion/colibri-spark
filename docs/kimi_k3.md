@@ -525,6 +525,54 @@ whole dense path adds to ~16 GB/token, which at the 235 GB/s ceiling is 68 ms
 of a 231 ms token: memory is under a third of the budget, so no amount of
 kernel work alone reaches 5 tok/s.
 
+### The w2 expert kernel already has float4 shared loads
+
+Carried on the open list as untouched work, but it was done: `k3_w1_down_fast`
+-- the w2 / down projection -- does not have its own dot product. It calls
+`warp_row_dot_w1`, the same helper `k3_w1_gate_up_fast` uses, so when that
+helper moved to stride-36 float4 shared loads both kernels moved at once. nsys
+confirms both run the same number of times (26,544 instances each in a 30 s
+window). There is no separate w2 dot product left to widen.
+
+### The four open items, closed
+
+| item | answer |
+|---|---|
+| lm_head replicated -- shard it + argmax allreduce | already implemented and live (`lm_head_shard`, `head_greedy`), gated on `hw>1 && greedy && t==C-1` |
+| 4-wide consecutive fold for the dense int4 kernel | done, and confirmed **optimal**: W=2 4.019, W=4 4.258, W=8 4.170, W=4x2rows 4.234 -- a peak, not a slope |
+| float4 shared loads for the w2 expert kernel | already done, shared with w1 through `warp_row_dot_w1` |
+| is `K3_DENSE_DEV_GB` or the 64 MB cap binding | **neither**: the cap was already 2 GB and reports 0.00 GB skipped, and the budget defaulted to 0.0 so it was never consulted. Auto-sizing it was worth **+12%** |
+
+### Where the 234 ms token actually goes
+
+Per token at 4.28 tok/s, from PROF2 and the kernel summary:
+
+| term | ms | | term | ms |
+|---|---:|---|---|---:|
+| shared experts | 42.7 | | netkda | 30.4 |
+| kproj | 32.9 | | routed experts | 26.1 |
+| latent | 16.0 | | router | 12.9 |
+| netmla | 10.2 | | ctljoin | 10.2 |
+| khead | 9.9 | | netmoe | 9.5 |
+| matt | 8.5 | | resmix | 4.7 |
+
+Three budgets, and none of them alone is the answer:
+
+* **Memory, ~68 ms.** The dense path totals ~16 GB/token; at the measured
+  235 GB/s ceiling that is 68 ms, under a third of the token. The kernels are
+  already at 180-235 GB/s and the fold-width sweep found a peak, so there is
+  very little left here.
+* **Collectives, ~50 ms exposed.** Of that roughly 21 ms is irreducible 1 GbE
+  wire time for the ~2.6 MB/token that crosses the bridge -- a hardware floor
+  under the stated no-recabling constraint.
+* **CPU, ~37 ms.** Every term contains a transcendental, and a ulp change moves
+  27% of expert routes, so it is pinned by arithmetic rather than engineering.
+
+Reaching 5 tok/s needs 34 ms off a 234 ms token. It is not available in any
+single one of those three under bit-exactness: the memory budget is nearly
+spent, a fifth of the collective budget is wire time, and the CPU budget is
+gated on quality rather than on speed.
+
 ### The chip is power-capped, which changes what "optimization" means
 
 `nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours
