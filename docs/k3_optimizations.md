@@ -20,7 +20,7 @@ Budget, measured (s per 100 tokens; x10 for ms/token):
 | `kconv` | 1.10 | CPU, `expf`-bound |
 | `matt` | 0.84 | CPU |
 | `khead` | 0.61 | CPU |
-| `topk` | 0.44 | CPU |
+| `topk` | 0.09 | CPU (was 0.44) |
 | `head` | 0.15 | GPU (sharded) |
 
 Two more facts that shape the list:
@@ -41,6 +41,8 @@ Two more facts that shape the list:
   mispredicted the direction four separate times (see `docs/kimi_k3.md`).
 
 ## Bit-exact — DONE
+
+- [x] Top-16 expert selection O(K^2*E) -> O(K*E) (`topk` 0.436 -> 0.085 s/100) — 3.913 -> 3.957
 
 - [x] Exact int8 GEMV folded onto 128 threads (`dee7fd0`) — 3.238 -> 3.296
 - [x] 32-way shared-memory bank conflict in the 1-bit expert GEMV (`18fb60e`) — 3.296 -> 3.510

@@ -288,6 +288,29 @@ Measured: `head` **0.508 -> 0.150 s/100 tokens**, collectives 18315 -> 18414 per
 because only the slice needs mirroring. End to end **3.797/3.850 -> 3.914/3.906
 tok/s**, output byte identical.
 
+### Routed-expert selection was O(K^2 * E)
+
+`moe_forward` picked the top-16 of 896 experts by running K passes over all E
+experts, and inside each pass walking the already-chosen list to test
+membership, while recomputing `st[e] + rbias[e]` every time. That is
+~129K inner operations per (layer, token) where ~14K suffices, and at 92 sparse
+layers it cost **0.436 s/100 tokens**.
+
+A `used[]` flag plus one precomputed biased score gives the identical sequence
+-- same strict `>`, so the lowest index still wins ties, and the weight is still
+the raw sigmoid score -- for about 9x less work. Bit-exact by construction: only
+the membership test and a common subexpression changed, not a single
+floating-point operation or its order.
+
+`topk` **0.436 -> 0.085 s/100 tokens** (5.1x), `moe` 11.851 -> 11.547, and end
+to end 3.913/3.897 -> **3.957/3.968 tok/s**. Output byte-identical.
+
+Worth noting how this was missed for so long: it is pure CPU control flow with
+no kernel, no collective and no memory-bandwidth story, so none of the
+profiling that found the bank conflict or the SMMU mapping would ever have
+pointed at it. It showed up only from reading the code of the last unexamined
+PROF2 term.
+
 ### Both major GEMV paths are now at their memory walls
 
 Probes that hold the memory pattern fixed and vary the work, run COLD (cycling

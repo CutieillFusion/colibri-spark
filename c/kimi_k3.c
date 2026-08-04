@@ -1745,18 +1745,27 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     m->t_router+=now_s()-tp0; tp0=now_s();
     int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
     int *keff=malloc((size_t)C*sizeof(int));
-    if(!idxs||!keff){fprintf(stderr,"OOM moe sel\n");exit(1);}
+    float *bias_sc=falloc(E); unsigned char *used=malloc((size_t)E);
+    if(!idxs||!keff||!used){fprintf(stderr,"OOM moe sel\n");exit(1);}
     for(int t=0;t<C;t++){
         float *st=sco+(int64_t)t*E;
         for(int e=0;e<E;e++) st[e]=sigmoidf_(st[e]);
         int *idx=idxs+(int64_t)t*K; float *wsel=wsels+(int64_t)t*K;
+        /* Selection was O(K^2 * E): each of the K picks rescanned all E experts
+         * AND walked the already-chosen list to test membership, and recomputed
+         * st[e]+rbias[e] on every pass. A used[] flag and one precomputed
+         * biased score give the identical sequence -- same strict `>` so the
+         * lowest index still wins ties, same raw-sigmoid weight -- for ~9x less
+         * work. Bit-exact by construction: only the membership test and a
+         * common subexpression changed. */
+        for(int e=0;e<E;e++){ bias_sc[e]=st[e]+o->rbias[e]; used[e]=0; }
         for(int kk=0;kk<K;kk++){
             int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){
-                int taken=0; for(int j=0;j<kk;j++) if(idx[j]==e){taken=1;break;}
-                float sv=st[e]+o->rbias[e];
-                if(!taken&&sv>bv){ bv=sv; best=e; }
+                float sv=bias_sc[e];
+                if(!used[e]&&sv>bv){ bv=sv; best=e; }
             }
+            used[best]=1;
             idx[kk]=best; wsel[kk]=st[best];          /* weight = RAW sigmoid score */
         }
         { float sm=0; for(int kk=0;kk<K;kk++) sm+=wsel[kk];
@@ -1872,7 +1881,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     w_matmul(out,u,&o->lat_up,C);
     m->t_latent+=now_s()-tp0;
     for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
-    free(sco);free(idxs);free(wsels);free(keff);
+    free(sco);free(idxs);free(wsels);free(keff);free(bias_sc);free(used);
     free(z);free(u);free(gate);free(up);free(hz);free(sg);free(su);free(sd);
 }
 
