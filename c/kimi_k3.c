@@ -361,6 +361,11 @@ static void k3_head_shard(int H, int *h0, int *hn){
     *h0=a; *hn=b-a;
 }
 
+/* Which matmuls actually reach the exact K3 kernel. nsys says the generic
+ * quant_matmul is 64% of GPU time at 1.37 ms a call against 91 us for
+ * k3_dense_i4g_exactW, so the split matters more than either kernel does. */
+static _Atomic long g_dp_k3=0, g_dp_off=0, g_dp_fmt=0, g_dp_par=0;
+static int g_dense_census = 0;    /* K3_DENSE_CENSUS=1 */
 #ifdef COLI_CUDA
 /* ---------- optional GPU placement for the RESIDENT (dense) tensors ----------
  *
@@ -384,11 +389,6 @@ static int    g_k3_cuda = 0;
  * Cleared on any failure so a run degrades to the CPU path rather than dying
  * mid-token. Declared here because k3_cuda_report() below reports the split. */
 static int      g_k3_expert_gpu = 0;
-/* Which matmuls actually reach the exact K3 kernel. nsys says the generic
- * quant_matmul is 64% of GPU time at 1.37 ms a call against 91 us for
- * k3_dense_i4g_exactW, so the split matters more than either kernel does. */
-static _Atomic long g_dp_k3=0, g_dp_off=0, g_dp_fmt=0, g_dp_par=0;
-static int g_dense_census = 0;    /* K3_DENSE_CENSUS=1 */
 /* K3_DENSE_GPU: zero-copy dense GEMV. ON by default after the exact-order
  * kernel took a 300-token 4-node run from 1.09 -> 1.21 tok/s: shared experts
  * 43.9 -> 33.3 s, latent projections 16.8 -> 13.2 s, with bit-exact standalone
