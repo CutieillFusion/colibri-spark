@@ -48,7 +48,8 @@ Two more facts that shape the list:
 - [x] `matt` score buffer on the stack, not malloc'd per head per token
 - [x] K3_DENSE_DEV_GB auto-sized: it defaulted to 0, so nothing was ever
       mirrored -- 3.86 -> 4.33 tok/s, output unchanged 6/6
-- [x] 4-wide fold confirmed: worth +6.5%, but ONLY with mirrors on
+- [x] 4-wide fold confirmed OPTIMAL: W=2 4.019, W=4 4.258, W=8 4.170,
+      W=4 x 2rows 4.234 -- a peak, not a slope; +6.5% but only with mirrors on
 - [ ] REVERTED: MLA absorb on GPU (fb898f3) -- +0.4% is inside noise
 - [ ] REVERTED: KDA control part 2 on GPU -- dead wash, 3.877/3.888 vs 3.877/3.883
 - [ ] REJECTED: shard the replicated shared experts -- compute saving 0.2 ms/layer

@@ -405,6 +405,50 @@ and with the GPU already idle ~76% the copy time was hidden anyway. Reverted.
 The lesson is that the 12 seconds of API time is not 12 seconds of critical
 path, and `cuda_api_sum` alone cannot tell you which.
 
+### The fold width sweep, and why 4 is the peak
+
+`T = 256 / W` -- the reduction tree needs exactly 256 lanes, so a wider fold
+buys wider loads only by spending threads. Measured end to end, and the shape
+is a peak rather than a slope:
+
+| variant | tok/s | shared s/100 |
+|---|---|---|
+| W=2, 128 threads | 4.019 / 4.020 | -- |
+| **W=4, 64 threads** | **4.258 / 4.252** | 4.281 |
+| W=8, 32 threads | 4.170 / 4.169 | 4.516 |
+| W=4, 2 rows per block | 4.234 / 4.230 | 4.203 |
+
+W=8 gives each thread four contiguous weight bytes -- one 32-bit load instead
+of two byte loads -- and still loses, because one warp per block cannot keep
+enough loads in flight. Two rows per block was the attempt to buy occupancy
+back without touching W: each row keeps a private 256-lane tree, so it stays
+bit-exact, and it does help the kernel term (4.281 -> 4.203) while losing
+slightly end to end. Both reverted.
+
+The dense path sits at ~180 GB/s against a 235 GB/s achievable ceiling, and
+neither load width nor occupancy moves it, so whatever limits it is not those.
+
+### Deploy every source, then verify the hash
+
+Four consecutive measurements -- W=8, two rows per block, four rows per block,
+and a baseline -- all came back at 2.9-3.2 tok/s and all were wrong. The
+sharded shared-expert experiment had been reverted locally and committed, but
+the redeploys that followed copied only `backend_cuda_k3.cu`, so every node was
+still running the sharded `kimi_k3.c` with its 93 blocking allreduces.
+
+The tell was in the run's own log: `dense mirrors: 12.65 GB placed` instead of
+16.06 GB, because sharded gate/up are a quarter the size. Re-deploying both
+sources restored 4.258/4.252, and W=8 re-measured at 4.170 rather than 2.927 --
+the whole 30% deficit was the stale binary.
+
+That is the third bug of this shape in one session, after the unforwarded
+environment variables and the two harnesses with different defaults. All three
+share a cause: the run did not assert that it was running what it claimed. The
+standing rule is now that every measurement checks a line the run itself
+printed -- the mirror report for placement, the harness echo for forwarding --
+and `scratchpad/deploy.sh` refuses to finish unless all four nodes report the
+same binary hash.
+
 ### The chip is power-capped, which changes what "optimization" means
 
 `nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours
