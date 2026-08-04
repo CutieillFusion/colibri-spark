@@ -487,6 +487,44 @@ needs a root-owned line in /etc/modprobe.d
 Until that exists, the dense kernel cannot be diagnosed further, and it is the
 largest single term in the token.
 
+### Two thirds of GPU time is the GENERIC kernel, and the router is f32
+
+`nsys --report cuda_gpu_kern_sum` needs no performance counters, so it works
+where `ncu` is permission-blocked, and it says something the API summary never
+did:
+
+| kernel | GPU time | instances | avg |
+|---|---|---|---|
+| `quant_matmul` (generic backend) | 7.10 s (64.2%) | 5,193 | 1.37 ms |
+| `k3_dense_i4g_exactW<4>` | 2.66 s (24.1%) | 29,287 | 91 us |
+| `k3_w1_gate_up_fast` | 0.62 s (5.6%) | 26,544 | 23 us |
+
+A census in `w_matmul` (`K3_DENSE_CENSUS=1`, off by default) shows where the
+generic calls come from. Per token during decode: **exact 920, permanently
+declined 0, format-mismatch 143.5, in-parallel 0.** Nothing is falling off the
+fast path through the `k3_dense_off` latch -- the fast kernel simply only
+accepts fmt 1 and 4, and 143.5 matmuls per token are neither:
+
+| shape | calls/token | fmt | bytes/token |
+|---|---|---|---|
+| I=7168 **O=896** (router) | 92 | **f32** | **2.36 GB** |
+| I=128 O=3072 (`f_b`) | 69 | f32 | 110 MB |
+| I=7168 O=24 (`b_proj`) | 69 | f32 | 48 MB |
+
+**The router is stored f32.** 25.7 MB per layer, 2.36 GB per token -- roughly
+15% of everything the model reads in a token -- to produce a 896-wide score
+vector. It is not slow for what it moves: 92 calls in the measured 12.9 ms/token
+is 183 GB/s, the same rate the shared experts get. It is just eight times
+larger than it would be at int4, and it is the one tensor whose precision the
+model is most sensitive to, since its output feeds top-16-of-896 selection.
+
+Two things follow. The 1.37 ms average for `quant_matmul` is mostly prefill,
+not decode -- the decode calls run at the same GB/s as everything else, so the
+generic kernel is not the problem the percentage makes it look like. And the
+whole dense path adds to ~16 GB/token, which at the 235 GB/s ceiling is 68 ms
+of a 231 ms token: memory is under a third of the budget, so no amount of
+kernel work alone reaches 5 tok/s.
+
 ### The chip is power-capped, which changes what "optimization" means
 
 `nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours

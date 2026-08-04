@@ -153,6 +153,7 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
      * identical. */
     ColiCudaTensor *cuda; int cuda_device; int8_t cuda_failed, cuda_placed;
     int8_t k3_reg, k3_dense_off;      /* zero-copy dense path: registered / declined */
+    int8_t fmt_reported;              /* census: shape logged once */
     /* Optional device copies for the exact dense kernel. Host-registered pages
      * reach the GPU through the SMMU at 4 KB granularity; cudaMalloc'd memory
      * uses large pages, which measured up to 1.65x on the SAME kernel. Null
@@ -383,6 +384,11 @@ static int    g_k3_cuda = 0;
  * Cleared on any failure so a run degrades to the CPU path rather than dying
  * mid-token. Declared here because k3_cuda_report() below reports the split. */
 static int      g_k3_expert_gpu = 0;
+/* Which matmuls actually reach the exact K3 kernel. nsys says the generic
+ * quant_matmul is 64% of GPU time at 1.37 ms a call against 91 us for
+ * k3_dense_i4g_exactW, so the split matters more than either kernel does. */
+static _Atomic long g_dp_k3=0, g_dp_off=0, g_dp_fmt=0, g_dp_par=0;
+static int g_dense_census = 0;    /* K3_DENSE_CENSUS=1 */
 /* K3_DENSE_GPU: zero-copy dense GEMV. ON by default after the exact-order
  * kernel took a 300-token 4-node run from 1.09 -> 1.21 tok/s: shared experts
  * 43.9 -> 33.3 s, latent projections 16.8 -> 13.2 s, with bit-exact standalone
@@ -607,6 +613,12 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
     /* Zero-copy dense GEMV first: no upload and no duplicate of the weights,
      * which is what frees RAM for the expert cache. Falls through to the
      * uploading path when it declines (prefill, or x too big for shared). */
+    if(S==1 && g_dense_census) { if(w->k3_dense_off) atomic_fetch_add_explicit(&g_dp_off,1,memory_order_relaxed);
+               else if(!(w->fmt==1||w->fmt==4)) { atomic_fetch_add_explicit(&g_dp_fmt,1,memory_order_relaxed);
+                   if(!((W*)w)->fmt_reported){ ((W*)w)->fmt_reported=1;
+                       fprintf(stderr,"[K3/DENSE] generic: I=%d O=%d fmt=%d bytes=%.1fMB\n",
+                               w->I,w->O,w->fmt,(double)w->I*w->O*4/1e6); } }
+               else if(omp_in_parallel()) atomic_fetch_add_explicit(&g_dp_par,1,memory_order_relaxed); }
     if(g_k3_dense_gpu && g_k3_cuda && !w->k3_dense_off && !omp_in_parallel() && S==1
        && (w->fmt==1||w->fmt==4)){
         W *mw=(W*)w;
@@ -630,8 +642,12 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
             }
             const void *bl = mw->k3_dw ? mw->k3_dw : w_blob(w);
             const float *sc = mw->k3_dw ? (const float*)mw->k3_ds : w->s;
-            if(coli_k3_dense(y,x,bl,sc,w->fmt,S,w->I,w->O,w->gs)) return;
+            if(coli_k3_dense(y,x,bl,sc,w->fmt,S,w->I,w->O,w->gs)){
+                if(g_dense_census) atomic_fetch_add_explicit(&g_dp_k3,1,memory_order_relaxed);
+                return; }
             mw->k3_dense_off=1;   /* declined for a stable reason; stop retrying */
+            fprintf(stderr,"[K3/DENSE] declined I=%d O=%d fmt=%d gs=%d -> generic\n",
+                    w->I,w->O,w->fmt,w->gs);
         }
     }
     /* Serial path only: placement mutates w lazily and the CUDA driver must not
@@ -1149,6 +1165,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     /* NOTE: g_k3_tp_attn is resolved EARLIER, before the weights load -- the
      * head-sliced loads below depend on it, and reading it here would be too
      * late (the projections would already be resident at full width). */
+    { const char *e=getenv("K3_DENSE_CENSUS"); g_dense_census = e?atoi(e):0; }
     int want_expert_gpu=getenv("K3_EXPERT_GPU")&&atoi(getenv("K3_EXPERT_GPU"));
     /* The zero-copy dense kernels share backend_cuda_k3's stream/scratch
      * initialization but do not require routed experts to run on the GPU. */
@@ -2381,6 +2398,11 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            g_ctl_secs-dcw0,m->t_ctljoin-dcj0,
            m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0,g_ctl_start-dcs0,
            g_resmix_secs-drm0);
+    if(g_dense_census) fprintf(stderr,"[K3/DENSE] decode dispatch: exact=%ld off=%ld fmt=%ld inpar=%ld\n",
+            (long)atomic_load_explicit(&g_dp_k3,memory_order_relaxed),
+            (long)atomic_load_explicit(&g_dp_off,memory_order_relaxed),
+            (long)atomic_load_explicit(&g_dp_fmt,memory_order_relaxed),
+            (long)atomic_load_explicit(&g_dp_par,memory_order_relaxed));
     fflush(stdout);
 }
 

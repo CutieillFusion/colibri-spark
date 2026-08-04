@@ -58,6 +58,8 @@ Two more facts that shape the list:
 - [ ] REJECTED (retest): K3_FUSE_QKVG with mirrors on -- still a wash, 4.248 vs 4.258
 - [ ] BLOCKED: dense kernel diagnosis needs ncu; ERR_NVGPUCTRPERM, needs root
       `options nvidia NVreg_RestrictProfilingToAdminUsers=0` + module reload
+- [ ] OPEN: router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
+      cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to
       pin -ffp-contract=off for the conv loop or re-baseline the reference
 - [x] MLA absorb GEMVs moved to the GPU, BIT-EXACT (`matt` 0.896 -> 0.849) — the
