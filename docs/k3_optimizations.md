@@ -63,6 +63,11 @@ Two more facts that shape the list:
 - [x] short-row dispatch: I<=4096 uses 4 rows/block, latent 1.596 -> 1.555, 6/6 exact
 - [ ] REJECTED: mapped activations (cudaHostAllocMapped) -- 4.06 vs 4.30; x is
       re-read once per block, so it must stay L2-resident in device memory
+- [x] split the RD2 cross exchange: bridge bytes halved, netkda -12.4%,
+      netmla -19%, 6/6 exact. End to end +0.7% (noise) -- the collective terms
+      are the honest result
+- [ ] MEASURED: expert load imbalance costs 2.3 ms/token; not fixable without
+      moving expert weights between nodes
 - [ ] OPEN: router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
       cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to

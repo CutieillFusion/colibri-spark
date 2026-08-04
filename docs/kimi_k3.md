@@ -624,6 +624,60 @@ possible in principle -- upload x normally, write y mapped, since y is written
 exactly once per block -- but with the wrapper now known to be ~8 ms/token
 there is not enough there to be worth the risk.
 
+### Half the bridge traffic was redundant
+
+The RD2 collective is two phases: exchange within the 200 GbE pair, then
+exchange across the 1 GbE bridge. After phase 1 **both ranks of a pair hold the
+identical pair sum** -- and the old phase 2 had both of them push that same full
+vector across the bridge. Half of the bridge traffic was a duplicate.
+
+Now the pair leader carries the first half of the vector across and the member
+carries the second, and the two completed halves are swapped back over the pair
+link, which is ~14x faster and effectively free. Bridge bytes per rank drop from
+n to n/2.
+
+Bit-exact, and the argument is worth stating because it is not obvious. Phase 1
+leaves `v0+v1` on rank 0 and `v1+v0` on rank 1 -- equal, since float addition is
+commutative even though it is not associative. So both ranks were already
+computing the identical `(v0+v1)+(v2+v3)`, and having one of them compute it and
+send the finished value is the same value by construction. The swap moves
+completed results, never partial sums.
+
+Same-session A/B, and 6/6 byte-identical output:
+
+| | SPLIT=0 | SPLIT=1 |
+|---|---|---|
+| netkda | 3.128 | **2.740** (-12.4%) |
+| netmla | 1.112 | **0.898** (-19%) |
+| netmoe | 0.974 | 1.054 (+8%) |
+| tok/s | 4.299 / 4.317 | 4.362 / 4.316 |
+
+-5.2 ms/token on the collectives, but end to end only +0.7%, inside noise. The
+gap is instructive: **netmoe got worse**, and it is the one collective that was
+already hidden -- it runs under the shared experts via `allreduce_start`/`wait`,
+so halving its payload cannot shorten a wait that was already covered, while the
+extra round trip is real. The split is therefore worth having on the exposed
+sites and not on the hidden one.
+
+### Load imbalance shows up as collective time, and it is small
+
+Per-rank PROF2 from one run:
+
+| rank | expert | netmoe | sum |
+|---|---|---|---|
+| 0 | 2.634 | 1.019 | 3.653 |
+| 1 | 2.468 | 1.255 | 3.723 |
+| 2 | 2.217 | 1.486 | 3.703 |
+| 3 | 2.308 | 1.403 | 3.711 |
+
+`expert` and `netmoe` are anti-correlated and their sum is nearly constant --
+the definition of load imbalance, with the early finishers paying at the
+collective. The cause is structural: routed experts are owned by
+`e % world == rank`, so a token whose top-16 lands 5/3/4/4 gives one rank 60%
+more expert work than another. The recoverable amount is only
+`mean(max - own)` = **2.3 ms/token**, and rebalancing is not possible without
+moving expert weights between nodes, which the fabric cannot pay for.
+
 ### The chip is power-capped, which changes what "optimization" means
 
 `nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours

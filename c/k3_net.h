@@ -64,6 +64,7 @@ static int    g_net_fd[K3_NET_MAX];        /* downstream: members, and (root) pe
 static int    g_net_up = -1;               /* upstream: leader, or root for a leader */
 static int    g_net_cross = -1;            /* optional rank r <-> r+2 direct bridge */
 static int    g_net_rd2 = 0;               /* two-phase 4-rank recursive doubling */
+static int    g_net_split = 1;             /* halve the bridge payload; K3_NET_SPLIT=0 off */
 static float *g_net_scratch = NULL;
 static size_t g_net_scratch_n = 0;
 static double g_net_secs = 0;              /* time parked in collectives */
@@ -129,6 +130,7 @@ static int k3_net_init(void) {
     g_net_isleader = (g_net_rank == g_net_leader);
     int port = getenv("K3_MASTER_PORT") ? atoi(getenv("K3_MASTER_PORT")) : 29555;
     g_net_rd2 = getenv("K3_NET_RD2") ? atoi(getenv("K3_NET_RD2")) : 0;
+    g_net_split = getenv("K3_NET_SPLIT") ? atoi(getenv("K3_NET_SPLIT")) : 1;
     if (g_net_rd2 && (g_net_world != 4 || g_net_gsize != 2)) {
         fprintf(stderr,"[K3/NET] K3_NET_RD2 requires world=4, group=2\n"); exit(1);
     }
@@ -281,7 +283,36 @@ static void k3_net_allreduce(float *v, size_t n) {
          * without a leader broadcast. */
         int pairfd = g_net_isleader ? g_net_fd[g_net_rank+1] : g_net_up;
         k3_exchange_add(pairfd,v,n);
-        k3_exchange_add(g_net_cross,v,n);
+        /* After phase 1 BOTH ranks of a pair hold the identical pair sum, and
+         * the old phase 2 had both of them push that same full vector across
+         * the 1 GbE bridge. Half of that is redundant: let the pair leader
+         * carry the first half of the vector across and the member carry the
+         * second, then swap the two completed halves back over the 200 GbE
+         * pair link, which is ~14x faster and effectively free.
+         *
+         * Bridge bytes per rank drop from n to n/2. Bit-exact: an element of
+         * the first half is still ((v0+v1)+(v2+v3)) -- the same two additions
+         * in the same order, just evaluated on one rank of the pair instead of
+         * redundantly on both -- and the swap moves finished values, not
+         * partial sums. Falls back to the full exchange for short vectors,
+         * where a second round trip costs more than the halved payload saves
+         * (the barrier reduces a single float). */
+        size_t half = n / 2;
+        if (g_net_split && n >= 1024 && half > 0) {
+            if (g_net_isleader) {
+                k3_exchange_add(g_net_cross, v, half);
+                if (!k3_send_all(pairfd, v, half*sizeof(float)) ||
+                    !k3_recv_all(pairfd, v+half, (n-half)*sizeof(float))) {
+                    fprintf(stderr,"[K3/NET] split swap (leader)\n"); exit(1); }
+            } else {
+                k3_exchange_add(g_net_cross, v+half, n-half);
+                if (!k3_recv_all(pairfd, v, half*sizeof(float)) ||
+                    !k3_send_all(pairfd, v+half, (n-half)*sizeof(float))) {
+                    fprintf(stderr,"[K3/NET] split swap (member)\n"); exit(1); }
+            }
+        } else {
+            k3_exchange_add(g_net_cross,v,n);
+        }
         g_net_secs += k3_now() - t0; g_net_calls++;
         return;
     }
