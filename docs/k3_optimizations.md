@@ -17,10 +17,11 @@ Budget, measured (s per 100 tokens; x10 for ms/token):
 | `latent` | 1.59 | GPU |
 | `router` | 1.32 | GPU, stock path |
 | `mout` | 1.29 | 78% collective |
-| `kconv` | 1.10 | CPU, `expf`-bound |
+| `kconv` | 0.20 | CPU (was 1.10) |
 | `matt` | 0.84 | CPU |
 | `khead` | 0.61 | CPU |
 | `topk` | 0.09 | CPU (was 0.44) |
+| `resmix` | 0.47 | CPU, now measured |
 | `head` | 0.15 | GPU (sharded) |
 
 Two more facts that shape the list:
@@ -43,6 +44,8 @@ Two more facts that shape the list:
 ## Bit-exact — DONE
 
 - [x] Top-16 expert selection O(K^2*E) -> O(K*E) (`topk` 0.436 -> 0.085 s/100) — 3.913 -> 3.957
+- [x] Rotating conv window instead of a per-token memmove (`kconv` 1.103 -> 0.200 s/100, 5.5x) — 3.982 -> 4.084
+- [x] `matt` score buffer on the stack, not malloc'd per head per token
 
 - [x] Exact int8 GEMV folded onto 128 threads (`dee7fd0`) — 3.238 -> 3.296
 - [x] 32-way shared-memory bank conflict in the 1-bit expert GEMV (`18fb60e`) — 3.296 -> 3.510

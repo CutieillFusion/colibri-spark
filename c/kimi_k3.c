@@ -224,7 +224,8 @@ typedef struct {
                                            * then swap into the layer LRU */
     /* KDA state */
     float **kstate;                       /* [layer] -> [heads*hd*hd], S[k][v] */
-    float **cwq, **cwk, **cwv;            /* conv windows [proj*conv_k], oldest first */
+    float **cwq, **cwk, **cwv;    /* conv windows [proj*conv_k], oldest first */
+    int8_t cwh[128];              /* rotating write head into those windows */
     /* MLA cache */
     kvq **Lc, **Rc; int max_t;
     /* experts */
@@ -245,6 +246,7 @@ typedef struct {
     double t_ctl, t_ctljoin;                   /* control work vs join wait */
     double t_ctlstart;                         /* create -> work actually begins */
     double t_net_kda, t_net_mla, t_net_moe;     /* EXPOSED collective time by site */
+    double t_resmix;                           /* AttnRes softmax mix (CPU) */
     double t_mproj, t_mcache, t_matt, t_mout;   /* mla_forward breakdown */
     uint64_t n_ekernel;
     FILE *trace;
@@ -1001,6 +1003,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     double t0=now_s();
     m->L=calloc(c->n_layers,sizeof(Layer));
     m->kstate=calloc(c->n_layers,sizeof(float*));
+    memset(m->cwh,0,sizeof(m->cwh));
     m->cwq=calloc(c->n_layers,sizeof(float*));
     m->cwk=calloc(c->n_layers,sizeof(float*));
     m->cwv=calloc(c->n_layers,sizeof(float*));
@@ -1153,8 +1156,10 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
 }
 
 /* ---------- AttnRes softmax mix over [bres rows..., prefix] ---------- */
+static double g_resmix_secs=0;
 static void res_mix(float *out, const float *prefix, const float *bres, int nb, int D,
                     const float *sw, float eps){
+    double rm0=now_s();
     const float *v[16]; float sc[16];
     for(int e=0;e<nb;e++) v[e]=bres+(int64_t)e*D;
     v[nb]=prefix;
@@ -1165,6 +1170,7 @@ static void res_mix(float *out, const float *prefix, const float *bres, int nb, 
     }
     softmax_(sc,nb+1);
     for(int d=0;d<D;d++){ float a=0; for(int e=0;e<=nb;e++) a+=sc[e]*v[e][d]; out[d]=a; }
+    g_resmix_secs+=now_s()-rm0;
 }
 
 /* ---------- KDA layer (chunk of C tokens; projections batched, recurrence
@@ -1278,17 +1284,23 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
          * (11% of total) for 2.5 MFLOP of real work -- ~550us of barrier per
          * region. Even at world=1 (pn=12288, ~120us serial) one fork/join
          * costs more than the whole loop. */
+        /* The window used to be shifted down by one every token: K-1 float
+         * moves per channel, 3 tensors x pn channels x 69 layers. K is a power
+         * of two, so a rotating head indexes the same values in the same order
+         * with no moves at all -- bit-exact, and it touches fewer bytes rather
+         * than more (the rule the KV-decode hoist broke). */
+        int hh = m->cwh[li];
         for(int w2=0;w2<3;w2++){
             float *win=wins[w2], *vec=vecs[w2]; const float *cw=taps[w2];
             for(int d=p0;d<p0+pn;d++){
                 float *wd=win+(int64_t)d*K;
-                for(int j=0;j<K-1;j++) wd[j]=wd[j+1];
-                wd[K-1]=vec[d];
+                wd[hh]=vec[d];                       /* newest overwrites oldest */
                 float acc=0; const float *cd=cw+(int64_t)d*K;
-                for(int j=0;j<K;j++) acc+=cd[j]*wd[j];
+                for(int j=0;j<K;j++) acc+=cd[j]*wd[(hh+1+j)&(K-1)];
                 vec[d]=siluf_(acc);
             }
         }
+        m->cwh[li]=(int8_t)((hh+1)&(K-1));
         m->t_kconv+=now_s()-kc0;
         double kh0=now_s();
         #pragma omp parallel for schedule(static)
@@ -1441,7 +1453,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
             int rbase=h*(c->qk_nope+vh);
             float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
-            float *sc=falloc(nt);
+            float scbuf[512]; float *sc = (nt<=512) ? scbuf : falloc(nt);
             for(int t=0;t<nt;t++){
                 const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
                 float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*kv_dec(Lt[i]);
@@ -1454,7 +1466,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                 const kvq *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
                 for(int i=0;i<kvl;i++) clat[i]+=s2*kv_dec(Lt[i]);
             }
-            free(sc);
+            if(nt>512) free(sc);
             float *cx=ctxt+(int64_t)h*vh;
             for(int d=0;d<vh;d++)
                 cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
@@ -2188,6 +2200,7 @@ static void model_state_reset(Model *m){
     for(int i=0;i<c->n_layers;i++){
         if(m->L[i].kda){
             memset(m->kstate[i],0,(size_t)c->kda_heads*c->kda_hd*c->kda_hd*sizeof(float));
+            m->cwh[i]=0;
             memset(m->cwq[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
             memset(m->cwk[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
             memset(m->cwv[i],0,(size_t)c->kda_proj*c->conv_k*sizeof(float));
@@ -2274,7 +2287,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double dkpr0=m->t_kproj, dkc0=m->t_kconv, dkh0=m->t_khead, dko0=m->t_kout;
     double dcj0=m->t_ctljoin, dcw0=g_ctl_secs;
     double dnk0=m->t_net_kda, dnm0=m->t_net_mla, dnx0=m->t_net_moe;
-    double dcs0=g_ctl_start;
+    double dcs0=g_ctl_start, drm0=g_resmix_secs;
     double dmpr0=m->t_mproj, dmc0=m->t_mcache, dma0=m->t_matt, dmo0=m->t_mout;
     double dnet0=k3_net_secs(); uint64_t dnc0=k3_net_calls();
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
@@ -2335,7 +2348,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            "router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
            "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f "
            "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f ctlwork=%.3f ctljoin=%.3f "
-           "netkda=%.3f netmla=%.3f netmoe=%.3f ctlstart=%.3f\n",
+           "netkda=%.3f netmla=%.3f netmoe=%.3f ctlstart=%.3f resmix=%.3f\n",
            m->t_attn-da0,m->t_moe-de0,m->t_eload-dd0,m->t_head-dh0,
            k3_net_secs()-dnet0,(unsigned long long)(k3_net_calls()-dnc0),
            m->t_router-dr0,m->t_topk-dtop0,m->t_latent-dl0,
@@ -2343,7 +2356,8 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            m->t_kproj-dkpr0,m->t_kconv-dkc0,m->t_khead-dkh0,m->t_kout-dko0,
            m->t_mproj-dmpr0,m->t_mcache-dmc0,m->t_matt-dma0,m->t_mout-dmo0,
            g_ctl_secs-dcw0,m->t_ctljoin-dcj0,
-           m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0,g_ctl_start-dcs0);
+           m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0,g_ctl_start-dcs0,
+           g_resmix_secs-drm0);
     fflush(stdout);
 }
 

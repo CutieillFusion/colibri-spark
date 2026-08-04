@@ -288,6 +288,33 @@ Measured: `head` **0.508 -> 0.150 s/100 tokens**, collectives 18315 -> 18414 per
 because only the slice needs mirroring. End to end **3.797/3.850 -> 3.914/3.906
 tok/s**, output byte identical.
 
+### Two CPU terms were algorithmic, not numerical
+
+Both found by reading the code behind PROF2 terms rather than by profiling --
+neither has a kernel, a collective or a bandwidth story, so nsys could not point
+at either.
+
+**The depthwise conv window was memmoved every token.** `kda_forward` kept a
+K=4 window per channel oldest-first and shifted it down by one each token:
+K-1 float moves per channel, three tensors x pn channels x 69 layers. K is a
+power of two, so a rotating write head indexes the same values in the same
+order with no moves at all. `kconv` **1.103 -> 0.200 s/100 tokens (5.5x)**.
+
+That is far more than the moves themselves cost. The shift was a
+read-modify-write over the window (147 KB per layer, read AND written) and it
+serialised the loop body, which blocked vectorisation of the tap dot that
+follows. Removing it fixed all three.
+
+**`matt` malloc'd its score buffer per head per token** -- 576 allocations per
+token for `nt <= 512` floats. A stack buffer removes them.
+
+Together with the top-16 selection fix these took decode from 3.913/3.897 to
+**4.084/4.079 tok/s**, all byte-identical.
+
+The rule that predicted which of these would work: remove computation WITHOUT
+increasing the bytes touched. The KV-decode hoist broke it (traded 2-byte reads
+for 4-byte reads) and lost; these three respect it and won.
+
 ### Routed-expert selection was O(K^2 * E)
 
 `moe_forward` picked the top-16 of 896 experts by running K passes over all E
