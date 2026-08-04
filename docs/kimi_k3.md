@@ -288,6 +288,39 @@ Measured: `head` **0.508 -> 0.150 s/100 tokens**, collectives 18315 -> 18414 per
 because only the slice needs mirroring. End to end **3.797/3.850 -> 3.914/3.906
 tok/s**, output byte identical.
 
+### The only CPU work that can currently move to the GPU
+
+`mla_forward`'s absorb GEMVs -- `w_addrow` building `qabs`, and `w_rowdot`
+producing the head output -- are pure MAC loops with **no transcendentals**, so
+unlike everything else on the CPU they can move to the GPU bit-exactly. The CPU
+order is reproducible with one thread per output element:
+
+* `w_addrow` (fmt 4): `acc[i] += (scl[r][g] * coef) * (nibble - 8)`, outer
+  accumulation over rows in increasing order.
+* `w_rowdot` (fmt 4): per group `ga = sum x[i]*(nibble-8)` in pairs, then
+  `a += ga * scl[g]`.
+
+Two things make this work where the control projections failed. Parallelism:
+batching all heads gives `mhn * kvl` = 12288 threads for `qabs`, against the
+control's 152 rows which could only fill five warps. And round trips: per-head
+calls would be 576 per token and eat the gain, so all heads go in one launch --
+two per layer.
+
+Measured `matt` 0.896 -> 0.849 s/100 tokens, end to end 4.299/4.285 ->
+4.313/4.308, output byte-identical. The gain is much smaller than the
+arithmetic suggests because 48 launches per token cost ~0.5 ms, which offsets
+most of what the absorb saved.
+
+**Why nothing else can follow it.** Every other CPU term contains a
+transcendental -- `expf` in SiLU, SiTU, the softmaxes and the KDA decay gate --
+and CUDA's `expf`/`tanhf` differ from glibc's in the last ulp. On this model
+that is not a small difference: the fused SiTU kernel is correct to 1.46e-11 in
+isolation and 5.96e-07 in-engine, and still moves **27% of expert selections**,
+giving PCC 0.873 and 54.7% top-1 agreement. Top-16-of-896 routing amplifies a
+ulp perturbation into a different computation over 92 layers. So under a
+PCC >= 0.9999 bar, anything upstream of the router is effectively pinned to the
+CPU by arithmetic, not by engineering.
+
 ### Two CPU terms were algorithmic, not numerical
 
 Both found by reading the code behind PROF2 terms rather than by profiling --
