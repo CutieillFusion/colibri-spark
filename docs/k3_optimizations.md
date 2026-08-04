@@ -70,6 +70,13 @@ Two more facts that shape the list:
 - [x] ~~Bounded spin before `poll()` in the collective~~ — inside noise
 - [x] ~~Device mirrors for expert slots~~ — 145.7 vs 148.3 GB/s, no effect
 - [x] ~~CUDA graphs~~ — launches are 1.3% of wall; topology is data-dependent
+- [x] ~~Hoisting the MLA KV decode out of the per-head loop~~ — bf16 `kv_dec`
+      looked ~48x redundant (Lt does not depend on the head, and it is decoded
+      twice per head). Decoding once into f32 scratch measured WORSE: `matt`
+      0.836 -> 0.903, end to end 3.944/3.940 against 3.957/3.968. Those loops
+      are bound by KV memory traffic, not decode instructions, so replacing
+      2-byte reads with 4-byte reads costs more than the shifts saved. bf16 KV
+      is a bandwidth optimisation and decoding on the fly is correct.
 
 ## Not bit-exact — REQUIRES `tools/k3_quality.py`
 
