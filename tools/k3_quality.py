@@ -49,17 +49,23 @@ TH = {
     # Distributional distance at temperature 1.
     "kl_mean_max":         1.0e-4,
     "kl_max_max":          1.0e-2,
-    # MoE-specific: fraction of (layer, token) top-16 expert SETS unchanged.
-    # A routing change is a different computation even when text looks fine.
+    # MoE-specific: K3_ROUTE_STATS writes a [n_layers x n_experts] uint32
+    # histogram of how often each expert was selected. If routing is unchanged
+    # the two histograms are IDENTICAL, so this is the fraction of bins that
+    # match exactly -- a strict check that any reordering of borderline experts
+    # will move. Text can look fine while this drops.
     "expert_agree_min":    0.99,
     # Free-running: mean tokens generated before the first divergence from the
     # baseline completion, as a fraction of the completion length. 1.0 means
     # identical output.
     "gen_first_div_min":   0.90,
-    # Degeneracy guards -- these catch a "passing" change that has actually
-    # collapsed the model, which agreement metrics alone can miss.
-    "max_repeat_4gram":    0.15,   # fraction of 4-grams that are repeats
-    "min_distinct_tokens": 0.25,   # distinct/total token ratio
+    # Degeneracy guards, RELATIVE to the baseline. An absolute bound is wrong
+    # here and is a reward-hacking hazard: prompt 4 of the fixed set repeats at
+    # 0.267 in the BASELINE, so an absolute 0.15 flags the prompt rather than a
+    # regression, and the tempting fix is to loosen the number until it passes.
+    # The honest question is whether the candidate is materially WORSE.
+    "repeat_worse_max":    0.05,   # cand_repeat - base_repeat
+    "distinct_worse_max":  0.05,   # base_distinct - cand_distinct
 }
 
 def load_logits(d):
@@ -77,7 +83,7 @@ def load_gens(d):
     return out
 
 def load_routes(d):
-    p = os.path.join(d, "routes.bin")
+    p = os.path.join(d, "routes.bin")   # K3_ROUTE_STATS histogram
     if not os.path.exists(p): return None
     return np.fromfile(p, dtype=np.uint32)
 
@@ -146,21 +152,24 @@ def score(base, cand, label="candidate"):
     gb, gc = load_gens(base), load_gens(cand)
     common = sorted(set(gb) & set(gc))
     if common:
-        fracs, reps, dists = [], [], []
+        fracs, dreps, ddists, ident = [], [], [], 0
         for kx in common:
             a, b = gb[kx].split(), gc[kx].split()
+            if gb[kx] == gc[kx]: ident += 1
             m = min(len(a), len(b)); i = 0
             while i < m and a[i] == b[i]: i += 1
             fracs.append(i / max(1, len(a)))
-            r, dv = degeneracy(gc[kx]); reps.append(r); dists.append(dv)
+            rb_, db_ = degeneracy(gb[kx]); rc_, dc_ = degeneracy(gc[kx])
+            dreps.append(rc_ - rb_); ddists.append(db_ - dc_)
         res["gen_prompts"] = len(common)
+        res["gen_identical"] = ident
         res["gen_first_div"] = float(np.mean(fracs))
         res["gen_first_div_worst"] = float(np.min(fracs))
-        res["max_repeat_4gram"] = float(np.max(reps))
-        res["min_distinct"] = float(np.min(dists))
+        res["repeat_worse"] = float(np.max(dreps))
+        res["distinct_worse"] = float(np.max(ddists))
         checks.append(("gen_first_div", res["gen_first_div"], TH["gen_first_div_min"], "min"))
-        checks.append(("max_repeat_4gram", res["max_repeat_4gram"], TH["max_repeat_4gram"], "max"))
-        checks.append(("min_distinct", res["min_distinct"], TH["min_distinct_tokens"], "min"))
+        checks.append(("repeat_worse", res["repeat_worse"], TH["repeat_worse_max"], "max"))
+        checks.append(("distinct_worse", res["distinct_worse"], TH["distinct_worse_max"], "max"))
     else:
         res["gen_prompts"] = 0
         print("WARNING: no free-running completions found; teacher-forced only.")
@@ -168,8 +177,21 @@ def score(base, cand, label="candidate"):
 
     print(f"=== quality scorecard: {label} ===")
     print(f"  teacher-forced positions : {res['positions']}")
-    print(f"  free-running prompts     : {res['gen_prompts']}")
-    print(f"  bit-identical            : {res['bit_identical']}")
+    print(f"  free-running prompts     : {res['gen_prompts']}"
+          + (f"  ({res['gen_identical']} identical)" if res['gen_prompts'] else ""))
+    print(f"  logits bit-identical     : {res['bit_identical']}")
+    # COVERAGE. If the teacher-forced logits are identical but the generations
+    # are not, the change is decode-only and every teacher-forced criterion
+    # below is VACUOUS -- it passed by measuring nothing. Say so loudly rather
+    # than banking those PASSes.
+    if res["bit_identical"] and res.get("gen_prompts") and res["gen_identical"] < res["gen_prompts"]:
+        res["tf_vacuous"] = True
+        print("  !! COVERAGE: teacher-forced logits are IDENTICAL while generations")
+        print("     differ -- the change is decode-only and the teacher-forced")
+        print("     criteria below measured NOTHING. Fix the capture to exercise")
+        print("     the changed path; do not accept on these numbers.")
+    else:
+        res["tf_vacuous"] = False
     print("  --- diagnostics (not pass/fail) ---")
     print(f"  PCC                      : {res['pcc']:.9f}")
     print(f"  max |dlogit|             : {res['max_abs_dlogit']:.6e}")
@@ -182,6 +204,9 @@ def score(base, cand, label="candidate"):
               f"({'>=' if sense=='min' else '<='} {bound})")
     if res.get("expert_agree") is None:
         print("  WARN  expert_agree        not captured (set K3_ROUTE_STATS)")
+    if res.get("tf_vacuous"):
+        ok = False
+        print("  FAIL  coverage           teacher-forced portion did not observe the change")
     print(f"  RESULT: {'PASS' if ok else 'FAIL'}")
     return ok, res
 

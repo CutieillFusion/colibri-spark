@@ -74,9 +74,21 @@ Two more facts that shape the list:
 Ordered by risk-adjusted value: activation-only ulp differences first, routing
 last. Each must be landed and gated SEPARATELY so a failure is attributable.
 
-- [ ] **1. SiTU fused into the shared-expert GPU epilogue** (~10 ms/token)
-      Risk: LOW. `tanhf`/`expf` ulp only, in activations. The routed-expert
-      kernel already fuses SiTU on the GPU, so the construction exists.
+- [~] **1. SiTU fused into the shared-expert GPU epilogue** (~10 ms/token)
+      ATTEMPTED, REVERTED — speedup real, quality gate FAILED, cause not yet
+      explained. Speed: **4.001/3.995 against 3.903/3.898 (+2.5%)**, `shared`
+      4.310 -> 3.477 s/100 with `netmoe` 1.013 -> 1.302 (a faster shared expert
+      exposes more of the collective it was hiding, so ~3 ms of the ~10 comes
+      back). Quality: teacher-forced **top-1 agreement 54.7%**, max |dlogit|
+      **11.4** — orders of magnitude beyond a `tanhf`/`expf` ulp difference, so
+      this is a BUG, not the expected precision cost.
+      Next step: the S==1 and S>1 paths behave differently. Free-running
+      (S==1 only) diverged mildly (`gen_first_div` 0.81, consistent with ulp
+      effects compounding), while prefill (S>1, the loop added for gate
+      coverage) diverged massively. Suspect the S>1 loop over tokens rather
+      than the kernel. Verify the fused result against
+      `w_matmul`+`situf_` elementwise at S=1 and S=64 separately before
+      retrying.
 - [ ] **2. KDA conv + SiLU on the GPU** (~8 ms/token)
       Risk: LOW-MED. `expf` ulp. Small work per launch, so it must be fused
       with a neighbour rather than launched alone.
