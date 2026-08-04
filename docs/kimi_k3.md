@@ -449,6 +449,44 @@ printed -- the mirror report for placement, the harness echo for forwarding --
 and `scratchpad/deploy.sh` refuses to finish unless all four nodes report the
 same binary hash.
 
+### kproj runs at half the bandwidth of shared, and three hypotheses do not explain it
+
+Computing achieved bandwidth per term from the profile and the tensor sizes:
+
+| term | bytes/token | ms/token | achieved |
+|---|---|---|---|
+| shared | 7.67 GB | 42.7 | 180 GB/s |
+| kproj | 3.80 GB | 32.9 | **115 GB/s** |
+| lm_head (measured earlier, same kernel) | -- | -- | 234.5 GB/s |
+
+The same kernel reaches 234.5 GB/s on lm_head, 180 on the 27 MB shared-expert
+matrices and 115 on the 13.75 MB projections, which looks exactly like a fixed
+cost per launch. It is not. Three hypotheses, each falsified by measurement:
+
+* **Round trips.** `K3_FUSE_QKVG` concatenates q/k/v/g so four launches and four
+  x-uploads per layer become one -- 207 fewer round trips per token. It was a
+  wash before mirroring and is still a wash after: 4.248/4.240 against
+  4.258/4.252, with kproj moving 3.285 -> 3.329 s/100, the wrong way.
+* **Memory contention with the control thread.** GB10 shares one memory
+  controller between CPU and GPU, and the control streams 409 MB/token on six
+  cores while kproj runs. But dropping to four control threads made kproj
+  *worse* (3.423), not better.
+* **CPU descheduling.** Twenty cores carry ten OpenMP workers plus six control
+  workers, so `t_kproj` might be measuring the main thread losing its core
+  rather than GPU work. Turning the overlap off entirely made kproj *worse
+  again* (4.941 vs 3.285) while `ctlwork` stayed at 2.765 -- the control thread
+  running alongside makes kproj faster, not slower.
+
+Every remaining hypothesis needs per-kernel counters: achieved occupancy, DRAM
+throughput, and the stall reason. `ncu` is installed at
+/usr/local/cuda/bin/ncu and is wired into `k3drive.py` behind `NCU=1`, but it
+fails with **ERR_NVGPUCTRPERM** -- GPU performance counters are restricted to
+administrators, and there is no passwordless sudo on these nodes. Enabling them
+needs a root-owned line in /etc/modprobe.d
+(`options nvidia NVreg_RestrictProfilingToAdminUsers=0`) and a module reload.
+Until that exists, the dense kernel cannot be diagnosed further, and it is the
+largest single term in the token.
+
 ### The chip is power-capped, which changes what "optimization" means
 
 `nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours

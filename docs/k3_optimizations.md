@@ -55,6 +55,9 @@ Two more facts that shape the list:
 - [ ] REJECTED: shard the replicated shared experts -- compute saving 0.2 ms/layer
       vs 1.18 ms/layer for the added collective; 4.33 -> 2.92 tok/s
 - [ ] REJECTED: pinned staging for activation vectors -- wash on unified memory
+- [ ] REJECTED (retest): K3_FUSE_QKVG with mirrors on -- still a wash, 4.248 vs 4.258
+- [ ] BLOCKED: dense kernel diagnosis needs ncu; ERR_NVGPUCTRPERM, needs root
+      `options nvidia NVreg_RestrictProfilingToAdminUsers=0` + module reload
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to
       pin -ffp-contract=off for the conv loop or re-baseline the reference
 - [x] MLA absorb GEMVs moved to the GPU, BIT-EXACT (`matt` 0.896 -> 0.849) — the
