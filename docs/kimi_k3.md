@@ -259,6 +259,35 @@ part's **235 GB/s** achievable read bandwidth (measured; 273 GB/s theoretical â€
 note `cudaDevAttrMemoryClockRate` reports LPDDR5X's 8533 MT/s data rate, so
 doubling it overstates peak by 2x). `lat_up` already reaches 94%.
 
+### The lm_head was replicated; greedy decode only needs the argmax
+
+`lm_head` is [vocab 163840, hidden 7168] and every rank computed ALL of it --
+1.17 GB and, after the 4-wide fold and mirrors, still 5.1 ms/token done four
+times over. Greedy sampling needs only the argmax, so each rank takes a
+contiguous row slice and the ranks agree on a winner with **one collective per
+token**, not per layer.
+
+Exactness has two parts. Row o's dot does not depend on any other row, so a
+slice produces the same values as the replicated computation. And `sample_tok`'s
+greedy rule is `if(lo[i] > lo[b])` -- strict, so the FIRST index wins ties; a
+rank's local scan uses the same strict compare, and scanning ranks in ascending
+order preserves it globally because the slices are ascending and contiguous.
+The reduction is a zero-filled sum used as a gather: each rank writes only its
+own (value, index) slot, so the sum IS the gather, and 163840 is exact in f32.
+
+`temp > 0` needs the whole vector for softmax and top-p, and `K3_LOGITS` and the
+trace dump need it too, so those keep the full head; the caller sets
+`head_greedy` from the request before `forward`.
+
+The slice view is cached in the Model. Rebuilding it per token would reset its
+registration and device mirror every time, the same trap the KDA `sh_ready`
+views avoid.
+
+Measured: `head` **0.508 -> 0.150 s/100 tokens**, collectives 18315 -> 18414 per
+100 tokens (one more per token, as expected), mirror footprint 16.95 -> 16.06 GB
+because only the slice needs mirroring. End to end **3.797/3.850 -> 3.914/3.906
+tok/s**, output byte identical.
+
 ### Both major GEMV paths are now at their memory walls
 
 Probes that hold the memory pattern fixed and vary the work, run COLD (cycling

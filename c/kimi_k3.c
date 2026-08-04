@@ -213,6 +213,12 @@ typedef struct {
     Layer *L;
     float *final_norm, *out_sw;
     W lm_head;
+    /* Row slice of lm_head this rank owns when the head is sharded. Cached:
+     * building the view per token would reset its registration and device
+     * mirror every time. */
+    W lm_head_shard; int lm_head_shard_ready;
+    int head_greedy;                  /* caller's temp<=0, set before forward */
+    int head_tok;                     /* set when the sharded path ran; else -1 */
     int has_head;
     Slot ws[64];                          /* working set: parallel loads land here,
                                            * then swap into the layer LRU */
@@ -1934,6 +1940,7 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
         }
     }
     float *logits=NULL;
+    m->head_tok=-1;
     if(m->has_head){
         double t0=now_s();
         for(int t=0;t<C;t++){
@@ -1943,6 +1950,49 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
             res_mix(mix,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
             rmsnorm_(mix,mix,m->final_norm,D,c->eps);
             if(m->trace) fwrite(mix,sizeof(float),D,m->trace);
+            /* lm_head is [vocab, hidden] and every rank computed ALL of it --
+             * 1.17 GB and 5.1 ms/token replicated four ways. Greedy sampling
+             * only needs the argmax, so each rank can take a contiguous row
+             * slice and the ranks then agree on a winner with ONE collective
+             * per token (not per layer).
+             *
+             * Exact: row o's dot is independent of the other rows, so the
+             * values match the replicated computation. sample_tok's greedy rule
+             * is `if(lo[i]>lo[b])`, i.e. first index wins ties; a rank's local
+             * scan uses the same strict >, and scanning ranks in ascending
+             * order preserves it globally because the slices are ascending and
+             * contiguous.
+             *
+             * temp>0 needs the whole vector for softmax/top-p, and K3_LOGITS
+             * and the trace dump need it too, so those keep the full head. */
+            int hw = k3_net_world();
+            int shard = hw>1 && m->head_greedy && !g_lfp && !m->trace && t==C-1;
+            if(shard){
+                int V=c->vocab, per=(V+hw-1)/hw, rk=k3_net_rank();
+                int v0=rk*per; if(v0>V) v0=V;
+                int vn=V-v0; if(vn>per) vn=per;
+                if(!m->lm_head_shard_ready){
+                    m->lm_head_shard=w_rows(&m->lm_head,v0,vn>0?vn:1);
+                    m->lm_head_shard_ready=1;
+                }
+                float bv=-INFINITY; int gi=v0;
+                if(vn>0){
+                    float *part=falloc(vn);
+                    w_matmul(part,mix,&m->lm_head_shard,1);
+                    int bi=0; for(int i=1;i<vn;i++) if(part[i]>part[bi]) bi=i;
+                    bv=part[bi]; gi=v0+bi;
+                    free(part);
+                }
+                /* zero-filled sum IS a gather: each rank writes only its slot */
+                float red[2*K3_NET_MAX]; memset(red,0,sizeof(red));
+                red[2*rk]=bv; red[2*rk+1]=(float)gi;
+                k3_net_allreduce(red,(size_t)2*hw);
+                int best=(int)red[1]; float bestv=red[0];
+                for(int i=1;i<hw;i++) if(red[2*i]>bestv){ bestv=red[2*i]; best=(int)red[2*i+1]; }
+                m->head_tok=best;
+                logits=NULL;
+                continue;
+            }
             float *lo=falloc(c->vocab);
             w_matmul(lo,mix,&m->lm_head,1);
             if(g_lfp) fwrite(lo,sizeof(float),(size_t)c->vocab,g_lfp);
@@ -2196,6 +2246,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;
     uint64_t hit0=m->hits, miss0=m->miss;
     float *lo=NULL;
+    m->head_greedy = (q->temp <= 0.f);
     for(int i=0;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
         free(lo); lo=step_chunk(m,ids+i,i,C);
@@ -2216,7 +2267,8 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     char buf[512], xtag[64];
     double tg=now_s();
     for(int s=0;s<q->max_tok&&!cancelled;s++){
-        int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
+        int tk = (m->head_tok>=0) ? m->head_tok
+                               : sample_tok(lo,m->c.vocab,q->temp,q->top_p);
         free(lo); lo=NULL;
         int eos=0; for(int i=0;i<m->c.n_eos;i++) if(tk==m->c.eos[i]) eos=1;
         int show=!eos;
@@ -2413,6 +2465,7 @@ int main(int argc, char **argv){
         fprintf(stderr,"[K3] K3_TRACE set: prefill chunk forced to 1\n");
     }
     double t0=now_s(); float *lo=NULL;
+    m.head_greedy = (temp <= 0.f);
     for(int i=0;i<np;i+=chunk){
         int Cc=np-i<chunk?np-i:chunk;
         if(lo) free(lo);
@@ -2434,7 +2487,7 @@ int main(int argc, char **argv){
     int xsup=0, xopen=0; char xtag[64]; int xtl=0;
     if(chat&&think){ printf("[think] "); fflush(stdout); }
     for(int s=0;s<ngen;s++){
-        int t=sample_tok(lo,m.c.vocab,temp,1.f);
+        int t = (m.head_tok>=0) ? m.head_tok : sample_tok(lo,m.c.vocab,temp,1.f);
         free(lo); lo=NULL;
         int is_eos=0; for(int e=0;e<m.c.n_eos;e++) if(t==m.c.eos[e]) is_eos=1;
         int show=1;
