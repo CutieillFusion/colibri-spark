@@ -637,10 +637,29 @@ attempts confirm it is not a parallelism problem:
 | OMP=12 | 3.673 / 3.677 | 3.763 |
 | OMP=10, `GOMP_SPINCOUNT=0` | 3.740 / 3.733 | 3.433 |
 
-More threads make the control *slower*, which is the signature of a
-bandwidth-bound region. Passive waiting hurts everything else too (`khead`
-0.609 -> 1.218). The only remaining lever on this term is fewer bytes, i.e. the
-stored precision of `f_a`/`f_b`/`b_proj` -- a numerics change, not an exact one.
+More threads make the control *slower*. That was read as a bandwidth-bound
+region, and the conclusion drawn -- that the only lever left was fewer bytes,
+i.e. stored precision -- was **wrong**.
+
+The right reading is that this region runs on a pthread created fresh for every
+KDA layer, so its OpenMP team is CONSTRUCTED FROM SCRATCH 69 times per token,
+and construction scales with the worker count while the work is bandwidth-bound.
+So the correct move is FEWER workers, not more, and there is a clear optimum:
+
+| control workers | warm tok/s | `ctljoin` |
+|---|---:|---:|
+| 4 | 3.600 / 3.656 | 1.181 |
+| **6 (default)** | **4.279 / 4.279** | **1.006** |
+| 8 | 4.198 / 4.196 | 1.541 |
+| 10 (ambient) | 4.084 / 4.079 | 2.183 |
+
+`ctljoin` **2.183 -> 1.006** and `kproj` 4.399 -> 3.272 s/100 tokens. Bit-exact:
+each output row is still summed sequentially by a single thread, so the worker
+count cannot change a value. Passive waiting (`GOMP_SPINCOUNT=0`) still hurts
+everything else (`khead` 0.609 -> 1.218) and is unrelated.
+
+The lesson: "more threads made it slower" has two very different explanations,
+and picking the wrong one closed off a 5% win for several iterations.
 
 ### The KDA control's cost is contention, not thread churn
 

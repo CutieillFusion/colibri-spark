@@ -283,8 +283,31 @@ typedef struct {
     int hidden, hd, p0, pn, h0, hn;
 } KdaCtrlJob;
 
+/* Worker count for the control region ONLY.
+ *
+ * This runs on a pthread created fresh each KDA layer, so its OpenMP team is
+ * built from scratch 69 times per token -- and team construction scales with
+ * the worker count while the work itself is bandwidth-bound. That is why 18 and
+ * 12 workers both measured SLOWER here than 10, which looks paradoxical until
+ * you read it as creation cost rather than contention. Fewer, larger slices
+ * therefore beat more workers, and there is a clear optimum:
+ *
+ *   workers  4      6      8      10 (ambient)
+ *   tok/s    3.63   4.28   4.20   4.08
+ *   ctljoin  1.181  1.006  1.541  2.183
+ *
+ * Six is the peak -- below that the region is genuinely too narrow and the
+ * work itself dominates. Bit-exact either way: each output row is still summed
+ * sequentially by a single thread. */
+static int k3_ctl_threads(void){
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("K3_CTL_THREADS"); n = e ? atoi(e) : 6; if (n < 1) n = 6; }
+    return n;
+}
+
 static void kda_control_b1(KdaCtrlJob *j){
-    #pragma omp parallel
+    int nt_ = k3_ctl_threads();
+    #pragma omp parallel num_threads(nt_ > 0 ? nt_ : omp_get_max_threads())
     {
         #pragma omp for schedule(static)
         for(int o=0;o<j->hd+j->hn;o++){

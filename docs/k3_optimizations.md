@@ -46,6 +46,7 @@ Two more facts that shape the list:
 - [x] Top-16 expert selection O(K^2*E) -> O(K*E) (`topk` 0.436 -> 0.085 s/100) — 3.913 -> 3.957
 - [x] Rotating conv window instead of a per-token memmove (`kconv` 1.103 -> 0.200 s/100, 5.5x) — 3.982 -> 4.084
 - [x] `matt` score buffer on the stack, not malloc'd per head per token
+- [x] Control region sized to 6 workers, not the ambient 10 (`ctljoin` 2.183 -> 1.006) — 4.084 -> 4.279
 
 - [x] Exact int8 GEMV folded onto 128 threads (`dee7fd0`) — 3.238 -> 3.296
 - [x] 32-way shared-memory bank conflict in the 1-bit expert GEMV (`18fb60e`) — 3.296 -> 3.510
@@ -68,7 +69,7 @@ Two more facts that shape the list:
 - [x] ~~Control inline under deferred GEMVs~~ — `khead` and `netkda` regress
 - [x] ~~Deferred GEMV sync alone~~ — neutral; one stream, back-to-back anyway
 - [x] ~~Parallelising SiTU / `res_mix` / `out+=sd`~~ — omp region costs ~58 us in-engine
-- [x] ~~More control threads (18) / dynamic schedule~~ — bandwidth-bound
+- [x] ~~More control threads (18) / dynamic schedule~~ — but FEWER (6) is a large win, see above
 - [x] ~~`OMP_NUM_THREADS`=12, `GOMP_SPINCOUNT`=0~~ — both worse
 - [x] ~~Bounded spin before `poll()` in the collective~~ — inside noise
 - [x] ~~Device mirrors for expert slots~~ — 145.7 vs 148.3 GB/s, no effect
