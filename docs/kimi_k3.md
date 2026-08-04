@@ -359,6 +359,52 @@ What this changes going forward: free-running generation is the only gate that
 covers decode, teacher-forced logits are a prefill-only instrument, and any
 future exactness claim has to name which of the two it was checked with.
 
+### A per-layer collective costs 1.18 ms, and that governs what is worth doing
+
+The shared experts and the latent projections are loaded with `w_load`, not
+`w_load_rows`, so unlike the attention projections they are **replicated on
+every rank**. All four ranks log `shared=4.27` and `latent=1.59` s/100 -- the
+signature of four machines computing the same answer. That is 58.6 ms/token of
+4x redundant work on a 231 ms token, and sharding it looked like the single
+biggest remaining lever.
+
+It was implemented exactly: row-shard gate/up, run SiTU on the local slice
+before gathering (so three quarters of the `situf_` calls disappear too), then
+gather with an allreduce over disjoint slices, which is bit-exact because every
+element is contributed by one rank and summed against zeros.
+
+The compute did exactly what it should. `shared` fell to ~24 ms/token of real
+work. But `netmoe` went from 0.947 to **10.991 s/100**, and end-to-end fell from
+4.327/4.306 to 2.919/3.370.
+
+| | compute saved | collective added |
+|---|---|---|
+| per layer | ~0.2 ms | **~1.18 ms** |
+| per token (93 layers) | ~19 ms | ~110 ms |
+
+So the replication is not an oversight -- it is the cheaper side of a trade the
+fabric dictates. **A blocking collective on this topology costs about 1.18 ms,
+so any change that adds one per layer has to save more than 1.18 ms per layer
+to break even.** Sharding the shared experts offers 0.2. Nothing else in the
+per-layer budget is anywhere near 1.18 ms either, which rules out the whole
+family of "shard the replicated thing" optimizations below the lm_head level --
+lm_head works precisely because it is once per token, not once per layer.
+
+### Pinned staging for the activation vectors: no gain
+
+nsys over a 30 s steady-state window shows 65,419 host-to-device and 65,419
+device-to-host transfers averaging 28 KB, doing 208 ms of actual DMA between
+them while the memcpy API calls consume 12 seconds. That is a 98% overhead
+ratio and the classic pageable-memory signature -- the weights are registered
+but the activations are `falloc`'d scratch that changes address every call.
+
+Staging both directions through `cudaHostAlloc` buffers measured 4.304/4.314
+against 4.327/4.306: a wash. On GB10 the GPU reads the same physical LPDDR5X
+the CPU does, so pinning does not buy the DMA path it would on a discrete card,
+and with the GPU already idle ~76% the copy time was hidden anyway. Reverted.
+The lesson is that the 12 seconds of API time is not 12 seconds of critical
+path, and `cuda_api_sum` alone cannot tell you which.
+
 ### The chip is power-capped, which changes what "optimization" means
 
 `nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours

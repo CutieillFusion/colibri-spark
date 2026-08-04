@@ -51,6 +51,9 @@ Two more facts that shape the list:
 - [x] 4-wide fold confirmed: worth +6.5%, but ONLY with mirrors on
 - [ ] REVERTED: MLA absorb on GPU (fb898f3) -- +0.4% is inside noise
 - [ ] REVERTED: KDA control part 2 on GPU -- dead wash, 3.877/3.888 vs 3.877/3.883
+- [ ] REJECTED: shard the replicated shared experts -- compute saving 0.2 ms/layer
+      vs 1.18 ms/layer for the added collective; 4.33 -> 2.92 tok/s
+- [ ] REJECTED: pinned staging for activation vectors -- wash on unified memory
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to
       pin -ffp-contract=off for the conv loop or re-baseline the reference
 - [x] MLA absorb GEMVs moved to the GPU, BIT-EXACT (`matt` 0.896 -> 0.849) — the
