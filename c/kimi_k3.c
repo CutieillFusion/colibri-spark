@@ -602,32 +602,6 @@ static W w_concat4(const W *a, const W *b, const W *c, const W *d, int r0, int n
 }
 
 /* ---------- W: load-time quantization + matvec ---------- */
-#ifdef COLI_CUDA
-/* Register + mirror a tensor for the exact k3 kernels, reusing the same lazily
- * built mirrors w_matmul uses so a kernel that needs a tensor outside w_matmul
- * cannot diverge from it. */
-static int w_k3_ptrs(const W *w, const void **blob, const float **sc){
-    if(!g_k3_cuda || !g_k3_dense_gpu || w->k3_dense_off) return 0;
-    W *mw=(W*)w;
-    int64_t rb=(w->fmt==4)?((int64_t)w->I+1)/2:(int64_t)w->I;
-    int64_t nsc=(w->fmt==4)?((int64_t)w->I+w->gs-1)/w->gs:1;
-    if(!mw->k3_reg){
-        if(coli_k3_register((void*)w_blob(w),(size_t)w->O*rb) &&
-           coli_k3_register(w->s,(size_t)w->O*nsc*sizeof(float))) mw->k3_reg=1;
-        else { mw->k3_dense_off=1; return 0; }
-    }
-    if(!mw->k3_dev_tried){
-        void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
-        if(dw){ void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
-                if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; } }
-        mw->k3_dev_tried=1;
-    }
-    *blob = mw->k3_dw ? (const void*)mw->k3_dw : w_blob(w);
-    *sc   = mw->k3_dw ? (const float*)mw->k3_ds : w->s;
-    return 1;
-}
-#endif
-
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_CUDA
     /* Zero-copy dense GEMV first: no upload and no duplicate of the weights,
@@ -1454,9 +1428,6 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
     int mh0=0, mh1=H;
     if(wsz>1){ int per=(H+wsz-1)/wsz; mh0=wrk*per; mh1=mh0+per; if(mh1>H) mh1=H; if(mh0>H) mh0=H; }
     int mhn=mh1-mh0;
-    int mhs = mhn>0 ? mhn : 1;
-    float *qcoef=falloc((int64_t)mhs*c->qk_nope), *qabs_all=falloc((int64_t)mhs*kvl);
-    float *clat_all=falloc((int64_t)mhs*kvl), *cx_all=falloc((int64_t)mhs*vh);
     if(wsz>1 && mhn>0 && !a->sh_ready){
         a->qbs=w_rows(&a->qb,0,mhn*qh);        /* already head-sliced at load */
         a->gs_=w_rows(&a->g, 0,mhn*vh);
@@ -1499,34 +1470,12 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
         int nt=pos0+tt+1;
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
         float *ctxt=ctx+(int64_t)tt*H*vh;
-        /* Absorb GEMVs on the GPU, batched across heads. BIT-EXACT: one thread
-         * per output element reproduces w_addrow's and w_rowdot's accumulation
-         * order. Unlike the control projections there is real parallelism --
-         * mhn*kvl = 12288 threads for qabs against the control's 152 rows --
-         * and batching keeps it to two round trips per layer instead of the
-         * 576 per token that per-head calls would cost. The softmax between
-         * them stays on the CPU; expf would not be exact. */
-        int rstride=c->qk_nope+vh, gpu_abs=0;
-#ifdef COLI_CUDA
-        const void *kb=NULL; const float *ks=NULL;
-        static int mabs=-1;
-        if(mabs<0){ const char *e=getenv("K3_MLA_ABSORB"); mabs=e?atoi(e):1; }
-        if(mabs && a->kvb.fmt==4 && mhn>0 && !omp_in_parallel() && w_k3_ptrs(&a->kvb,&kb,&ks)){
-            for(int hh=0;hh<mhn;hh++)
-                memcpy(qcoef+(int64_t)hh*c->qk_nope, qvt+(int64_t)(mh0+hh)*qh,
-                       (size_t)c->qk_nope*sizeof(float));
-            gpu_abs=coli_k3_mla_absorb(qabs_all,qcoef,kb,ks,0,mhn,c->qk_nope,kvl,
-                                       a->kvb.gs,rstride,mh0*rstride);
-        }
-#endif
         #pragma omp parallel for schedule(static)
         for(int h=mh0;h<mh1;h++){
             const float *qp=qvt+(int64_t)h*qh, *qrp=qp+c->qk_nope;
             int rbase=h*(c->qk_nope+vh);
-            float qabsbuf[4096]; float *qabs;
-            if(gpu_abs) qabs=qabs_all+(int64_t)(h-mh0)*kvl;
-            else { qabs=qabsbuf; memset(qabs,0,kvl*sizeof(float));
-                   for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs); }
+            float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
+            for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
             float scbuf[512]; float *sc = (nt<=512) ? scbuf : falloc(nt);
             for(int t=0;t<nt;t++){
                 const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
@@ -1541,25 +1490,10 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                 for(int i=0;i<kvl;i++) clat[i]+=s2*kv_dec(Lt[i]);
             }
             if(nt>512) free(sc);
-            if(gpu_abs) memcpy(clat_all+(int64_t)(h-mh0)*kvl,clat,(size_t)kvl*sizeof(float));
-            else {
-                float *cx=ctxt+(int64_t)h*vh;
-                for(int d=0;d<vh;d++)
-                    cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
-            }
+            float *cx=ctxt+(int64_t)h*vh;
+            for(int d=0;d<vh;d++)
+                cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
         }
-#ifdef COLI_CUDA
-        if(gpu_abs){
-            if(!coli_k3_mla_absorb(cx_all,clat_all,kb,ks,1,mhn,vh,kvl,
-                                   a->kvb.gs,rstride,mh0*rstride+c->qk_nope)){
-                fprintf(stderr,"[K3] MLA absorb rowdot failed\n"); exit(1); }
-            for(int hh=0;hh<mhn;hh++){
-                int h=mh0+hh; float *cx=ctxt+(int64_t)h*vh;
-                for(int d=0;d<vh;d++)
-                    cx[d]=cx_all[(int64_t)hh*vh+d]*sigmoidf_(gvt[(int64_t)h*vh+d]);
-            }
-        }
-#endif
     }
     m->t_matt+=now_s()-mt0; mt0=now_s();
     if(wsz>1 && mhn>0){
@@ -1574,7 +1508,6 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
         { double na=now_s(); k3_net_allreduce(out,(size_t)C*c->hidden); m->t_net_mla+=now_s()-na; }
     } else w_matmul(out,ctx,&a->o,C);
     m->t_mout+=now_s()-mt0;
-    free(qcoef);free(qabs_all);free(clat_all);free(cx_all);
     free(qa);free(qv);free(ckv);free(gv);free(ctx);
 }
 

@@ -73,12 +73,6 @@ int  coli_k3_gate_up_situ(float *gate, const float *x,
                           const void *w3p, const float *w3s,
                           int S, int I, int O, int gs, float beta1, float beta2);
 
-/* MLA absorb GEMVs, batched across heads. BIT-EXACT: reproduces w_addrow's and
- * w_rowdot's accumulation order with one thread per output element. */
-int  coli_k3_mla_absorb(float *out, const float *in, const void *q4,
-                        const float *scales, int mode, int nh, int nrow,
-                        int I, int gs, int rstride, int rbase0);
-
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus

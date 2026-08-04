@@ -979,8 +979,24 @@ extern "C" void coli_k3_devmirror_report(void) {
 extern "C" void *coli_k3_devmirror(const void *host, size_t bytes) {
     if (!g_ready || !host || !bytes) return nullptr;
     if (!g_devmir_init) {
+        /* Defaulting this to zero disabled mirroring entirely, which measured
+         * 3.86 tok/s against 4.28 with a budget set -- an 11% loss that stayed
+         * invisible because the speed harness never forwarded the variable.
+         * Auto-size instead: a fifth of what is free, capped, so the expert
+         * cache keeps the rest. Only ~16 GB is eligible on this sharding, so
+         * the cap is never reached and nothing is skipped for budget. */
         const char *e = getenv("K3_DENSE_DEV_GB");
-        double gb = e ? atof(e) : 0.0;
+        double gb;
+        if (e) gb = atof(e);
+        else {
+            size_t fb = 0, tb = 0;
+            /* A fifth of free was too tight: it placed 11.45 GB, skipped 4.16
+             * for budget, and reached only 4.21 tok/s against 4.28 with the
+             * whole eligible set mirrored. The eligible set is ~16 GB on this
+             * sharding, so take a third and cap at 24. */
+            gb = (cudaMemGetInfo(&fb, &tb) == cudaSuccess) ? (double)fb * 0.35 / 1e9 : 0.0;
+            if (gb > 24.0) gb = 24.0;
+        }
         g_devmir_left = (size_t)(gb * 1e9);
         g_devmir_init = 1;
         if (g_devmir_left)
@@ -1155,103 +1171,4 @@ extern "C" int coli_k3_gate_up_situ(float *gate, const float *x,
         if (!ck(cudaStreamSynchronize(g_stream), "situ sync")) return 0;
     }
     return 1;
-}
-
-/* ---------------- MLA absorb GEMVs (exact) --------------------------------
- * mla_forward builds `qabs` with w_addrow over qk_nope rows and produces the
- * head output with w_rowdot over v_head rows. Both are pure MAC loops -- no
- * transcendentals -- so unlike the SiTU fusion they can move to the GPU
- * BIT-EXACTLY, provided the CPU's order is reproduced:
- *
- *   w_addrow (fmt 4): acc[i] += (scl[r][g] * coef) * (nibble - 8), with the
- *   outer accumulation over rows r in increasing order.
- *   w_rowdot (fmt 4): per group ga = sum of x[i]*(nibble-8) in pairs, then
- *   a += ga * scl[g], groups in increasing order.
- *
- * One thread owns one output element, so each accumulation chain stays
- * sequential in a single thread. The control projections failed this test at
- * 152 rows; here all heads are batched into one launch, giving
- * nheads * I threads (12288 for qabs at 24 heads), which is ample. */
-__global__ void k3_mla_addrows(float *__restrict__ acc, const float *__restrict__ coef,
-                               const unsigned char *__restrict__ q4,
-                               const float *__restrict__ scales,
-                               int nh, int nrow, int I, int gsh, int ng, int rstride, int rbase0) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = idx % I, hh = idx / I;
-    if (hh >= nh) return;
-    size_t rb = (size_t)((I + 1) >> 1);
-    int g = i >> gsh; if (g >= ng) g = ng - 1;
-    float a = 0.f;
-    for (int d = 0; d < nrow; d++) {
-        size_t r = (size_t)(rbase0 + hh * rstride + d);
-        unsigned char b = q4[r * rb + (size_t)(i >> 1)];
-        int n = (i & 1) ? (b >> 4) : (b & 15);
-        float s = scales[r * (size_t)ng + g] * coef[(size_t)hh * nrow + d];
-        a += s * (float)(n - 8);
-    }
-    acc[(size_t)hh * I + i] = a;
-}
-
-__global__ void k3_mla_rowdots(float *__restrict__ out, const float *__restrict__ x,
-                               const unsigned char *__restrict__ q4,
-                               const float *__restrict__ scales,
-                               int nh, int nrow, int I, int gs, int ng, int rstride, int rbase0) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int d = idx % nrow, hh = idx / nrow;
-    if (hh >= nh) return;
-    size_t rb = (size_t)((I + 1) >> 1);
-    size_t r = (size_t)(rbase0 + hh * rstride + d);
-    const unsigned char *p = q4 + r * rb;
-    const float *scl = scales + r * (size_t)ng;
-    const float *xv = x + (size_t)hh * I;
-    float a = 0.f;
-    for (int g = 0; g * gs < I; g++) {
-        float ga = 0.f;
-        int e = (g + 1) * gs; if (e > I) e = I;
-        for (int i = g * gs; i < e; i += 2) {
-            unsigned char b = p[i >> 1];
-            ga += xv[i] * (float)((int)(b & 0xF) - 8);
-            if (i + 1 < e) ga += xv[i + 1] * (float)((int)(b >> 4) - 8);
-        }
-        a += ga * scl[g];
-    }
-    out[(size_t)hh * nrow + d] = a;
-}
-
-static float *g_mx = nullptr, *g_my = nullptr; static int g_mx_cap = 0, g_my_cap = 0;
-static int ensure_mla_scratch(int nx, int ny) {
-    if (nx > g_mx_cap) { if (g_mx) cudaFree(g_mx);
-        if (!ck(cudaMalloc(&g_mx, (size_t)nx * sizeof(float)), "mla x")) { g_mx_cap = 0; return 0; }
-        g_mx_cap = nx; }
-    if (ny > g_my_cap) { if (g_my) cudaFree(g_my);
-        if (!ck(cudaMalloc(&g_my, (size_t)ny * sizeof(float)), "mla y")) { g_my_cap = 0; return 0; }
-        g_my_cap = ny; }
-    return 1;
-}
-
-/* mode 0: acc[h][0..I) = sum over nrow rows (w_addrow). in = coef[h][0..nrow)
- * mode 1: out[h][0..nrow) = rowdot of each row against in[h][0..I) */
-extern "C" int coli_k3_mla_absorb(float *out, const float *in, const void *q4,
-                                  const float *scales, int mode, int nh, int nrow,
-                                  int I, int gs, int rstride, int rbase0) {
-    if (!g_ready || nh <= 0 || nrow <= 0 || I <= 0) return 0;
-    if (gs <= 0 || (gs & (gs - 1)) || (I & (gs - 1))) return 0;
-    int gsh = 0; while ((1 << gsh) < gs) gsh++;
-    int ng = (I + gs - 1) / gs;
-    int nin  = mode ? nh * I    : nh * nrow;
-    int nout = mode ? nh * nrow : nh * I;
-    if (!ensure_mla_scratch(nin, nout)) return 0;
-    if (!ck(cudaMemcpyAsync(g_mx, in, (size_t)nin * sizeof(float),
-                            cudaMemcpyHostToDevice, g_stream), "mla in")) return 0;
-    int th = 128, n = nout, bl = (n + th - 1) / th;
-    if (mode)
-        k3_mla_rowdots<<<bl, th, 0, g_stream>>>(g_my, g_mx, (const unsigned char *)q4,
-                                                scales, nh, nrow, I, gs, ng, rstride, rbase0);
-    else
-        k3_mla_addrows<<<bl, th, 0, g_stream>>>(g_my, g_mx, (const unsigned char *)q4,
-                                                scales, nh, nrow, I, gsh, ng, rstride, rbase0);
-    if (!ck(cudaGetLastError(), "mla absorb launch")) return 0;
-    if (!ck(cudaMemcpyAsync(out, g_my, (size_t)nout * sizeof(float),
-                            cudaMemcpyDeviceToHost, g_stream), "mla out")) return 0;
-    return ck(cudaStreamSynchronize(g_stream), "mla sync");
 }

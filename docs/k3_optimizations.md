@@ -46,6 +46,13 @@ Two more facts that shape the list:
 - [x] Top-16 expert selection O(K^2*E) -> O(K*E) (`topk` 0.436 -> 0.085 s/100) — 3.913 -> 3.957
 - [x] Rotating conv window instead of a per-token memmove (`kconv` 1.103 -> 0.200 s/100, 5.5x) — 3.982 -> 4.084
 - [x] `matt` score buffer on the stack, not malloc'd per head per token
+- [x] K3_DENSE_DEV_GB auto-sized: it defaulted to 0, so nothing was ever
+      mirrored -- 3.86 -> 4.33 tok/s, output unchanged 6/6
+- [x] 4-wide fold confirmed: worth +6.5%, but ONLY with mirrors on
+- [ ] REVERTED: MLA absorb on GPU (fb898f3) -- +0.4% is inside noise
+- [ ] REVERTED: KDA control part 2 on GPU -- dead wash, 3.877/3.888 vs 3.877/3.883
+- [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to
+      pin -ffp-contract=off for the conv loop or re-baseline the reference
 - [x] MLA absorb GEMVs moved to the GPU, BIT-EXACT (`matt` 0.896 -> 0.849) — the
       first successful CPU->GPU migration; see the note in docs/kimi_k3.md for
       why it is the only one currently possible

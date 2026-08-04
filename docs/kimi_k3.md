@@ -288,6 +288,136 @@ Measured: `head` **0.508 -> 0.150 s/100 tokens**, collectives 18315 -> 18414 per
 because only the slice needs mirroring. End to end **3.797/3.850 -> 3.914/3.906
 tok/s**, output byte identical.
 
+### The mirror budget defaulted to zero, and that cost 12%
+
+`K3_DENSE_DEV_GB` gates whether dense weights get a `cudaMalloc` copy (2 MB
+pages) instead of being read through the host-registered zero-copy mapping
+(SMMU 4 KB pages). The per-tensor cap had already been raised from 64 MB to
+2 GB, but **the budget itself defaulted to 0.0**, so no tensor was ever
+mirrored unless a human set the variable. Measured, same session, all four
+combinations:
+
+| | I4W=2 | I4W=4 |
+|---|---|---|
+| no mirrors | 3.856 / 3.859 | 3.862 / 3.862 |
+| 40 GB budget | 4.019 / 4.020 | **4.284 / 4.276** |
+
+Two things worth reading off that table. The mirrors are worth ~11%. And the
+4-wide fold is worth +6.5% **but only with mirrors on** -- at zero-copy it is
+worth nothing (3.856 vs 3.862), which is exactly what the comment above the
+cap predicted and why the two had to be tested together rather than in turn.
+
+So the answer to "is the budget or the cap binding" is *neither*: the report
+line says `0.00 GB skipped over the cap`, and the budget was never consulted
+because it was zero. The default is now auto-sized from `cudaMemGetInfo`. A
+fifth of free was still too tight -- it placed 11.45 GB, skipped 4.16 GB and
+reached only 4.210/4.206 -- so it takes a third, capped at 24 GB, which places
+the entire 16.06 GB eligible set and reaches **4.327/4.306**.
+
+### Two harness bugs that made A/Bs compare a config against itself
+
+Both were silent, and both invalidated measurements that had already been
+reported:
+
+1. `run_e2e.sh` forwarded only `PORT` to the four nodes. Any variable set on
+   the driving shell -- `DEVGB`, `I4W` -- stayed there, so both arms of an A/B
+   ran the driver defaults and came back identical. Three A/Bs died this way
+   before the `dense mirrors: 0.00 GB placed` line exposed it while the shell
+   said 40 GB.
+2. The speed harness (`k3drive.py`) defaulted `DEVGB` to 0 while the quality
+   harness (`k3gen.py`) defaulted it to 18. Speed and correctness had therefore
+   never been measured on the same configuration.
+
+The rule this leaves: an A/B is only valid if the run's own log echoes the
+setting under test. `run_e2e.sh` now prints what it forwards, and the mirror
+report line is checked on every mirror measurement.
+
+### Teacher-forced logits do not exercise the decode path
+
+`d1657cc` (rotating conv window, stack score buffer) changes free-running
+output: from `3d86a11` onward the six-prompt gate goes 1/6 against its
+reference, and bisection puts the change exactly there -- `5047fe4` (topk) is
+6/6, and the commits between are documentation only. But the teacher-forced
+logit capture over a 300-token prompt is **bit-identical** between the two
+builds, same sha256 over all 40 MB.
+
+Both facts are real. `--ngen 0` runs prefill only, and the rotation lives in
+the S==1 decode path, so the strongest instrument in the harness is blind to
+it by construction. It is not a state leak either: prompt 1 generated alone in
+a fresh engine hashes identically to prompt 1 generated second, so the engine
+is deterministic and position-independent -- the difference is per-token and
+numerical.
+
+The mechanism is FP contraction, not ordering. There is no `-ffast-math`, so
+GCC may not reorder the sum, but its default **is** `-ffp-contract=fast`, and
+`acc += cd[j]*wd[(hh+1+j)&(K-1)]` does not contract to FMA the same way the
+old contiguous `acc += cd[j]*wd[j]` did. Same operands, same order, different
+rounding, and top-16-of-896 routing turns that into a different token a few
+hundred steps later.
+
+What this changes going forward: free-running generation is the only gate that
+covers decode, teacher-forced logits are a prefill-only instrument, and any
+future exactness claim has to name which of the two it was checked with.
+
+### The chip is power-capped, which changes what "optimization" means
+
+`nvidia-smi -q -d PERFORMANCE` reports **SW Power Cap: Active** with 61.7 hours
+accumulated, while HW thermal and HW power-brake slowdown are both zero and the
+CPU governor is already `performance` at its 2.808 GHz ceiling. GB10 is a
+superchip: the CPU and the GPU draw from **one power budget**. So moving work
+from one to the other does not reduce the energy per token, it only relocates
+it, and under a binding cap the total throughput barely moves.
+
+That theory explains the whole result set, retrospectively:
+
+| change | kind | outcome |
+|---|---|---|
+| topk O(K^2 E) -> O(KE) | eliminates work | 5.1x on the term |
+| conv memmove -> rotating window | eliminates work | 5.5x on the term |
+| MLA absorb -> GPU | relocates work | +0.4%, near noise |
+| KDA control part 1 -> GPU | relocates work | rejected, 9.8 GB/s |
+| KDA control part 2 -> GPU | relocates work | dead wash, see below |
+
+Every accepted win removed computation. Every relocation underdelivered. The
+rule to carry forward is that under a power cap you go faster by doing **less
+total work**, not by moving work to a quieter unit.
+
+### Control part 2 on the GPU: correct, exact, and worth nothing
+
+Part 2 of `kda_control_b1` looked like the ideal migration candidate -- 3072
+output rows against part 1's 152, and no transcendental, so it reproduces the
+CPU order exactly. Implemented as `k3_ctl_fb` on its own stream (the control
+runs on its own pthread and must not share `g_stream`), with `f_b` transposed
+to `[hd][pn]` so a warp reads consecutive floats instead of striding 512 B.
+
+Interleaved A/B, same session, alternating to cancel drift:
+
+| | warm1 | warm2 |
+|---|---|---|
+| part 2 on GPU | 3.877 | 3.888 |
+| part 2 on CPU | 3.877 | 3.883 |
+
+A dead wash, so it was reverted. The likely mechanism is that the control
+thread's kernel now queues behind the main thread's dense GEMVs, so the control
+finishes no earlier than it did on the CPU -- and under the power cap above,
+there was no throughput to win by relocating it anyway.
+
+**A measurement trap this exposed.** The first attempt split the one
+`omp parallel` region into two so part 2 could sit outside it. That alone cost
+**-11%** (4.31 -> 3.85) through per-layer team construction, and because the
+CPU fallback path was inside the same restructure, *both* arms of the A/B
+regressed together and looked like a GPU problem. Deciding `gpu` before the
+region and keeping the CPU branch inside it restored parity.
+
+### Absolute numbers drift between sessions; only interleaved A/B is valid
+
+Identical code at `fb898f3` measured **4.313/4.308** one day and
+**3.873/3.869** the next, with no change to the binary, no other load, and
+temperatures at 61-68 C. That is a ~10% session-to-session drift, larger than
+almost every optimization measured in this log. Consequently a number from one
+session may not be compared with a number from another. Every A/B from here on
+alternates arms inside a single session, and reports both warm runs.
+
 ### The only CPU work that can currently move to the GPU
 
 `mla_forward`'s absorb GEMVs -- `w_addrow` building `qabs`, and `w_rowdot`
