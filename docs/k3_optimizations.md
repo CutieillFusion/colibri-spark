@@ -69,6 +69,9 @@ Two more facts that shape the list:
 - [ ] CORRECTED: there is NO expert work imbalance -- counts are balanced within
       2.6% and anti-correlate with time. Residual real skew is 2.2 ms/token and
       its cause is unidentified (store layout, I/O volume, host load all ruled out)
+- [x] split the exposed collectives only: netmoe -15%, 4.362 -> 4.391, 6/6 exact
+- [ ] REJECTED: SO_BUSY_POLL -- inapplicable, the exchange loop uses MSG_DONTWAIT
+      so recv() never blocks and the option only affects blocking receives
 - [ ] OPEN: router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
       cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to

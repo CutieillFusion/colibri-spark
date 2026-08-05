@@ -681,6 +681,30 @@ The general rule: **reducing a collective's payload helps only where the
 collective is exposed.** Where it is hidden, the metric to protect is round
 trips, not bytes.
 
+### SO_BUSY_POLL does nothing here, because the loop never blocks
+
+With the bridge payload halved, what remains in `netkda` is latency rather than
+wire time -- ~185 reductions a token, each now two round trips. `SO_BUSY_POLL`
+makes the kernel poll the NIC instead of waiting for an interrupt, which is the
+textbook fix for exactly that. Measured, same session:
+
+| | BPOLL=0 | BPOLL=50us |
+|---|---|---|
+| netkda | 2.982 | 2.953 |
+| netmla | 1.010 | 1.019 |
+| netmoe | 0.834 | 0.949 |
+| tok/s | 4.346 / 4.354 | 4.340 / 4.327 |
+
+A wash, trending negative. The reason is that `k3_exchange_add` already spins in
+user space with `MSG_DONTWAIT`, so `recv()` returns immediately whether or not
+data has arrived -- and `SO_BUSY_POLL` only takes effect on a **blocking**
+receive. The option was inapplicable from the start; the busy-wait it would have
+added was already there. Reverted.
+
+TCP_NODELAY was checked at the same time and is already set on every collective
+socket, with a comment explaining that Nagle would otherwise add up to 40 ms per
+reduction.
+
 ### The "expert imbalance" is not expert imbalance -- four falsified explanations
 
 Per-rank `expert` time is reproducible to +-0.02 across five runs and always
