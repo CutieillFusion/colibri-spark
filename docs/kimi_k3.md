@@ -746,6 +746,41 @@ Adding `!m->w1_mode` makes the option a correct no-op here instead of a crash.
 It cannot be evaluated on this deployment at all until a 2-bit store exists, so
 its "0.51 vs 0.58 tok/s" note stands unretested.
 
+### The one CPU reduction that worked: stop oversubscribing 20 cores
+
+`ctljoin` is 9.8 ms/token of the main thread *waiting* for the control, which
+should not exist -- the control's 27.5 ms of work runs concurrently with kproj's
+32.7 ms, so it ought to finish first. It does not, because the threads do not
+fit: 10 OpenMP workers plus 6 control workers plus the loader pool plus the
+network exchange, on 20 cores.
+
+Sweeping the two team sizes, same session, `khead` shown because it is the
+exposed CPU term most sensitive to scheduling:
+
+| OMPT | CTLT | tok/s | khead s/100 |
+|---|---|---|---|
+| 6 | 6 | 4.313 | 0.723 |
+| **8** | **6** | **4.389 / 4.373** | **0.783** |
+| 10 | 6 | 4.373 / 4.364 | 1.037 |
+| 12 | 6 | 4.338 / 4.335 | 1.139 |
+| 8 | 4 | 3.390 / 3.315 | 1.615 |
+
+Eight is the peak. `khead` drops **10.4 -> 7.8 ms/token, -24%**, purely from not
+contending: the work is identical and every `#pragma omp parallel for` in the
+hot path is over independent heads or rows, so the arithmetic cannot change.
+Verified 6/6 byte-identical against the reference with mirrors placed.
+
+Going further does not help -- at 6 workers `khead` keeps falling (0.723) but
+the region becomes too narrow and throughput drops, and cutting the control team
+to 4 costs 22%, which reproduces the earlier CTLT sweep.
+
+This is the shape of CPU reduction that works here, and it is worth contrasting
+with the one that did not. The control port removed 26 ms of CPU by **moving**
+work to the GPU and lost a third of throughput. This removes 2.6 ms by **not
+doing** work -- descheduling -- and keeps it. On a part where CPU and GPU share
+one memory system, CPU time is only worth removing when the removal does not
+create demand somewhere else.
+
 ### Removing CPU time makes it SLOWER -- the CPU is not the contended resource
 
 The KDA control is the largest block of CPU time in the engine: `ctlwork` 27.5

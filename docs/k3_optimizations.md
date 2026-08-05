@@ -77,6 +77,11 @@ Two more facts that shape the list:
 - [ ] CLOSED BY ARITHMETIC: hiding the 7.3 ms/token of expert I/O -- per layer
       there is 0.643 ms to hide and 0.467 ms of cover, so >=0.176 ms must be
       exposed and exactly 0.176 is. Reordering only moves which term shows it
+- [x] OMP team 10 -> 8 workers: khead 10.4 -> 7.8 ms/token (-24%), 4.373 -> 4.389,
+      6/6 exact. 10 OMP + 6 control + loaders + network did not fit 20 cores
+- [ ] MEASURED: SiTU is the only serial CPU loop left, but it sits inside the
+      allreduce_start/wait window -- speeding it up moves time to netmoe, not out
+      of the token. khead and matt are already omp-parallel
 - [ ] REJECTED: KDA control on the GPU (block-per-row tree). Removes 26 ms/token
       of CPU -- ctlwork 27.5->11.3, ctljoin 9.9->0.04, kproj 32.7->24.8 -- and
       costs a third of throughput: netkda +44.7 ms, netmla +19.4, khead +14.6.
