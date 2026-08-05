@@ -1822,6 +1822,29 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
          * work. Bit-exact by construction: only the membership test and a
          * common subexpression changed. */
         for(int e=0;e<E;e++){ bias_sc[e]=st[e]+o->rbias[e]; used[e]=0; }
+        /* Does safe int8 pruning of the router have any headroom? A two-pass
+         * router only pays if the gap between the 16th and 17th biased score
+         * exceeds the worst-case int8 error, because anything closer than that
+         * must be re-scored exactly. Bound per row: (s/2)*||x||_1 with
+         * s = max|w_row|/127. Printed once. */
+        if(g_dense_census){
+            static int shown=0;
+            if(!shown){ shown=1;
+                float *tmp=falloc(E);
+                for(int e=0;e<E;e++) tmp[e]=bias_sc[e];
+                for(int a2=0;a2<18;a2++) for(int b2=a2+1;b2<E;b2++)
+                    if(tmp[b2]>tmp[a2]){ float t=tmp[a2]; tmp[a2]=tmp[b2]; tmp[b2]=t; }
+                double l1=0; for(int i=0;i<c->hidden;i++) l1+=fabs(x[i]);
+                float wmax=0; const float *rw=o->router;
+                for(int64_t i=0;i<(int64_t)c->hidden;i++){ float a=fabsf(rw[i]); if(a>wmax)a=a,wmax=a; }
+                double bound=(wmax/127.0/2.0)*l1;
+                fprintf(stderr,"[K3/ROUTER] top1=%.5f k16=%.5f k17=%.5f gap(16,17)=%.6f "
+                        "spread(1,16)=%.5f | ||x||_1=%.1f wmax=%.5f int8bound=%.5f ratio=%.1f\n",
+                        tmp[0],tmp[15],tmp[16],tmp[15]-tmp[16],tmp[0]-tmp[15],
+                        l1,wmax,bound,bound/((double)(tmp[15]-tmp[16])+1e-30));
+                free(tmp);
+            }
+        }
         for(int kk=0;kk<K;kk++){
             int best=-1; float bv=-1e30f;
             for(int e=0;e<E;e++){

@@ -816,6 +816,47 @@ Practical consequence: there is no cheap way to give the expert cache what
 mirroring gave the dense weights, because the slots' contents change with the
 LRU and cannot be device-resident. Reverted, since it is neutral at best.
 
+### The two-pass router is dead: the error bound is 57x the score gap
+
+The last named exact lever was a safe two-pass router -- score all 896 experts
+in low precision, keep every expert within a rigorous error bound of the
+16th-best, then re-score only the survivors in f32. Bit-exact by construction if
+the bound holds, and the router is 2.36 GB/token, ~15% of everything the model
+reads.
+
+It only pays if the bound is smaller than the separation it has to resolve.
+Measured in-engine (`K3_DENSE_CENSUS=1` now prints this once):
+
+    top1=0.40059  k16=0.24787  k17=0.24465  gap(16,17)=0.003212
+    spread(1,16)=0.15273  ||x||_1=214.0  wmax=0.21582
+    int8 bound=0.18182  ratio=56.6
+
+The worst-case int8 error is **57x the gap** it must resolve, and larger than the
+entire spread from the 1st to the 16th expert. Every one of the 896 would
+survive pruning, so the refinement pass would re-score all of them and the first
+pass would be pure overhead.
+
+The bound is `(s/2)*||x||_1` with `s = wmax/127`, and it is loose because it is a
+worst case over 7168 accumulated terms where the RMS error is ~85x smaller. A
+probabilistic bound would prune well but would not be exact, which is the whole
+point of the exercise. Sweeping formats against the same gap:
+
+| format | bound | bound/gap | viable |
+|---|---|---|---|
+| int8 | 0.181833 | 56.6 | no |
+| bf16 | 0.090206 | 28.1 | no |
+| int12 | 0.011281 | 3.5 | no |
+| fp16 | 0.022552 | 7.0 | no |
+| **int16** | **0.000705** | **0.2** | yes |
+
+Only int16 clears it, and int16 halves the router rather than shrinking it 4-8x:
+first pass 1.18 GB plus refinement on a handful of rows, against 2.36 GB now.
+About 6 ms/token, ~2.8%, for a new quantized copy of the router, a new kernel, a
+gather, and bound logic that silently corrupts routing if it is ever wrong.
+
+Recorded as measured-and-declined rather than built. The probe stays behind
+`K3_DENSE_CENSUS` so the numbers are reproducible.
+
 ### GB10 is big.LITTLE, and pinning to the fast cluster is WORSE
 
 `lscpu` reports one model name but `/proc/cpuinfo` has two CPU part ids in equal

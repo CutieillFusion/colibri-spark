@@ -100,7 +100,11 @@ Two more facts that shape the list:
       CPU time is free here; GPU/memory time is not
 - [ ] HARNESS BUG: cmp_logits.py is prefill-only and certified the above as
       PCC 1.000000000 / bit-identical. Warning added; use run_gen.sh for C==1
-- [ ] OPEN: router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
+- [ ] DEAD: two-pass router with safe pruning. The int8 error bound is 0.1818
+      against a 16th-to-17th score gap of 0.0032 -- 57x too loose, and wider than
+      the whole 1st-to-16th spread. Only int16 clears the bound, worth ~2.8% for
+      ~200 lines and a correctness hazard. Declined
+- [ ] OPEN (non-exact): router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
       cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to
       pin -ffp-contract=off for the conv loop or re-baseline the reference
