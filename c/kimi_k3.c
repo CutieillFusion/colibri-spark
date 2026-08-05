@@ -1130,8 +1130,39 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             /* 25.7 MB/layer x 92 = 2.36 GB/token. On the CPU f32 path that is
              * ~0.21 s/token at the ~11 GB/s those cores manage; as a W it uses
              * the same GPU dispatch as every other dense tensor. */
-            o->router_w.fmt=0; o->router_w.f=o->router;
             o->router_w.O=c->n_experts; o->router_w.I=c->hidden;
+            /* K3_ROUTER_I8: quantize the router to int8, per output row.
+             *
+             * It is the largest tensor still on the generic kernel and the
+             * single biggest byte source left -- 25.7 MB/layer, 2.36 GB/token,
+             * ~15% of everything the model reads. At int8 that is 0.59 GB, and
+             * it also moves onto the exact int8 kernel and the device mirror
+             * instead of coli_cuda_matmul.
+             *
+             * NOT exact, and the risky kind of inexact: this feeds top-16-of-896
+             * selection, where the measured gap between the 16th and 17th biased
+             * score is 0.0032. Gate on end-to-end PCC and the free-running
+             * output, never on the hash. */
+            { static int ri8=-1;
+              if(ri8<0){ const char *e=getenv("K3_ROUTER_I8"); ri8=e?atoi(e):0; }
+              int64_t RO=c->n_experts, RI=c->hidden;
+              if(ri8){
+                  o->router_w.q8=malloc((size_t)RO*RI);
+                  o->router_w.s=falloc(RO);
+                  if(!o->router_w.q8){fprintf(stderr,"OOM router int8\n");exit(1);}
+                  for(int64_t r=0;r<RO;r++){
+                      const float *rw=o->router+r*RI;
+                      float mx=0.f;
+                      for(int64_t i=0;i<RI;i++){ float a=fabsf(rw[i]); if(a>mx) mx=a; }
+                      float sc=mx/127.f; if(sc<1e-30f) sc=1e-30f;
+                      o->router_w.s[r]=sc;
+                      float inv=1.f/sc; int8_t *q=o->router_w.q8+r*RI;
+                      for(int64_t i=0;i<RI;i++){
+                          int v=(int)lrintf(rw[i]*inv);
+                          if(v>127)v=127; if(v<-127)v=-127; q[i]=(int8_t)v; } }
+                  o->router_w.fmt=1;
+                  free(o->router); o->router=NULL;      /* gives back 25.7 MB/layer */
+              } else { o->router_w.fmt=0; o->router_w.f=o->router; } }
             o->rbias =f32_load(m,NM("model.layers.%d.block_sparse_moe.gate.e_score_correction_bias",i),c->n_experts);
             o->lat_norm=f32_load(m,NM("model.layers.%d.block_sparse_moe.routed_expert_norm.weight",i),c->latent);
             w_load(m,&o->lat_down,NM("model.layers.%d.block_sparse_moe.routed_expert_down_proj.weight",i),c->latent,c->hidden,bits);
@@ -1881,8 +1912,10 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 for(int a2=0;a2<18;a2++) for(int b2=a2+1;b2<E;b2++)
                     if(tmp[b2]>tmp[a2]){ float t=tmp[a2]; tmp[a2]=tmp[b2]; tmp[b2]=t; }
                 double l1=0; for(int i=0;i<c->hidden;i++) l1+=fabs(x[i]);
-                float wmax=0; const float *rw=o->router;
-                for(int64_t i=0;i<(int64_t)c->hidden;i++){ float a=fabsf(rw[i]); if(a>wmax)a=a,wmax=a; }
+                float wmax=0;
+                if(o->router){ const float *rw=o->router;
+                    for(int64_t i=0;i<(int64_t)c->hidden;i++){ float a=fabsf(rw[i]); if(a>wmax)wmax=a; } }
+                else if(o->router_w.fmt==1) wmax=o->router_w.s[0]*127.f;
                 double bound=(wmax/127.0/2.0)*l1;
                 fprintf(stderr,"[K3/ROUTER] top1=%.5f k16=%.5f k17=%.5f gap(16,17)=%.6f "
                         "spread(1,16)=%.5f | ||x||_1=%.1f wmax=%.5f int8bound=%.5f ratio=%.1f\n",

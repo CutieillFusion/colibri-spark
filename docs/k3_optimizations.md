@@ -108,6 +108,11 @@ Two more facts that shape the list:
       35.4 ms/token. PCC 0.999999999 vs a 0.999 bar, top-1 100%, free-running
       coherent. Passes because the sigmoid is computed in double and rounded
       once (CUDA expf misses glibc 30.3% of the time, the double form 0.062%)
+- [ ] FAILS 0.999: int8 router. +6.2% (4.483 -> 4.760, router 13.0 -> 4.4 ms) but
+      PCC 0.985126289, top-1 87.5%, max|dlogit| 4.27. Kept behind K3_ROUTER_I8=1.
+      Perturbs a DECISION (top-16 of 896) not a value -- see the 0.0032 score gap
+- [ ] NEXT (non-exact): fp16/bf16 router (halves rather than quarters bytes, keeps
+      relative precision), or int8 first pass + exact re-score near the boundary
 - [ ] OPEN (non-exact): router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
       cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to

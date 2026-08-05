@@ -924,6 +924,51 @@ longer bit-exact with that reference, so the gate is now:
 Byte-identity remains the right gate for changes that claim to be exact, and
 `K3_SITU_GPU=0` restores it.
 
+### int8 router: +6.2% and it fails the quality bar
+
+The router is the largest byte source left -- 25.7 MB/layer, 2.36 GB/token, ~15%
+of everything the model reads -- and the only dense tensor still on the generic
+kernel because it is f32 (fmt 0). Quantizing it to int8 per output row moves it
+onto the exact int8 kernel and the device mirror as well as cutting its bytes
+4x, and it also hands back 2.36 GB of RAM on a box with 13 GB free.
+
+The speed is the best single result in this log:
+
+| | tok/s | router s/100 |
+|---|---|---|
+| f32 router | 4.483 / 4.476 | 1.303 |
+| **int8 router** | **4.760 / 4.724** | **0.444** |
+
++6.2%, with the router term falling 13.0 -> 4.4 ms/token, exactly the 4x the
+byte count predicts.
+
+It fails anyway:
+
+    top-1 agreement 87.500%   (4 of 32 positions differ)
+    top-5 overlap   90.000%
+    KL mean 5.509e-02   max 1.903e-01
+    max |dlogit|    4.273186
+    PCC 0.985126289          threshold 0.999 -> FAIL
+
+This is the outcome the earlier bound analysis predicted rather than a surprise.
+The worst-case int8 error is 0.1818 against a measured 16th-to-17th score gap of
+**0.0032** -- 57x too loose -- so expert selection genuinely changes, and unlike
+the SiTU perturbation (max |dlogit| 0.0014) this one moves whole experts in and
+out of the top-16. Kept behind `K3_ROUTER_I8`, default off.
+
+The contrast with fused SiTU is the useful part. Both are ~1-ulp-class changes
+to individual arithmetic, but SiTU perturbs a **value** and the router perturbs a
+**decision**. A value error of 1e-3 attenuates; a decision error swaps one
+expert of 896 for another and the two produce unrelated outputs. Precision has
+to be budgeted by what the number is used for, not by its magnitude.
+
+What could still work here: int8 with per-group rather than per-row scales
+(perhaps 2-4x tighter, still ~15x too loose), fp16 or bf16 which keep relative
+precision everywhere and halve rather than quarter the bytes, or an int8 first
+pass with exact f32 re-scoring of the experts near the top-16 boundary -- which
+under a PCC bar no longer needs the rigorous bound that killed it as an exact
+technique.
+
 ### GB10 is big.LITTLE, and pinning to the fast cluster is WORSE
 
 `lscpu` reports one model name but `/proc/cpuinfo` has two CPU part ids in equal
