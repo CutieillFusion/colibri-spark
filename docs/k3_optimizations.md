@@ -77,6 +77,10 @@ Two more facts that shape the list:
 - [ ] CLOSED BY ARITHMETIC: hiding the 7.3 ms/token of expert I/O -- per layer
       there is 0.643 ms to hide and 0.467 ms of cover, so >=0.176 ms must be
       exposed and exactly 0.176 is. Reordering only moves which term shows it
+- [ ] REJECTED: MADV_HUGEPAGE for the expert cache. Verified applied (engine
+      AnonHugePages 0 -> 40.78 GB, ~10M fewer PTEs) and throughput unchanged:
+      4.409/4.395 vs 4.427/4.407. The mirror win was the ACCESS PATH
+      (device-resident vs SMMU-translated), not page size
 - [ ] REJECTED: speculative decoding. Batching is WORSE per token here --
       C=1 234.7 ms, C=4 360.4, C=8 304.4 -- so four together cost 1442 ms
       against 939 ms sequential. No acceptance rate rescues a 1.5x loss, and

@@ -785,6 +785,37 @@ traffic, and on a part where memory is the binding resource that is the wrong
 direction -- the same reason moving the control to the GPU lost, and pinning to
 the fast cluster lost.
 
+### Huge pages do nothing -- the mirror win was the access path, not page size
+
+The device-mirror result was recorded as a page-size effect: dense weights read
+through host-registered **4 KB SMMU pages** at 166.7 GB/s against **2 MB pages**
+from `cudaMalloc` at 234.5 GB/s. If page size were the mechanism, the expert
+cache should benefit the same way -- it is 80 GB of anonymous memory that the
+kernels read through the SMMU, and THP on these nodes is in `madvise` mode with
+`/proc/meminfo` reporting **AnonHugePages: 0 kB**, so nothing in the engine had
+huge pages at all. Roughly 20 million 4 KB entries for the expert cache alone.
+
+Aligning the slots to 2 MB and calling `madvise(MADV_HUGEPAGE)` works exactly as
+intended -- verified mid-run, not assumed:
+
+    AnonHugePages in engine: 40.78 GB   (of 70.9 GB RSS)
+    system AnonHugePages:    42.7 GB    (was 0)
+
+About ten million page-table entries removed. Throughput did not move:
+**4.409/4.395 with huge pages against 4.427/4.407 without**, and `expert` was
+2.605 against 2.590 s/100.
+
+So page size is not the mechanism, and the note attributing the mirror win to it
+is wrong. What `cudaMalloc` changes on this integrated part is the **access
+path**: device-resident memory is reached through the GPU's native path, while
+host-registered memory goes through SMMU translation whatever its page size.
+Both live in the same LPDDR5X. That also explains why mapped activations lost --
+they moved data the other way, onto the translated path.
+
+Practical consequence: there is no cheap way to give the expert cache what
+mirroring gave the dense weights, because the slots' contents change with the
+LRU and cannot be device-resident. Reverted, since it is neutral at best.
+
 ### GB10 is big.LITTLE, and pinning to the fast cluster is WORSE
 
 `lscpu` reports one model name but `/proc/cpuinfo` has two CPU part ids in equal
