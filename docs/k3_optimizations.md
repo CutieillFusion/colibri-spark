@@ -113,6 +113,10 @@ Two more facts that shape the list:
       Perturbs a DECISION (top-16 of 896) not a value -- see the 0.0032 score gap
 - [ ] FAILS 0.999: fp16 router. +3.1% (4.516 -> 4.664), top-1 100%, PCC 0.994432661.
       Better than int8 on every measure and still short. K3_ROUTER_F16=1
+- [ ] REJECTED: two-pass router (int8 search + exact f32 decision). Correct, it
+      is SLOWER than f32 -- 4.412 vs 4.508, router 1.626 vs 1.298. Candidates
+      average ~106 of 896 (not the 29 one sample showed) and the single-block
+      selection kernel costs more than the bytes saved. K3_ROUTER2=1
 - [ ] SUPERSEDED: fp16/bf16 router (halves rather than quarters bytes, keeps
       relative precision), or int8 first pass + exact re-score near the boundary
 - [ ] OPEN (non-exact): router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would

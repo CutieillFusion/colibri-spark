@@ -73,6 +73,13 @@ int  coli_k3_gate_up_situ(float *gate, const float *x,
                           const void *w3p, const float *w3s,
                           int S, int I, int O, int gs, float beta1, float beta2);
 
+/* Two-pass router: int8 search, exact f32 decision near the top-K boundary.
+ * rbias and wf32 must be device-visible (mirrored or host-registered). */
+int  coli_k3_router2(float *scores, const float *x,
+                     const void *q8, const float *s8,
+                     const float *wf32, const float *rbias,
+                     int E, int I, int K, float delta);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus

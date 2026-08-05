@@ -808,6 +808,95 @@ __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restric
  * rows it takes latent from 1.596 to 1.555 s/100 and is neutral to slightly
  * positive end to end, verified 6/6 byte-identical. */
 
+
+/* ---------------- two-pass router ------------------------------------------
+ * The router is 2.36 GB/token and drives top-16-of-896 selection, where the
+ * measured 16th-to-17th score gap is 0.0032. Quantizing it outright fails the
+ * quality bar -- int8 scored PCC 0.985, fp16 0.994 -- because the error is
+ * comparable to that gap and swaps experts.
+ *
+ * So quantize only the SEARCH and keep the DECISION exact: score all 896 rows
+ * in int8, take the 16th best, then re-score in f32 only the rows within delta
+ * of it. Measured candidate counts at the boundary are sparse -- 16 rows at
+ * delta 0.002, 29 at 0.010, 78 at 0.020 -- against an int8 RMS score error of
+ * ~0.0016, so delta 0.01 is past 6 sigma while touching 3.2% of the rows.
+ * Bytes: 0.59 GB int8 + ~0.08 GB gathered f32 against 2.36 GB.
+ *
+ * Three kernels chained on one stream, so this costs two extra launches per
+ * layer (~4 us each) and no extra round trip -- the host still gets one
+ * download of 896 scores. */
+
+/* 16th-largest of (sc + rbias), then every row within delta of it. One block,
+ * K masked max-reductions -- 16 passes of a 256-way tree, a few hundred steps. */
+/* The engine ranks by sigmoid(score) + rbias, not score + rbias. Sigmoid is
+ * monotonic, but the bias is added AFTER it, so the two orderings differ and
+ * selecting on the raw score picks the wrong candidates -- which measured as
+ * PCC 0.985, indistinguishable from having no second pass at all. */
+__device__ __forceinline__ float k3_rank(float raw, float bias) {
+    return (float)(1.0 / (1.0 + exp(-(double)raw))) + bias;
+}
+
+__global__ void k3_router_cand(const float *__restrict__ sc,
+                               const float *__restrict__ rbias,
+                               int E, int K, float delta,
+                               int *__restrict__ cand, int *__restrict__ ncand,
+                               int cap) {
+    __shared__ float sv[256];
+    __shared__ int   si[256];
+    __shared__ unsigned char taken[1024];
+    __shared__ float kth;
+    int p = threadIdx.x, T = blockDim.x;
+    for (int e = p; e < E; e += T) taken[e] = 0;
+    if (!p) { *ncand = 0; kth = -3.0e38f; }
+    __syncthreads();
+    for (int k = 0; k < K; k++) {
+        float bv = -3.0e38f; int ba = -1;
+        for (int e = p; e < E; e += T) {
+            if (taken[e]) continue;
+            float v = k3_rank(sc[e], rbias[e]);
+            if (v > bv) { bv = v; ba = e; }
+        }
+        sv[p] = bv; si[p] = ba;
+        __syncthreads();
+        for (int n = T / 2; n >= 1; n >>= 1) {
+            if (p < n && sv[p + n] > sv[p]) { sv[p] = sv[p + n]; si[p] = si[p + n]; }
+            __syncthreads();
+        }
+        if (!p) { if (si[0] >= 0) taken[si[0]] = 1; kth = sv[0]; }
+        __syncthreads();
+    }
+    float thr = kth - delta;
+    for (int e = p; e < E; e += T) {
+        if (k3_rank(sc[e], rbias[e]) >= thr) {
+            int i = atomicAdd(ncand, 1);
+            if (i < cap) cand[i] = e;
+        }
+    }
+}
+
+/* Exact f32 re-score of the candidate rows. One block per candidate. */
+__global__ void k3_router_exact(float *__restrict__ sc, const float *__restrict__ x,
+                                const float *__restrict__ w,
+                                const int *__restrict__ cand,
+                                const int *__restrict__ ncand, int I, int cap) {
+    int j = blockIdx.x;
+    int n = *ncand; if (n > cap) n = cap;
+    if (j >= n) return;
+    int o = cand[j];
+    const float *wr = w + (size_t)o * I;
+    int p = threadIdx.x, T = blockDim.x;
+    float a = 0.f;
+    for (int i = p; i < I; i += T) a += x[i] * wr[i];
+    __shared__ float sh[256];
+    sh[p] = a; __syncthreads();
+    for (int nn = T / 2; nn >= 1; nn >>= 1) {
+        if (p < nn) sh[p] += sh[p + nn];
+        __syncthreads();
+    }
+    if (!p) sc[o] = sh[0];
+}
+
+
 /* ---------------- fp16 dense GEMV (fmt 2) ---------------------------------
  * For the router. int8 per-row quantization ties the absolute error to the row
  * maximum -- about 2% of a typical weight when the row spans 4 sigma -- and
@@ -1308,4 +1397,47 @@ extern "C" int coli_k3_gate_up_situ(float *gate, const float *x,
         if (!ck(cudaStreamSynchronize(g_stream), "situ sync")) return 0;
     }
     return 1;
+}
+
+/* The candidate count varies far more per layer than one sample suggested:
+ * measured 32, 51, 264, 119, 88, 85 at delta 0.01. A cap of 192 silently
+ * dropped the overflow, so those layers never re-scored their true top-16 and
+ * fell back to int8 quality -- PCC 0.9826. The cap is now the full expert
+ * count, which cannot overflow; the average is ~106 of 896, so the exact pass
+ * still touches ~12% of the rows. */
+#define K3_RT_CAP 1024
+static int *g_rt_cand = nullptr, *g_rt_n = nullptr;
+
+/* Chained on one stream: int8 scores, candidate selection, exact re-score.
+ * Two extra launches per layer and no extra round trip. */
+extern "C" int coli_k3_router2(float *scores, const float *x,
+                               const void *q8, const float *s8,
+                               const float *wf32, const float *rbias,
+                               int E, int I, int K, float delta) {
+    if (!g_ready || E <= 0 || E > 1024 || I <= 0) return 0;
+    if (!ensure_dense_scratch(I, E)) return 0;
+    if (!g_rt_cand && !ck(cudaMalloc(&g_rt_cand, K3_RT_CAP * sizeof(int)), "rt cand")) return 0;
+    int cap = E < K3_RT_CAP ? E : K3_RT_CAP;
+    if (!g_rt_n && !ck(cudaMalloc(&g_rt_n, sizeof(int)), "rt n")) return 0;
+    if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)I * sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "rt x")) return 0;
+    k3_dense_i8_exact<<<E, 128, 0, g_stream>>>(g_dy, g_dx, (const signed char *)q8, s8, I, E);
+    k3_router_cand<<<1, 256, 0, g_stream>>>(g_dy, rbias, E, K, delta,
+                                            g_rt_cand, g_rt_n, cap);
+    k3_router_exact<<<E, 256, 0, g_stream>>>(g_dy, g_dx, wf32,
+                                                     g_rt_cand, g_rt_n, I, cap);
+    if (!ck(cudaGetLastError(), "rt launch")) return 0;
+    if (!ck(cudaMemcpyAsync(scores, g_dy, (size_t)E * sizeof(float),
+                            cudaMemcpyDeviceToHost, g_stream), "rt scores")) return 0;
+    /* How many rows actually needed re-scoring? If this ever reaches the cap the
+     * overflow is silently dropped and the true top-K may not be re-scored. */
+    { static int nrep = 0; int hn = 0;
+      if (nrep < 6) {
+          cudaMemcpyAsync(&hn, g_rt_n, sizeof(int), cudaMemcpyDeviceToHost, g_stream);
+          cudaStreamSynchronize(g_stream);
+          fprintf(stderr, "[K3/RT] candidates=%d cap=%d%s\n", hn, cap,
+                  hn > cap ? "  *** OVER CAP ***" : "");
+          nrep++;
+      } }
+    return ck(cudaStreamSynchronize(g_stream), "rt sync");
 }

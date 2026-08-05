@@ -924,6 +924,52 @@ longer bit-exact with that reference, so the gate is now:
 Byte-identity remains the right gate for changes that claim to be exact, and
 `K3_SITU_GPU=0` restores it.
 
+### Two-pass router: two real bugs found, and it still does not pay
+
+The idea was to quantize the SEARCH and keep the DECISION exact -- score all 896
+rows in int8, take the K-th best, re-score in f32 only the rows within delta of
+it. Three kernels chained on one stream so there is no extra round trip.
+
+It cost two bugs to learn that it does not work, and both are worth recording
+because both were found by instrumenting rather than reasoning.
+
+**Bug 1: the wrong ranking.** The engine ranks by `sigmoid(score) + rbias`, not
+`score + rbias`. Sigmoid is monotonic, but the bias is added *after* it, so the
+two orderings are different and the candidate set was simply wrong -- it scored
+PCC 0.985381932, indistinguishable from having no second pass at all. Fixing it
+took top-1 agreement from 96.9% to 100% and PCC to 0.982551335, which is the
+tell that something else was also broken.
+
+**Bug 2: silent overflow.** The candidate count was capped at 192 and the
+overflow dropped. One sample had suggested 29 candidates at delta 0.01; the real
+per-layer spread is **32, 51, 264, 119, 88, 85** -- one in six layers overflowed,
+never re-scored its true top-16, and fell back to int8 quality. A single-sample
+estimate of a per-layer quantity was the mistake.
+
+With the cap raised so nothing overflows, the honest numbers:
+
+| | tok/s | router s/100 |
+|---|---|---|
+| f32 baseline | 4.508 / 4.486 | 1.298 |
+| two-pass, cap 192 (lossy) | 4.637 / 4.588 | 0.791 |
+| **two-pass, correct** | **4.412 / 4.407** | **1.626** |
+
+Correct, it is **slower than doing nothing**. Two reasons. The average candidate
+count is ~106 of 896, not 29, so the exact pass reads 0.28 GB rather than 0.08
+and the total is 0.87 GB against 2.36 -- a real saving but half what was
+projected. And the selection kernel is a **single block** running 16 masked
+256-way reductions over 896 elements; that latency, 92 times a token, costs more
+than the bytes it saves.
+
+The earlier "+2.4%" was measured with the lossy cap in place, i.e. it was fast
+because it was wrong. Kept behind `K3_ROUTER2`, default off.
+
+What would be needed to rescue it: a selection that is not one block -- either a
+device-wide threshold estimate instead of an exact K-th, or handing selection to
+the CPU, which already sorts these scores, at the price of a second round trip
+per layer (~4.6 ms/token against an ~8 ms saving). Neither is clearly positive,
+so the router stays f32.
+
 ### The router needs f32: int8 and fp16 both fail, and the pattern is the point
 
 The router is the largest byte source left -- 2.36 GB/token, ~15% of all reads --

@@ -186,7 +186,9 @@ typedef struct {                          /* gated MLA layer */
 
 typedef struct {                          /* LatentMoE */
     float *router, *rbias, *lat_norm;     /* [E,hidden] f32, [E], [latent] */
-    W router_w;                           /* same f32 buffer, so the router goes
+    W router_w;
+    int8_t *r_q8; float *r_s8;      /* int8 search copy for the two-pass router */
+    void *r_dq; float *r_ds, *r_db; int r_reg;                           /* same f32 buffer, so the router goes
                                            * through w_matmul and lands on the GPU
                                            * instead of quant.h's CPU f32 path */
     W lat_down, lat_up, sh_gate, sh_up, sh_down;
@@ -1215,7 +1217,28 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
               int64_t RO=c->n_experts, RI=c->hidden;
               static int rf16=-1;
               if(rf16<0){ const char *e=getenv("K3_ROUTER_F16"); rf16=e?atoi(e):0; }
-              if(rf16 && !ri8){
+              static int r2=-1;
+              if(r2<0){ const char *e=getenv("K3_ROUTER2"); r2=e?atoi(e):0; }
+              if(r2 && !ri8 && !rf16){
+                  /* Two-pass: int8 for the search, exact f32 for the decision.
+                   * Keeps the f32 rows (needed for re-scoring) and adds a 0.59 GB
+                   * int8 copy. Quantizing outright failed the PCC bar because the
+                   * error is comparable to the 0.0032 top-16 boundary gap; this
+                   * spends bytes only where the ranking is already settled. */
+                  o->r_q8=malloc((size_t)RO*RI);
+                  o->r_s8=falloc(RO);
+                  if(!o->r_q8){fprintf(stderr,"OOM router search copy\n");exit(1);}
+                  for(int64_t r=0;r<RO;r++){
+                      const float *rw=o->router+r*RI;
+                      float mx=0.f;
+                      for(int64_t i=0;i<RI;i++){ float a=fabsf(rw[i]); if(a>mx) mx=a; }
+                      float sc=mx/127.f; if(sc<1e-30f) sc=1e-30f;
+                      o->r_s8[r]=sc; float inv=1.f/sc; int8_t *q=o->r_q8+r*RI;
+                      for(int64_t i=0;i<RI;i++){
+                          int v=(int)lrintf(rw[i]*inv);
+                          if(v>127)v=127; if(v<-127)v=-127; q[i]=(int8_t)v; } }
+                  o->router_w.fmt=0; o->router_w.f=o->router;
+              } else if(rf16 && !ri8){
                   /* fp16 keeps relative precision everywhere (~0.05%) where int8
                    * per-row ties the error to the row max (~2%), so it perturbs
                    * the top-16 DECISION far less for half the bytes rather than
@@ -1974,7 +1997,35 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
     float *sco=falloc((int64_t)C*E);
     double tp0=now_s();
-    w_matmul(sco,x,&o->router_w,C);
+    int r2done=0;
+#ifdef COLI_CUDA
+    /* Runs for any C -- one call per token -- so the teacher-forced capture,
+     * which is prefill only, measures this path and not the f32 fallback. */
+    if(o->r_q8 && g_k3_ready){
+        static int reg=0; static float dl=-1.f;
+        if(dl<0){ const char *e=getenv("K3_ROUTER2_DELTA"); dl=e?(float)atof(e):0.01f; }
+        if(!o->r_reg){
+            /* int8 copy mirrored (read every token), f32 rows only registered --
+             * the exact pass touches ~29 of 896 rows, so the SMMU path is fine
+             * and 2.36 GB of mirror budget stays with the dense weights. */
+            void *dq=coli_k3_devmirror(o->r_q8,(size_t)E*c->hidden);
+            void *ds=coli_k3_devmirror(o->r_s8,(size_t)E*sizeof(float));
+            void *db=coli_k3_devmirror(o->rbias,(size_t)E*sizeof(float));
+            if(dq&&ds&&db&&coli_k3_register(o->router,(size_t)E*c->hidden*sizeof(float))){
+                o->r_dq=dq; o->r_ds=(float*)ds; o->r_db=(float*)db; o->r_reg=1;
+            } else o->r_reg=-1;
+        }
+        if(o->r_reg==1){
+            r2done=1;
+            for(int t=0;t<C && r2done;t++)
+                r2done = coli_k3_router2(sco+(int64_t)t*E, x+(int64_t)t*c->hidden,
+                                         o->r_dq,o->r_ds,o->router,o->r_db,
+                                         E,c->hidden,K,dl);
+        }
+        (void)reg;
+    }
+#endif
+    if(!r2done) w_matmul(sco,x,&o->router_w,C);
     m->t_router+=now_s()-tp0; tp0=now_s();
     int *idxs=malloc((size_t)C*K*sizeof(int)); float *wsels=falloc((int64_t)C*K);
     int *keff=malloc((size_t)C*sizeof(int));
@@ -2010,6 +2061,18 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
                     for(int64_t i=0;i<(int64_t)c->hidden;i++){ float a=fabsf(rw[i]); if(a>wmax)wmax=a; } }
                 else if(o->router_w.fmt==1) wmax=o->router_w.s[0]*127.f;
                 double bound=(wmax/127.0/2.0)*l1;
+                /* How many experts sit within delta of the 16th score? That
+                 * is the candidate count a two-pass router would have to
+                 * re-score exactly, and it decides whether the second pass is
+                 * cheap enough to be worth the first. */
+                { double k16=tmp[15];
+                  const double dl[5]={0.002,0.005,0.01,0.02,0.05};
+                  char buf[256]; int off=0;
+                  for(int q=0;q<5;q++){
+                      int cnt=0;
+                      for(int e=0;e<E;e++) if(bias_sc[e] >= k16-dl[q]) cnt++;
+                      off+=snprintf(buf+off,sizeof(buf)-off,"%s d=%.3f:%d",q?"":"",dl[q],cnt); }
+                  fprintf(stderr,"[K3/ROUTER] candidates within delta of k16 (of %d):%s\n",E,buf); }
                 fprintf(stderr,"[K3/ROUTER] top1=%.5f k16=%.5f k17=%.5f gap(16,17)=%.6f "
                         "spread(1,16)=%.5f | ||x||_1=%.1f wmax=%.5f int8bound=%.5f ratio=%.1f\n",
                         tmp[0],tmp[15],tmp[16],tmp[15]-tmp[16],tmp[0]-tmp[15],
