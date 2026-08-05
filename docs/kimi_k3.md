@@ -746,6 +746,45 @@ Adding `!m->w1_mode` makes the option a correct no-op here instead of a crash.
 It cannot be evaluated on this deployment at all until a 2-bit store exists, so
 its "0.51 vs 0.58 tok/s" note stands unretested.
 
+### Speculative decoding cannot pay: batching is WORSE per token here
+
+Speculative decoding is the standard answer for memory-bound single-stream
+decode, and it is exactness-preserving under greedy sampling -- you accept a
+drafted token only where the target model's argmax agrees, so the accepted
+sequence is exactly what greedy decoding would have emitted. The whole
+technique rests on one assumption: that a C-token forward costs about the same
+as a 1-token forward, because the weights are read once either way.
+
+**That assumption is false on this engine.** Measured directly with `K3_CHUNK`,
+warm, taking prefill time as `dt - gen/tok_s`:
+
+| C | ms per prefill token | vs C=1 |
+|---|---|---|
+| 1 | **234.7** | 1.00x |
+| 4 | 360.4 | 0.65x -- worse |
+| 8 | 304.4 | 0.77x -- worse |
+
+Four tokens together cost 1442 ms against 939 ms for four sequential decodes.
+Even at 100% draft acceptance speculation would lose 1.5x, so no acceptance rate
+rescues it.
+
+Two reasons, and the second is fatal. `coli_k3_dense` is documented S==1 only,
+so a C>1 forward falls to the generic `quant_matmul` -- that is what the census
+found taking 64% of GPU time. And expert traffic scales with the number of
+**unique** experts, which grows with C: one token routes to 16 of 896, four
+tokens route to up to 64, and the per-layer cache holds 168 slots, so a large
+chunk thrashes it (the cold log's `prefill 32/64 (18.0s)` is that thrash).
+
+Fixing the first does not rescue it. The dense path is ~84 ms of the 235 ms
+token; making it read weights once for all four tokens saves at most 252 ms of
+the 1442, leaving 1190 against 939. The expert term is what dominates, and it is
+the term that batching makes worse.
+
+This is the memory rule a fourth time. Batching trades arithmetic for memory
+traffic, and on a part where memory is the binding resource that is the wrong
+direction -- the same reason moving the control to the GPU lost, and pinning to
+the fast cluster lost.
+
 ### GB10 is big.LITTLE, and pinning to the fast cluster is WORSE
 
 `lscpu` reports one model name but `/proc/cpuinfo` has two CPU part ids in equal

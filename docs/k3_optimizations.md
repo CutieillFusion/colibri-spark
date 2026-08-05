@@ -77,6 +77,10 @@ Two more facts that shape the list:
 - [ ] CLOSED BY ARITHMETIC: hiding the 7.3 ms/token of expert I/O -- per layer
       there is 0.643 ms to hide and 0.467 ms of cover, so >=0.176 ms must be
       exposed and exactly 0.176 is. Reordering only moves which term shows it
+- [ ] REJECTED: speculative decoding. Batching is WORSE per token here --
+      C=1 234.7 ms, C=4 360.4, C=8 304.4 -- so four together cost 1442 ms
+      against 939 ms sequential. No acceptance rate rescues a 1.5x loss, and
+      fixing the S==1 dense limit leaves 1190 vs 939
 - [ ] REJECTED: big.LITTLE pinning (10x X925 @3.9GHz + 10x A725 @2.808GHz).
       main->big/control->little 4.253, +loaders->little 4.347, unpinned 4.347/4.355.
       khead worse in every pinned variant -- it is bandwidth-bound and two
