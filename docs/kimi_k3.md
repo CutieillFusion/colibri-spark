@@ -746,6 +746,87 @@ Adding `!m->w1_mode` makes the option a correct no-op here instead of a crash.
 It cannot be evaluated on this deployment at all until a 2-bit store exists, so
 its "0.51 vs 0.58 tok/s" note stands unretested.
 
+### Removing CPU time makes it SLOWER -- the CPU is not the contended resource
+
+The KDA control is the largest block of CPU time in the engine: `ctlwork` 27.5
+ms/token on six threads, leaving `ctljoin` 9.9 ms exposed. An earlier GPU port
+measured 9.8 GB/s and was rejected, but that kernel used one **thread** per
+output row -- 152 rows is five warps, which cannot stream 4.36 MB whatever the
+memory does. One **block** per row with a shared reduction gives 152 blocks x
+256 threads, and mirroring fa/bp/fb (476 MB across the 69 KDA layers) buys 2 MB
+pages for the read.
+
+It did exactly what it was supposed to do to the CPU, and lost badly anyway:
+
+| term | CPU control | GPU control |
+|---|---|---|
+| ctlwork | 2.765 | **1.129** |
+| ctljoin | 0.994 | **0.004** |
+| kproj | 3.272 | **2.476** |
+| khead | 0.906 | 2.369 |
+| netkda | 3.267 | **7.737** |
+| netmla | 1.065 | 3.004 |
+| netmoe | 0.936 | 1.945 |
+| **tok/s** | **4.304 / 4.348** | **2.923 / 3.161** |
+
+**26 ms/token of CPU removed, and a third of throughput lost.** Note `kproj`
+also improved, 32.7 -> 24.8 ms: with the six control threads gone it stops
+competing with the dense GEMVs for LPDDR5X, which is direct evidence that CPU
+and GPU contend for one memory system on this part.
+
+That is also the explanation. The control's 476 MB/token moved from six CPU
+threads onto the GPU, which was already the busy resource, and the collectives
+absorbed it -- netkda +44.7 ms, netmla +19.4, netmoe +10.1, and `khead`, which
+is still CPU work, +14.6 ms because the GPU's bursts now starve it. Every one of
+the 185 collectives in a token pays the resulting arrival jitter.
+
+`cudaStreamSynchronize` spins by default, so the obvious suspect was the control
+pthread burning a core the network's `MSG_DONTWAIT` loop needs. Replacing it
+with a `cudaEventBlockingSync` event changed nothing (3.002/2.969, netkda still
+7.549), which rules that out and leaves memory contention.
+
+**The conclusion contradicts the premise of the goal.** CPU time here is
+largely free -- it runs underneath GPU work -- while GPU and memory time is not.
+"Remove CPU time" is only worth doing when the removed work does not land on the
+contended resource, and on a shared-memory part almost all of it does. The one
+CPU->GPU migration that ever paid, the MLA absorb, was +0.4% and moved 5 ms.
+
+### The quality harness is blind to decode, and reported PCC 1.0 for this
+
+Gating the change on `cmp_logits.py` gave **top-1 100%, top-5 100%, KL 0,
+max|dlogit| 0, PCC 1.000000000, bit-identical: True** -- for a change that uses
+a tree reduction where the CPU sums sequentially and cannot be bit-exact.
+
+The reason is that the teacher-forced capture (`K3_LOGITS` with `--ngen 0`) runs
+**prefill only**, and the control is dispatched under
+`ctl_overlap = C==1 && ...`. The instrument never executed the modified code.
+
+This is the same blind spot recorded above for `d1657cc`, and it is worse than
+it looked: it does not merely miss a difference, it actively certifies a
+decode-path change as perfect. `tools/k3_quality.py` has a COVERAGE check for
+exactly this case; `cmp_logits.py` did not, and now carries a warning. Any
+change gated on teacher-forced logits alone must first be shown to execute in
+prefill at all.
+
+The free-running gate then reported **6/6 identical** for the same change, which
+was also wrong, for a different reason. `k3gen.py` read `K3_DENSE_DEV_GB`
+straight from `DEVGB`, and `DEVGB=auto` -- which `k3drive.py` handles by
+omitting the variable -- reached `atof("auto")` = 0. With no mirror budget
+`coli_k3_devmirror` returns null, `k3_ctl_gpu_all` bails to the CPU path, and
+the run measured the unmodified engine. The tell was `dense mirrors: 0.00 GB
+placed` in the generation log against 16.47 GB in the speed log.
+
+Two harnesses, two different defaults for the same variable, for the second
+time. The rule already written after the first occurrence -- an A/B is only
+valid if the run's own log echoes the setting under test -- now has to be
+applied to the **quality** runs as well, not only the speed runs.
+
+One useful thing fell out. `rq` (no mirrors) and `finq` (mirrors) compared 6/6,
+which is an accidental but real proof that device mirroring is value-neutral:
+the same weights through 2 MB pages instead of 4 KB pages produce identical
+tokens. Every earlier 6/6 claim therefore stands, because the configuration
+difference could not have changed the answer.
+
 ### The "expert imbalance" is not expert imbalance -- four falsified explanations
 
 Per-rank `expert` time is reproducible to +-0.02 across five runs and always
