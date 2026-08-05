@@ -97,6 +97,19 @@ static void k3_nodelay(int fd) {
     /* Every message is a synchronous round trip; Nagle would add up to 40 ms
      * per reduction, which at ~93 reductions/token is fatal. */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Halving the bridge payload took netkda down only 12%, so what is left is
+     * latency, not wire time: the split costs two round trips per reduction and
+     * there are ~185 reductions in a token. The exchange loop already spins in
+     * user space with MSG_DONTWAIT, so the remaining wait is NIC-to-socket
+     * interrupt latency, which is exactly what busy polling removes. Best
+     * effort -- SO_BUSY_POLL needs CAP_NET_ADMIN on some kernels, and a failure
+     * here is not worth reporting. K3_NET_BUSYPOLL=0 disables, or set it to the
+     * microsecond budget to spend per receive. */
+#ifdef SO_BUSY_POLL
+    const char *bp = getenv("K3_NET_BUSYPOLL");
+    int us = bp ? atoi(bp) : 50;
+    if (us > 0) setsockopt(fd, SOL_SOCKET, SO_BUSY_POLL, &us, sizeof(us));
+#endif
 }
 
 static int k3_connect_retry(const char *host, int port) {
@@ -386,7 +399,16 @@ static int       g_ar_active = 0;
 
 static void *k3_ar_worker(void *unused) {
     (void)unused;
+    /* Do NOT split the bridge payload here. Splitting halves the bytes but adds
+     * a second round trip, and this collective is the one that is already
+     * hidden underneath the shared experts -- halving a wait that was already
+     * covered buys nothing while the extra trip is real. Measured: netmoe went
+     * 0.974 -> 1.054 s/100 when the split applied here, against netkda -12.4%
+     * and netmla -19% at the exposed sites. Payload reduction pays on exposed
+     * collectives only. */
+    int save = g_net_split; g_net_split = 0;
     k3_net_allreduce(g_ar_v, g_ar_n);
+    g_net_split = save;
     return NULL;
 }
 

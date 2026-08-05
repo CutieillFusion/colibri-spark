@@ -659,6 +659,28 @@ so halving its payload cannot shorten a wait that was already covered, while the
 extra round trip is real. The split is therefore worth having on the exposed
 sites and not on the hidden one.
 
+### Payload reduction pays on exposed collectives and costs on hidden ones
+
+The split cross-exchange halves bridge bytes at the price of one extra round
+trip. Whether that is a win depends entirely on whether the collective was
+already hidden:
+
+| | split everywhere | split on exposed only |
+|---|---|---|
+| netkda (exposed) | 2.740 | 2.735 |
+| netmla (exposed) | 0.898 | 0.939 |
+| **netmoe (hidden)** | **1.054** | **0.896** (-15%) |
+| tok/s | 4.362 / 4.316 | **4.391 / 4.354** |
+
+`netmoe` is the one collective that runs under the shared experts via
+`allreduce_start`/`wait`. Halving a wait that was already covered buys nothing,
+while the extra round trip is real -- so the async worker now forces the full
+exchange and only the blocking sites split. 6/6 byte-identical.
+
+The general rule: **reducing a collective's payload helps only where the
+collective is exposed.** Where it is hidden, the metric to protect is round
+trips, not bytes.
+
 ### The "expert imbalance" is not expert imbalance -- four falsified explanations
 
 Per-rank `expert` time is reproducible to +-0.02 across five runs and always
