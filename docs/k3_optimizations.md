@@ -72,6 +72,11 @@ Two more facts that shape the list:
 - [x] split the exposed collectives only: netmoe -15%, 4.362 -> 4.391, 6/6 exact
 - [ ] REJECTED: SO_BUSY_POLL -- inapplicable, the exchange loop uses MSG_DONTWAIT
       so recv() never blocks and the option only affects blocking receives
+- [x] BUG FIX: K3_EXPERT_BATCH=1 crashed the engine (2-bit kernels on a 1-bit
+      store); guard now checks !w1_mode. Untestable here until a 2-bit store exists
+- [ ] CLOSED BY ARITHMETIC: hiding the 7.3 ms/token of expert I/O -- per layer
+      there is 0.643 ms to hide and 0.467 ms of cover, so >=0.176 ms must be
+      exposed and exactly 0.176 is. Reordering only moves which term shows it
 - [ ] OPEN: router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
       cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to

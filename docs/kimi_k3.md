@@ -705,6 +705,47 @@ TCP_NODELAY was checked at the same time and is already set on every collective
 socket, with a comment explaining that Nagle would otherwise add up to 40 ms per
 reduction.
 
+### The MoE schedule is already at its bound
+
+`load=0.728 s/100` is un-hidden expert I/O wait -- 7.3 ms/token, a term that had
+never been looked at. The obvious fix is to submit the expert loads right after
+top-k and let the shared experts cover them, instead of submitting them inside
+`experts_apply_union` where only the expert-to-expert pipeline covers them.
+
+The arithmetic says not to bother. Per MoE layer:
+
+* collective: 0.564 ms
+* shared-expert work available as cover: 0.467 ms
+* expert loads: 0.079 ms
+
+Everything that must be hidden totals 0.643 ms and there is 0.467 ms of cover,
+so at least 0.176 ms/layer must be exposed no matter how it is ordered. Measured
+exposure is `netmoe` 0.097 + `load` 0.079 = **0.176 ms/layer**. The schedule is
+already optimal, and any reordering only moves which term shows the wait --
+moving the shared experts before the expert apply would hide the 7.3 ms of loads
+and expose roughly 29 ms of collective in exchange.
+
+This is the same conservation that showed up in the split experiment: on this
+fabric there is more to hide than there is work to hide it under, and the only
+thing that changes the total is removing work, not resequencing it.
+
+### K3_EXPERT_BATCH=1 killed the engine
+
+Retesting it -- the comment said its trade would reverse once I/O was hidden --
+crashed every rank:
+
+    [K3/EXP] hz download: an illegal memory access was encountered
+
+`coli_k3_expert_batch_w2` launches the **2-bit** expert kernels unconditionally,
+but this deployment runs a **1-bit** store (`packed 2-bit experts: ..., 1-bit`),
+so the batch walked every 4.92 MiB slot with 2-bit strides and ran off the end.
+The single-expert path in `expert_apply` already dispatches on `m->w1_mode`; the
+`batchable` guard checked `m->w2_fd` and `g_k3_expert_gpu` but not the bit mode.
+Adding `!m->w1_mode` makes the option a correct no-op here instead of a crash.
+
+It cannot be evaluated on this deployment at all until a 2-bit store exists, so
+its "0.51 vs 0.58 tok/s" note stands unretested.
+
 ### The "expert imbalance" is not expert imbalance -- four falsified explanations
 
 Per-rank `expert` time is reproducible to +-0.02 across five runs and always

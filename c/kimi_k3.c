@@ -1736,7 +1736,13 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
          * loads) and batching waits for ALL of them first -- eload went 5.1 ->
          * 8.3 s, more than the syncs were worth. Keep it for the residency
          * endgame, where there is no I/O left to hide and the trade reverses. */
-        batchable = (g_k3_expert_batch && C==1 && m->w2_fd && g_k3_expert_gpu && nb<=64);
+        /* !w1_mode is required: coli_k3_expert_batch_w2 launches the 2-bit
+         * kernels unconditionally, so on a 1-bit store it walks every slot with
+         * 2-bit strides and runs off the end -- K3_EXPERT_BATCH=1 killed the
+         * engine with an illegal memory access. The single-expert path at
+         * expert_apply already dispatches on w1_mode; this guard did not. */
+        batchable = (g_k3_expert_batch && C==1 && m->w2_fd && !m->w1_mode
+                     && g_k3_expert_gpu && nb<=64);
         for(int j=0;j<nb&&batchable;j++) if(pcnt[base+j]!=1) batchable=0;
 #endif
         for(int j=0;j<nb;j++){
