@@ -394,6 +394,7 @@ static int    g_k3_cuda = 0;
  * Cleared on any failure so a run degrades to the CPU path rather than dying
  * mid-token. Declared here because k3_cuda_report() below reports the split. */
 static int      g_k3_expert_gpu = 0;
+static int      g_k3_ready = 0;      /* backend_cuda_k3 initialised */
 /* K3_DENSE_GPU: zero-copy dense GEMV. ON by default after the exact-order
  * kernel took a 300-token 4-node run from 1.09 -> 1.21 tok/s: shared experts
  * 43.9 -> 33.3 s, latent projections 16.8 -> 13.2 s, with bit-exact standalone
@@ -1176,6 +1177,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * initialization but do not require routed experts to run on the GPU. */
     int k3_ready=(g_k3_cuda&&(want_expert_gpu||g_k3_dense_gpu))
                  ?coli_k3_init(g_k3_cuda_devs[0],c->latent,c->moe_inter):0;
+    g_k3_ready=k3_ready;
     g_k3_expert_gpu=want_expert_gpu&&k3_ready;
     if(want_expert_gpu&&!g_k3_cuda)
         fprintf(stderr,"[K3/EXP] K3_EXPERT_GPU needs K3_GPUS — staying on CPU\n");
@@ -1799,6 +1801,50 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
     }
 }
 
+
+#ifdef COLI_CUDA
+/* Register + device-mirror a weight and hand back the pointers the K3 kernels
+ * want. Same latch as w_matmul: one attempt, then remember the answer. */
+static int w_k3_ptrs(const W *w, const void **blob, const float **sc){
+    if(!g_k3_dense_gpu || !g_k3_cuda || w->k3_dense_off || w->fmt!=4) return 0;
+    W *mw=(W*)w;
+    int64_t rb=((int64_t)w->I+1)/2, nsc=((int64_t)w->I+w->gs-1)/w->gs;
+    if(!mw->k3_reg){
+        if(coli_k3_register((void*)w_blob(w),(size_t)w->O*rb) &&
+           coli_k3_register(w->s,(size_t)w->O*nsc*sizeof(float))) mw->k3_reg=1;
+        else { mw->k3_dense_off=1; return 0; }
+    }
+    if(!mw->k3_dev_tried){
+        void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
+        if(dw){ void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
+                if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; } }
+        mw->k3_dev_tried=1;
+    }
+    *blob = mw->k3_dw ? (const void*)mw->k3_dw : w_blob(w);
+    *sc   = mw->k3_dw ? (const float*)mw->k3_ds : w->s;
+    return 1;
+}
+
+/* Fused shared-expert gate/up + SiTU on the GPU.
+ *
+ * NOT bit-exact: CUDA's transcendentals differ from glibc's in the last ulp, so
+ * this is gated on end-to-end PCC, not the reference hash. It removes the two
+ * separate gate/up matmuls, their two downloads and one upload, and the whole
+ * serial situf_ loop from the CPU. K3_SITU_GPU=1 to enable. */
+static int g_situ_gpu = -1;
+static int k3_situ_fused(float *sg, const float *x, const Moe *o, int C, int shi,
+                         float b1, float b2){
+    if(g_situ_gpu < 0){ const char *e=getenv("K3_SITU_GPU"); g_situ_gpu = e?atoi(e):1; }
+    if(!g_situ_gpu || !g_k3_ready) return 0;
+    const W *wg=&o->sh_gate, *wu=&o->sh_up;
+    if(wg->fmt!=4 || wu->fmt!=4 || wg->gs!=wu->gs) return 0;
+    if(wg->O!=shi || wu->O!=shi || wg->I!=wu->I) return 0;
+    const void *pg,*pu; const float *sgs,*sus;
+    if(!w_k3_ptrs(wg,&pg,&sgs) || !w_k3_ptrs(wu,&pu,&sus)) return 0;
+    return coli_k3_gate_up_situ(sg, x, pg, sgs, pu, sus, C, wg->I, shi, wg->gs, b1, b2);
+}
+#endif
+
 static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float *out){
     Cfg *c=&m->c; Moe *o=&l->moe;
     int E=c->n_experts, K=c->topk, LT=c->latent, MI=c->moe_inter;
@@ -1956,9 +2002,17 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     k3_net_allreduce_start(u,(size_t)C*LT);
     tp0=now_s();
     int shi=MI*c->n_shared;
-    float *sg=falloc((int64_t)C*shi), *su=falloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
-    w_matmul(sg,x,&o->sh_gate,C); w_matmul(su,x,&o->sh_up,C);
-    for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
+    float *sg=falloc((int64_t)C*shi), *sd=falloc((int64_t)C*c->hidden);
+    int fused=0;
+#ifdef COLI_CUDA
+    fused = k3_situ_fused(sg, x, o, C, shi, c->situ_b1, c->situ_b2);
+#endif
+    if(!fused){
+        float *su=falloc((int64_t)C*shi);
+        w_matmul(sg,x,&o->sh_gate,C); w_matmul(su,x,&o->sh_up,C);
+        for(int64_t i=0;i<(int64_t)C*shi;i++) sg[i]=situf_(sg[i],su[i],c->situ_b1,c->situ_b2);
+        free(su);
+    }
     w_matmul(sd,sg,&o->sh_down,C);
     m->t_shared+=now_s()-tp0;
     { double na=now_s(); k3_net_allreduce_wait(); m->t_net_moe+=now_s()-na; }
@@ -1970,7 +2024,7 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
     m->t_latent+=now_s()-tp0;
     for(int64_t d=0;d<(int64_t)C*c->hidden;d++) out[d]+=sd[d];
     free(sco);free(idxs);free(wsels);free(keff);free(bias_sc);free(used);
-    free(z);free(u);free(gate);free(up);free(hz);free(sg);free(su);free(sd);
+    free(z);free(u);free(gate);free(up);free(hz);free(sg);free(sd);
 }
 
 static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out){

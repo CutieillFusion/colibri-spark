@@ -857,6 +857,73 @@ gather, and bound logic that silently corrupts routing if it is ever wrong.
 Recorded as measured-and-declined rather than built. The probe stays behind
 `K3_DENSE_CENSUS` so the numbers are reproducible.
 
+### Fused SiTU on the GPU: +2.3%, PCC 0.999999999
+
+The quality bar was loosened from bit-exactness to **end-to-end PCC >= 0.999**,
+which makes the fused shared-expert kernel usable. It computes gate, up and the
+SiTU activation in one launch, so two matmuls, their two downloads, one upload
+and the entire serial `situf_` loop leave the CPU.
+
+The reason it now passes, having previously scored PCC 0.873, is a one-line
+change to the sigmoid. Measured over 200k samples against glibc:
+
+| expression | mismatches vs glibc |
+|---|---|
+| CUDA `expf(x)` | **30.3%** |
+| `(float)exp((double)x)` | **0.062%** |
+| CUDA `tanhf(x)` | 7.1% |
+| `(float)tanh((double)x)` | 11.8% |
+
+So the kernel computes the sigmoid in double and rounds once, and keeps CUDA's
+`tanhf`, which is the closer of the two there -- glibc's own `tanhf` is about
+1 ulp off the correctly-rounded result, which is why the double form is *worse*
+for tanh and better for exp. All five algebraic tanh formulations produce
+identical bits, so there is nothing to choose between them.
+
+Throughput, same session:
+
+| | tok/s | shared s/100 |
+|---|---|---|
+| CPU SiTU | 4.358 / 4.378 | 4.294 |
+| **fused GPU SiTU** | **4.469 / 4.445** | **3.542** |
+
+`shared` falls 42.9 -> 35.4 ms/token. `netmoe` rises slightly, 0.914 -> 0.978,
+because the shared experts are the cover for that collective and there is now
+less of them -- the conservation seen throughout this log.
+
+Quality, teacher-forced over 32 positions:
+
+    top-1 agreement 100.000%   top-5 overlap 100.000%
+    KL mean 3.325e-09  max 1.833e-08
+    max |dlogit| 0.001369      bit-identical: False
+    PCC 0.999999999            threshold 0.999 -> PASS
+
+`bit-identical: False` matters as much as the PCC: it is the coverage check that
+the instrument actually executed the changed code, which is what the prefill-only
+trap defeated for the control experiment. SiTU runs in the shared experts for
+every C, so prefill is valid coverage here.
+
+Free-running over six prompts is coherent -- the B-tree explanation and the
+irrationality proof are both correct, and the lengths track the baseline
+(554/515/546/338/509/671 bytes against 598/516/537/342/518/692), so there is no
+degeneration or truncation. Zero of six are byte-identical, which is expected
+and is the point.
+
+### The validation regime has changed
+
+Up to this commit every accepted change was gated on the reference hash
+`a3439dc6...a83ee2` and the six-prompt byte comparison. The default build is no
+longer bit-exact with that reference, so the gate is now:
+
+* **end-to-end PCC >= 0.999** on teacher-forced logits, plus top-1/top-5/KL,
+* a **coverage check** -- the logits must actually differ, or the instrument did
+  not run the changed code,
+* **free-running coherence** on the six prompts, checking output length and
+  content rather than a hash.
+
+Byte-identity remains the right gate for changes that claim to be exact, and
+`K3_SITU_GPU=0` restores it.
+
 ### GB10 is big.LITTLE, and pinning to the fast cluster is WORSE
 
 `lscpu` reports one model name but `/proc/cpuinfo` has two CPU part ids in equal

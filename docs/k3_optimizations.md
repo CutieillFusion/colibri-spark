@@ -104,6 +104,10 @@ Two more facts that shape the list:
       against a 16th-to-17th score gap of 0.0032 -- 57x too loose, and wider than
       the whole 1st-to-16th spread. Only int16 clears the bound, worth ~2.8% for
       ~200 lines and a correctness hazard. Declined
+- [x] FUSED SiTU on the GPU, default ON: 4.358 -> 4.469 (+2.3%), shared 42.9 ->
+      35.4 ms/token. PCC 0.999999999 vs a 0.999 bar, top-1 100%, free-running
+      coherent. Passes because the sigmoid is computed in double and rounded
+      once (CUDA expf misses glibc 30.3% of the time, the double form 0.062%)
 - [ ] OPEN (non-exact): router is f32, 2.36 GB/token (~15% of all traffic). int8/int4 would
       cut it 4-8x but it feeds top-16-of-896 selection -- needs the quality gate
 - [ ] OPEN: d1657cc changes decode output via FP contraction; decide whether to
