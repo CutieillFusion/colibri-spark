@@ -924,6 +924,49 @@ longer bit-exact with that reference, so the gate is now:
 Byte-identity remains the right gate for changes that claim to be exact, and
 `K3_SITU_GPU=0` restores it.
 
+### kproj is int8, not int4 -- and that resolves the 115 GB/s puzzle
+
+A scale census (`K3_DENSE_CENSUS=1` now reports format, group size and the scale
+fraction per shape) shows the dense path is **mixed precision**, which nothing in
+this log had accounted for:
+
+| shape | fmt | scales |
+|---|---|---|
+| [7168, 6144] shared experts | 4 (int4-g64) | 11.1% of the tensor |
+| [7168, 3584] latent | 4 | 11.1% |
+| [7168, 33792] dense MLP | 4 | 11.1% |
+| **[3072, 7168] kproj** | **1 (int8)** | none |
+| [40960, 7168] lm_head shard | **1 (int8)** | none |
+| [4608, 1536], [7168, 576] | 1 | none |
+
+This settles a puzzle that survived three falsified hypotheses. kproj was
+computed at 115 GB/s and called unexplained -- but that assumed int4. At int8 it
+moves **6.07 GB/token** (22 MB x 4 tensors x 69 layers) in 32.7 ms, which is
+**186 GB/s**: exactly the rate everything else achieves. kproj was never slow. It
+simply moves twice the bytes that was assumed, and it is now the single largest
+byte source in the model -- larger than the f32 router's 2.36 GB.
+
+Every fmt=4 tensor spends exactly **11.1%** of its bytes on f32 group scales
+(`I/16` against `I/2` at gs=64), which is a second, independent target.
+
+**The lever this implies has not been realised.** `w_load_rows` already contains
+an int8-to-int4-g64 downcast gated on `K3_BITS` being explicitly set, with a
+comment noting the int8 grid is 16x finer than int4 so double-quant noise is
+comparable to direct int4. Setting `K3_BITS=4` measured 4.585/4.572 against
+4.508/4.486 -- but the format census is **byte-identical between the two runs**,
+so the downcast did not fire and that 1.7% was session noise, not a gain.
+
+Why it does not fire is unresolved. The path requires `t->dtype==3` (a repacked
+U8 container) and `t->nbytes == O*I` with a per-row scale sidecar; there is a
+second int8 site for load-time quantization at `bits>4`, and the census cannot
+separate them because two different tensors share the shape [3072, 7168], one
+fmt 1 and one fmt 4. Distinguishing them needs a per-tensor path trace.
+
+If it can be made to fire, kproj at int4-g64 is 3.4 GB/token against 6.07 --
+roughly **17 ms, 7.6%**, the largest remaining lever by a wide margin, and a
+value perturbation rather than a decision, so it belongs to the class the fused
+SiTU passed rather than the class the router failed.
+
 ### Two-pass router: two real bugs found, and it still does not pay
 
 The idea was to quantize the SEARCH and keep the DECISION exact -- score all 896

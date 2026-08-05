@@ -113,6 +113,12 @@ Two more facts that shape the list:
       Perturbs a DECISION (top-16 of 896) not a value -- see the 0.0032 score gap
 - [ ] FAILS 0.999: fp16 router. +3.1% (4.516 -> 4.664), top-1 100%, PCC 0.994432661.
       Better than int8 on every measure and still short. K3_ROUTER_F16=1
+- [ ] TOP LEAD: kproj is int8 (6.07 GB/token) not int4 -- the largest byte source
+      in the model. The int8->int4-g64 downcast in w_load_rows exists but does not
+      fire under K3_BITS=4 (formats byte-identical); worth ~17 ms / 7.6% if fixed
+- [ ] LEAD: f32 group scales are 11.1% of every fmt=4 tensor; fp16 scales would
+      halve that (~0.9 GB/token). Value perturbation, same class as fused SiTU
+- [ ] CORRECTED: kproj's "115 GB/s" was an int4 assumption. At int8 it is 186 GB/s
 - [ ] REJECTED: two-pass router (int8 search + exact f32 decision). Correct, it
       is SLOWER than f32 -- 4.412 vs 4.508, router 1.626 vs 1.298. Candidates
       average ~106 of 896 (not the 29 one sample showed) and the single-block

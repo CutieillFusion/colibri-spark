@@ -154,6 +154,7 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
     ColiCudaTensor *cuda; int cuda_device; int8_t cuda_failed, cuda_placed;
     int8_t k3_reg, k3_dense_off;      /* zero-copy dense path: registered / declined */
     int8_t fmt_reported;              /* census: shape logged once */
+    int8_t gs_reported;
     /* Optional device copies for the exact dense kernel. Host-registered pages
      * reach the GPU through the SMMU at 4 KB granularity; cudaMalloc'd memory
      * uses large pages, which measured up to 1.65x on the SAME kernel. Null
@@ -704,7 +705,14 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
             const float *sc = (w->fmt==2) ? NULL
                             : mw->k3_dw ? (const float*)mw->k3_ds : w->s;
             if(coli_k3_dense(y,x,bl,sc,w->fmt,S,w->I,w->O,w->gs)){
-                if(g_dense_census) atomic_fetch_add_explicit(&g_dp_k3,1,memory_order_relaxed);
+                if(g_dense_census){
+                    atomic_fetch_add_explicit(&g_dp_k3,1,memory_order_relaxed);
+                    if(!((W*)w)->gs_reported){ ((W*)w)->gs_reported=1;
+                        int64_t wb=(int64_t)w->O*((w->I+1)/2);
+                        int64_t sb=(int64_t)w->O*((w->I+w->gs-1)/w->gs)*4;
+                        fprintf(stderr,"[K3/SCALE] I=%d O=%d fmt=%d gs=%d  weights=%.1fMB "
+                                "scales=%.1fMB = %.1f%% of the tensor\n",
+                                w->I,w->O,w->fmt,w->gs,wb/1e6,sb/1e6,100.0*sb/(wb+sb)); } }
                 return; }
             mw->k3_dense_off=1;   /* declined for a stable reason; stop retrying */
             fprintf(stderr,"[K3/DENSE] declined I=%d O=%d fmt=%d gs=%d -> generic\n",
