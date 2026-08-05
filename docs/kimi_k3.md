@@ -924,6 +924,114 @@ longer bit-exact with that reference, so the gate is now:
 Byte-identity remains the right gate for changes that claim to be exact, and
 `K3_SITU_GPU=0` restores it.
 
+### The router needs f32: int8 and fp16 both fail, and the pattern is the point
+
+The router is the largest byte source left -- 2.36 GB/token, ~15% of all reads --
+and the only dense tensor still on the generic kernel, because it is f32. Two
+quantizations were built and measured against the 0.999 PCC bar:
+
+| | tok/s | router s/100 | top-1 | PCC | verdict |
+|---|---|---|---|---|---|
+| f32 (baseline) | 4.516 / 4.494 | 1.308 | -- | -- | -- |
+| int8 per-row | **4.760 / 4.724** | 0.444 | 87.5% | 0.985126289 | FAIL |
+| fp16 | 4.664 / 4.624 | 0.689 | **100%** | 0.994432661 | FAIL |
+
+Both are real speedups -- +6.2% and +3.1% -- and both miss the bar. fp16 is the
+better of the two by every quality measure, exactly as predicted: int8 per-row
+ties the absolute error to the row maximum, about 2% of a typical weight when
+the row spans four sigma, while fp16 holds ~0.05% relative error everywhere.
+That is ~40x tighter and it buys 0.009 of PCC, which is still not enough.
+
+The reason is the one this log has been circling. The router does not produce a
+value, it produces a **decision**: top-16 of 896, where the measured gap between
+the 16th and 17th biased score is **0.0032** on scores of order 0.25. Any error
+comparable to that gap swaps experts, and two different experts produce
+unrelated outputs. Compare the fused SiTU landed earlier -- max |dlogit| 0.0014,
+PCC 0.999999999 -- which perturbs values that then attenuate.
+
+The fp16 result sharpens it further: **top-1 agreement is 100%** and PCC is still
+only 0.994. The greedy token never changes, yet the logit vector moves, because
+different experts ran. A top-1 gate alone would have passed this; PCC is what
+caught it.
+
+Both stay behind `K3_ROUTER_I8` and `K3_ROUTER_F16`, default off. Under a bar of
+0.999 the router is closed as a lever -- the only remaining option is an int8
+first pass with exact f32 re-scoring near the top-16 boundary, which restores
+the decision while keeping most of the byte saving.
+
+Adding fmt 2 (fp16, no scales) to the dense path also required a per-token
+prefill loop: `coli_k3_dense` is S==1 only, and without it the teacher-forced
+capture -- which is prefill only -- would have measured a scalar CPU fallback
+rather than the kernel that runs in decode. That is the third time the
+prefill/decode split has nearly invalidated a quality measurement.
+
+### Fused SiTU on the GPU: +2.3%, PCC 0.999999999
+
+The quality bar was loosened from bit-exactness to **end-to-end PCC >= 0.999**,
+which makes the fused shared-expert kernel usable. It computes gate, up and the
+SiTU activation in one launch, so two matmuls, their two downloads, one upload
+and the entire serial `situf_` loop leave the CPU.
+
+The reason it now passes, having previously scored PCC 0.873, is a one-line
+change to the sigmoid. Measured over 200k samples against glibc:
+
+| expression | mismatches vs glibc |
+|---|---|
+| CUDA `expf(x)` | **30.3%** |
+| `(float)exp((double)x)` | **0.062%** |
+| CUDA `tanhf(x)` | 7.1% |
+| `(float)tanh((double)x)` | 11.8% |
+
+So the kernel computes the sigmoid in double and rounds once, and keeps CUDA's
+`tanhf`, which is the closer of the two there -- glibc's own `tanhf` is about
+1 ulp off the correctly-rounded result, which is why the double form is *worse*
+for tanh and better for exp. All five algebraic tanh formulations produce
+identical bits, so there is nothing to choose between them.
+
+Throughput, same session:
+
+| | tok/s | shared s/100 |
+|---|---|---|
+| CPU SiTU | 4.358 / 4.378 | 4.294 |
+| **fused GPU SiTU** | **4.469 / 4.445** | **3.542** |
+
+`shared` falls 42.9 -> 35.4 ms/token. `netmoe` rises slightly, 0.914 -> 0.978,
+because the shared experts are the cover for that collective and there is now
+less of them -- the conservation seen throughout this log.
+
+Quality, teacher-forced over 32 positions:
+
+    top-1 agreement 100.000%   top-5 overlap 100.000%
+    KL mean 3.325e-09  max 1.833e-08
+    max |dlogit| 0.001369      bit-identical: False
+    PCC 0.999999999            threshold 0.999 -> PASS
+
+`bit-identical: False` matters as much as the PCC: it is the coverage check that
+the instrument actually executed the changed code, which is what the prefill-only
+trap defeated for the control experiment. SiTU runs in the shared experts for
+every C, so prefill is valid coverage here.
+
+Free-running over six prompts is coherent -- the B-tree explanation and the
+irrationality proof are both correct, and the lengths track the baseline
+(554/515/546/338/509/671 bytes against 598/516/537/342/518/692), so there is no
+degeneration or truncation. Zero of six are byte-identical, which is expected
+and is the point.
+
+### The validation regime has changed
+
+Up to this commit every accepted change was gated on the reference hash
+`a3439dc6...a83ee2` and the six-prompt byte comparison. The default build is no
+longer bit-exact with that reference, so the gate is now:
+
+* **end-to-end PCC >= 0.999** on teacher-forced logits, plus top-1/top-5/KL,
+* a **coverage check** -- the logits must actually differ, or the instrument did
+  not run the changed code,
+* **free-running coherence** on the six prompts, checking output length and
+  content rather than a hash.
+
+Byte-identity remains the right gate for changes that claim to be exact, and
+`K3_SITU_GPU=0` restores it.
+
 ### int8 router: +6.2% and it fails the quality bar
 
 The router is the largest byte source left -- 25.7 MB/layer, 2.36 GB/token, ~15%

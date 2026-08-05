@@ -27,6 +27,7 @@
  * same transactions anyway.
  */
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -806,6 +807,51 @@ __global__ void k3_dense_i4g_exact(float *__restrict__ y, const float *__restric
  * Applied to every shape it was a wash (4.234 vs 4.258). Applied only to short
  * rows it takes latent from 1.596 to 1.555 s/100 and is neutral to slightly
  * positive end to end, verified 6/6 byte-identical. */
+
+/* ---------------- fp16 dense GEMV (fmt 2) ---------------------------------
+ * For the router. int8 per-row quantization ties the absolute error to the row
+ * maximum -- about 2% of a typical weight when the row spans 4 sigma -- and
+ * that was enough to move expert selections and score PCC 0.985. fp16 keeps
+ * RELATIVE precision everywhere, ~0.05%, roughly 40x tighter, while still
+ * halving the bytes against f32.
+ *
+ * Same block-per-row, 4-wide fold, 256-lane tree as the int4 kernel, so the
+ * summation order matches the rest of the dense path. */
+__global__ void k3_dense_f16(float *__restrict__ y, const float *__restrict__ x,
+                             const __half *__restrict__ w, int I, int O) {
+    enum { W = 4, T = 256 / W };
+    int o = blockIdx.x;
+    if (o >= O) return;
+    const __half *wr = w + (size_t)o * I;
+    int p = (int)threadIdx.x;
+    float a[W];
+    #pragma unroll
+    for (int j = 0; j < W; j++) a[j] = 0.f;
+    for (int i = p * W; i + W - 1 < I; i += 256) {
+        float4 xx = *(const float4 *)(x + i);
+        a[0] += xx.x * __half2float(wr[i + 0]);
+        a[1] += xx.y * __half2float(wr[i + 1]);
+        a[2] += xx.z * __half2float(wr[i + 2]);
+        a[3] += xx.w * __half2float(wr[i + 3]);
+    }
+    __shared__ float sh[W][T];
+    #pragma unroll
+    for (int j = 0; j < W; j++) sh[j][p] = a[j];
+    __syncthreads();
+    for (int n = T / 2; n >= 1; n >>= 1) {
+        if (p < n) {
+            #pragma unroll
+            for (int j = 0; j < W; j++) sh[j][p] += sh[j][p + n];
+        }
+        __syncthreads();
+    }
+    if (!p) {
+        float v0 = sh[0][0], v1 = sh[1][0], v2 = sh[2][0], v3 = sh[3][0];
+        v0 += v2; v1 += v3;
+        y[o] = v0 + v1;
+    }
+}
+
 template<int W, int R>
 __global__ void k3_dense_i4g_exactR(float *__restrict__ y, const float *__restrict__ x,
                                     const unsigned char *__restrict__ q4,
@@ -1100,7 +1146,7 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     { const char *fs = getenv("K3_DENSE_STAGE"); if (fs) stage = atoi(fs); }
     if (stage && (size_t)I * sizeof(float) > 96u * 1024u) stage = 0;
     size_t shbytes = stage ? (size_t)I * sizeof(float) : 0;
-    if (fmt != 1 && fmt != 4) return 0;
+    if (fmt != 1 && fmt != 2 && fmt != 4) return 0;   /* 2 = fp16, no scales */
     int gsh = 0;
     if (fmt == 4) {
         if (gs <= 0 || (gs & (gs - 1))) return 0;        /* need a power of two */
@@ -1127,6 +1173,14 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
     if (!ensure_dense_scratch(I, O)) return 0;
     if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)I * sizeof(float),
                             cudaMemcpyHostToDevice, g_stream), "dense x upload")) return 0;
+    if (fmt == 2) {                       /* fp16 weights, no scales */
+        if (I & 3) return 0;
+        k3_dense_f16<<<O, 64, 0, g_stream>>>(g_dy, g_dx, (const __half *)w, I, O);
+        if (!ck(cudaGetLastError(), "f16 launch")) return 0;
+        if (!ck(cudaMemcpyAsync(y, g_dy, (size_t)O * sizeof(float),
+                                cudaMemcpyDeviceToHost, g_stream), "f16 download")) return 0;
+        return ck(cudaStreamSynchronize(g_stream), "f16 sync");
+    }
     int exact = 1;
     { const char *fe = getenv("K3_DENSE_EXACT"); if (fe) exact = atoi(fe); }
     int blocks = (O + K3_WARPS - 1) / K3_WARPS;

@@ -421,7 +421,7 @@ static int64_t w_bytes(const W *w){
 /* The weight blob coli_cuda_* expects for this format. */
 static const void *w_blob(const W *w){
     return w->fmt==0 ? (const void*)w->f
-         : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
+         : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;   /* fmt 2 and 4 both live in q4 */
 }
 
 /* K3_GPUS="0" or "0,1" places resident tensors on those CUDA ordinals; unset
@@ -614,6 +614,44 @@ static W w_concat4(const W *a, const W *b, const W *c, const W *d, int r0, int n
 }
 
 /* ---------- W: load-time quantization + matvec ---------- */
+
+
+#ifdef COLI_CUDA
+static int w_k3_ptrs_any(const W *w, const void **blob, const float **sc){
+    if(!g_k3_dense_gpu || !g_k3_cuda || w->k3_dense_off) return 0;
+    if(w->fmt!=1 && w->fmt!=2 && w->fmt!=4) return 0;
+    W *mw=(W*)w;
+    int64_t rb=(w->fmt==4)?((int64_t)w->I+1)/2
+             :(w->fmt==2)?((int64_t)w->I*2):(int64_t)w->I;
+    int64_t nsc=(w->fmt==4)?((int64_t)w->I+w->gs-1)/w->gs:1;
+    if(!mw->k3_reg){
+        if(coli_k3_register((void*)w_blob(w),(size_t)w->O*rb) &&
+           (w->fmt==2 || coli_k3_register(w->s,(size_t)w->O*nsc*sizeof(float)))) mw->k3_reg=1;
+        else { mw->k3_dense_off=1; return 0; }
+    }
+    if(!mw->k3_dev_tried){
+        void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
+        if(dw){ if(w->fmt==2){ mw->k3_dw=dw; mw->k3_ds=NULL; }
+                else { void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
+                       if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; } } }
+        mw->k3_dev_tried=1;
+    }
+    *blob = mw->k3_dw ? (const void*)mw->k3_dw : w_blob(w);
+    *sc   = (w->fmt==2) ? NULL : (mw->k3_dw ? (const float*)mw->k3_ds : w->s);
+    return 1;
+}
+#endif
+
+#ifdef COLI_CUDA
+/* One S==1 dense call with the register/mirror latch, for callers that need to
+ * drive it per token. */
+static int w_k3_dense_one(float *y, const float *x, const W *w){
+    const void *bl; const float *sc;
+    if(!w_k3_ptrs_any(w,&bl,&sc)) return 0;
+    return coli_k3_dense(y,x,bl,sc,w->fmt,1,w->I,w->O,w->gs);
+}
+#endif
+
 static void w_matmul(float *y, const float *x, const W *w, int S){
 #ifdef COLI_CUDA
     /* Zero-copy dense GEMV first: no upload and no duplicate of the weights,
@@ -625,29 +663,44 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
                        fprintf(stderr,"[K3/DENSE] generic: I=%d O=%d fmt=%d bytes=%.1fMB\n",
                                w->I,w->O,w->fmt,(double)w->I*w->O*4/1e6); } }
                else if(omp_in_parallel()) atomic_fetch_add_explicit(&g_dp_par,1,memory_order_relaxed); }
+    /* fp16 has no CPU path worth using and the generic CUDA path cannot take
+     * it, so drive the S==1 kernel once per token for prefill. Without this the
+     * teacher-forced logits capture -- which is prefill only -- would measure
+     * the scalar fallback instead of the kernel that actually runs in decode. */
+    if(g_k3_dense_gpu && g_k3_cuda && !w->k3_dense_off && !omp_in_parallel() && S>1
+       && w->fmt==2){
+        int ok=1;
+        for(int t=0;t<S && ok;t++)
+            ok = w_k3_dense_one(y+(int64_t)t*w->O, x+(int64_t)t*w->I, w);
+        if(ok) return;
+    }
     if(g_k3_dense_gpu && g_k3_cuda && !w->k3_dense_off && !omp_in_parallel() && S==1
-       && (w->fmt==1||w->fmt==4)){
+       && (w->fmt==1||w->fmt==2||w->fmt==4)){
         W *mw=(W*)w;
+        /* fmt 2 is fp16 with no scale array; everything else carries one. */
+        int64_t rb=(w->fmt==4)?((int64_t)w->I+1)/2
+                 :(w->fmt==2)?((int64_t)w->I*2):(int64_t)w->I;
+        int64_t nsc=(w->fmt==4)?((int64_t)w->I+w->gs-1)/w->gs:1;
         if(!mw->k3_reg){
-            int64_t rb=(w->fmt==4)?((int64_t)w->I+1)/2:(int64_t)w->I;
-            int64_t nsc=(w->fmt==4)?((int64_t)w->I+w->gs-1)/w->gs:1;
             if(coli_k3_register((void*)w_blob(w),(size_t)w->O*rb) &&
-               coli_k3_register(w->s,(size_t)w->O*nsc*sizeof(float))) mw->k3_reg=1;
+               (w->fmt==2 || coli_k3_register(w->s,(size_t)w->O*nsc*sizeof(float)))) mw->k3_reg=1;
             else mw->k3_dense_off=1;
         }
         if(mw->k3_reg){
             if(!mw->k3_dev_tried){
-                int64_t rb=(w->fmt==4)?((int64_t)w->I+1)/2:(int64_t)w->I;
-                int64_t nsc=(w->fmt==4)?((int64_t)w->I+w->gs-1)/w->gs:1;
                 void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
                 if(dw){
-                    void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
-                    if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; }   /* both or neither */
+                    if(w->fmt==2){ mw->k3_dw=dw; mw->k3_ds=NULL; }
+                    else {
+                        void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
+                        if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; }   /* both or neither */
+                    }
                 }
                 mw->k3_dev_tried=1;
             }
             const void *bl = mw->k3_dw ? mw->k3_dw : w_blob(w);
-            const float *sc = mw->k3_dw ? (const float*)mw->k3_ds : w->s;
+            const float *sc = (w->fmt==2) ? NULL
+                            : mw->k3_dw ? (const float*)mw->k3_ds : w->s;
             if(coli_k3_dense(y,x,bl,sc,w->fmt,S,w->I,w->O,w->gs)){
                 if(g_dense_census) atomic_fetch_add_explicit(&g_dp_k3,1,memory_order_relaxed);
                 return; }
@@ -670,16 +723,30 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
             }
         }
         if(mw->cuda_placed){
-            if(coli_cuda_matmul(&mw->cuda,y,x,w_blob(w),w->s,w->fmt,S,w->I,w->O,
+            if(w->fmt!=2 &&
+               coli_cuda_matmul(&mw->cuda,y,x,w_blob(w),w->s,w->fmt,S,w->I,w->O,
                                 mw->cuda_device,w->gs)) return;
             mw->cuda_failed = 1;
-            if(g_k3_cuda_nfail++ < 8)
+            if(w->fmt!=2 && g_k3_cuda_nfail++ < 8)
                 fprintf(stderr,"[K3/CUDA] tensor [%d,%d] fmt=%d on device %d disabled "
                     "after an error; falling back to CPU\n",w->O,w->I,w->fmt,mw->cuda_device);
         }
     }
 #endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
+    else if(w->fmt==2){                 /* fp16 weights: expand and dot */
+        const uint16_t *hw=(const uint16_t*)w->q4;
+        for(int t=0;t<S;t++){
+            const float *xt=x+(int64_t)t*w->I; float *yt=y+(int64_t)t*w->O;
+            for(int o=0;o<w->O;o++){
+                const uint16_t *hr=hw+(int64_t)o*w->I; float v=0;
+                for(int i=0;i<w->I;i++){
+                    uint32_t h=hr[i], sgn=(h&0x8000u)<<16, e=(h>>10)&0x1f, m=h&0x3ff, b;
+                    if(!e) b=sgn;
+                    else b=sgn|((e+112u)<<23)|(m<<13);
+                    float wv; memcpy(&wv,&b,4); v+=xt[i]*wv; }
+                yt[o]=v; } }
+    }
     else if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==4) matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs);
     else { fprintf(stderr,"w_matmul: bad fmt %d\n",w->fmt); exit(1); }
@@ -1146,7 +1213,33 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             { static int ri8=-1;
               if(ri8<0){ const char *e=getenv("K3_ROUTER_I8"); ri8=e?atoi(e):0; }
               int64_t RO=c->n_experts, RI=c->hidden;
-              if(ri8){
+              static int rf16=-1;
+              if(rf16<0){ const char *e=getenv("K3_ROUTER_F16"); rf16=e?atoi(e):0; }
+              if(rf16 && !ri8){
+                  /* fp16 keeps relative precision everywhere (~0.05%) where int8
+                   * per-row ties the error to the row max (~2%), so it perturbs
+                   * the top-16 DECISION far less for half the bytes rather than
+                   * a quarter. Stored in q4 as raw 16-bit halves. */
+                  o->router_w.q4=malloc((size_t)RO*RI*2);
+                  if(!o->router_w.q4){fprintf(stderr,"OOM router fp16\n");exit(1);}
+                  uint16_t *h=(uint16_t*)o->router_w.q4;
+                  for(int64_t i=0;i<RO*RI;i++){
+                      float v=o->router[i];
+                      uint32_t b; memcpy(&b,&v,4);
+                      uint32_t sgn=(b>>16)&0x8000u; int32_t e2=(int32_t)((b>>23)&0xff)-127+15;
+                      uint32_t man=b&0x7fffffu;
+                      uint16_t out;
+                      if(e2<=0) out=(uint16_t)sgn;                       /* flush tiny to zero */
+                      else if(e2>=31) out=(uint16_t)(sgn|0x7bffu);       /* clamp to max half */
+                      else {
+                          uint32_t r=man&0x1fffu; man>>=13;
+                          if(r>0x1000u || (r==0x1000u && (man&1))){ man++; if(man>0x3ffu){man=0;e2++;} }
+                          out=(uint16_t)(sgn|((uint32_t)e2<<10)|man);
+                      }
+                      h[i]=out; }
+                  o->router_w.fmt=2;
+                  free(o->router); o->router=NULL;
+              } else if(ri8){
                   o->router_w.q8=malloc((size_t)RO*RI);
                   o->router_w.s=falloc(RO);
                   if(!o->router_w.q8){fprintf(stderr,"OOM router int8\n");exit(1);}
