@@ -365,6 +365,11 @@ static void k3_head_shard(int H, int *h0, int *hn){
  * quant_matmul is 64% of GPU time at 1.37 ms a call against 91 us for
  * k3_dense_i4g_exactW, so the split matters more than either kernel does. */
 static _Atomic long g_dp_k3=0, g_dp_off=0, g_dp_fmt=0, g_dp_par=0;
+/* How many routed experts this rank actually ran. Per-rank expert time is
+ * reproducibly ordered 0 > 1 > 3 > 2 across runs, which is a fixed bias rather
+ * than per-token variance, so the question is whether the ranks run different
+ * NUMBERS of experts or the same number at different cost. */
+static _Atomic long g_exp_n=0, g_exp_layers=0;
 static int g_dense_census = 0;    /* K3_DENSE_CENSUS=1 */
 #ifdef COLI_CUDA
 /* ---------- optional GPU placement for the RESIDENT (dense) tensors ----------
@@ -1904,6 +1909,8 @@ static void moe_forward(Model *m, Layer *l, int li, const float *x, int C, float
                 else for(int k2=0;k2<6;k2++) if(er->fd[k2]>=0) posix_fadvise(er->fd[k2],er->off[k2],sizes[k2],POSIX_FADV_WILLNEED);
             }
         double te0=now_s();
+        if(g_dense_census){ atomic_fetch_add_explicit(&g_exp_n,nu,memory_order_relaxed);
+                            atomic_fetch_add_explicit(&g_exp_layers,1,memory_order_relaxed); }
         experts_apply_union(m,li,nu,uid,pfirst,pcnt,poslist,wlist,z,LT,C,u,gate,up,hz);
         m->t_expert+=now_s()-te0;
         free(map);free(uid);free(pcnt);free(pfirst);free(poslist);free(wlist);free(cur);
@@ -2398,6 +2405,12 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            g_ctl_secs-dcw0,m->t_ctljoin-dcj0,
            m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0,g_ctl_start-dcs0,
            g_resmix_secs-drm0);
+    if(g_dense_census) fprintf(stderr,"[K3/EXP] experts run=%ld over %ld layer-calls (%.3f per call)\n",
+            (long)atomic_load_explicit(&g_exp_n,memory_order_relaxed),
+            (long)atomic_load_explicit(&g_exp_layers,memory_order_relaxed),
+            atomic_load_explicit(&g_exp_layers,memory_order_relaxed)
+              ? (double)atomic_load_explicit(&g_exp_n,memory_order_relaxed)
+                / (double)atomic_load_explicit(&g_exp_layers,memory_order_relaxed) : 0.0);
     if(g_dense_census) fprintf(stderr,"[K3/DENSE] decode dispatch: exact=%ld off=%ld fmt=%ld inpar=%ld\n",
             (long)atomic_load_explicit(&g_dp_k3,memory_order_relaxed),
             (long)atomic_load_explicit(&g_dp_off,memory_order_relaxed),

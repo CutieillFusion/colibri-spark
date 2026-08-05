@@ -659,24 +659,47 @@ so halving its payload cannot shorten a wait that was already covered, while the
 extra round trip is real. The split is therefore worth having on the exposed
 sites and not on the hidden one.
 
-### Load imbalance shows up as collective time, and it is small
+### The "expert imbalance" is not expert imbalance -- four falsified explanations
 
-Per-rank PROF2 from one run:
+Per-rank `expert` time is reproducible to +-0.02 across five runs and always
+ordered 0 > 1 > 3 > 2, so it is a fixed bias rather than per-token variance.
+The obvious reading -- routed experts are owned by `e % world == rank`, so some
+token's top-16 lands unevenly -- is **wrong**, and a census of how many experts
+each rank actually runs (`K3_DENSE_CENSUS=1`) says so directly:
 
-| rank | expert | netmoe | sum |
-|---|---|---|---|
-| 0 | 2.634 | 1.019 | 3.653 |
-| 1 | 2.468 | 1.255 | 3.723 |
-| 2 | 2.217 | 1.486 | 3.703 |
-| 3 | 2.308 | 1.403 | 3.711 |
+| rank | experts/call | expert s/100 | s per expert | netmoe | sum |
+|---|---|---|---|---|---|
+| 0 | **4.460** (fewest) | **2.640** (slowest) | 0.592 | 1.189 | 3.829 |
+| 1 | 4.696 | 2.468 | 0.526 | 1.489 | 3.957 |
+| 2 | 4.527 | **2.240** (fastest) | 0.495 | 1.811 | 4.051 |
+| 3 | **4.698** (most) | 2.320 | 0.494 | 1.722 | 4.042 |
 
-`expert` and `netmoe` are anti-correlated and their sum is nearly constant --
-the definition of load imbalance, with the early finishers paying at the
-collective. The cause is structural: routed experts are owned by
-`e % world == rank`, so a token whose top-16 lands 5/3/4/4 gives one rank 60%
-more expert work than another. The recoverable amount is only
-`mean(max - own)` = **2.3 ms/token**, and rebalancing is not possible without
-moving expert weights between nodes, which the fabric cannot pay for.
+Count and time are **anti-correlated**: rank 0 runs the fewest experts and takes
+the longest. The counts themselves are balanced within +-2.6%, which is what the
+router's `e_score_correction_bias` is trained to achieve. So there is no work
+imbalance to fix; what differs is cost per expert, by up to 20%.
+
+Four candidate causes, each measured and rejected:
+
+* **Routing count.** Rejected above -- counts anti-correlate with time.
+* **Store layout.** Rank 0 is the only rank the harness does not give
+  `K3_W2_SHARD`, so it falls to `sw=1` and indexes all 896 experts at
+  `(nmoe*896 + e)*e_slot` -- reading its quarter at 4x stride across a 425 GB
+  store, where ranks 1-3 read packed 106 GB stores contiguously (confirmed:
+  425 GB vs 106/106/106). This looked decisive and is not: `/proc/<pid>/io`
+  says every rank reads **113.7-113.8 GB**, identical.
+* **Host load or thermals.** Equal: 210-250% CPU, 68-69 C on all four.
+* **Lock-step relabeling** -- the idea that ranks are pinned together by the
+  collective so only the split between `expert` and `netmoe` varies. The
+  anti-correlation is nearly perfect, but the sums are 3.829 / 3.957 / 4.051 /
+  4.042, a 5.8% spread, so some of it is real skew rather than relabeling.
+
+What survives: expert **work** is balanced, most of the apparent imbalance is
+where each rank absorbs its wait, and the residual real skew is the sum spread
+-- **2.2 ms/token**, not attributable to expert assignment. The remaining 20%
+per-expert cost difference on rank 0 is unexplained; the next instrument that
+would settle it is per-kernel occupancy on each host, which is what `ncu` is
+blocked on.
 
 ### The chip is power-capped, which changes what "optimization" means
 
