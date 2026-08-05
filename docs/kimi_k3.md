@@ -746,6 +746,41 @@ Adding `!m->w1_mode` makes the option a correct no-op here instead of a crash.
 It cannot be evaluated on this deployment at all until a 2-bit store exists, so
 its "0.51 vs 0.58 tok/s" note stands unretested.
 
+### GB10 is big.LITTLE, and pinning to the fast cluster is WORSE
+
+`lscpu` reports one model name but `/proc/cpuinfo` has two CPU part ids in equal
+numbers: **10x Cortex-X925 at 3.9 GHz (cpus 5-9, 15-19) and 10x Cortex-A725 at
+2.808 GHz (0-4, 10-14)**. Nothing in the engine pinned anything, so the main
+OpenMP team could be scheduled onto the 2.808 GHz cluster -- 72% of the clock --
+while the bandwidth-bound control sat on the fast one. That looks like free
+performance.
+
+It is not. Pinning by role -- main team and its OpenMP workers on the big
+cluster, control on the little one, since the control streams 456 MB/token and
+is bandwidth-bound rather than clock-bound:
+
+| | tok/s | khead s/100 |
+|---|---|---|
+| no pinning | **4.347 / 4.355** | **0.899** |
+| main->big, control->little | 4.253 / 4.260 | 1.370 |
+| the same, plus loaders->little | 4.347 / 4.299 | 1.313 |
+
+Pinning the loader pool helped -- without it the loaders inherit the main
+thread's mask and crowd onto the big cluster too -- but no variant beat leaving
+the scheduler alone, and `khead` was worse in every pinned configuration.
+
+The reason is that `khead` is bandwidth-bound, not clock-bound, and the two
+clusters have their own cache and memory paths. Eight threads spread over 20
+cores reach more aggregate bandwidth than eight threads confined to the ten fast
+ones, and 39% more clock does not pay for the lost path width. The kernel's
+scheduler already places the hot threads sensibly; a static mask only removes
+its freedom to spread them.
+
+This is the same lesson as the control port and the thread-count sweep, in a
+third form: on this part the binding resource is memory, so decisions that look
+like compute decisions -- move it to the GPU, give it faster cores -- lose,
+while decisions that reduce contention win.
+
 ### The one CPU reduction that worked: stop oversubscribing 20 cores
 
 `ctljoin` is 9.8 ms/token of the main thread *waiting* for the control, which

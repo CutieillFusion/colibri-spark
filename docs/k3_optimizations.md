@@ -77,6 +77,10 @@ Two more facts that shape the list:
 - [ ] CLOSED BY ARITHMETIC: hiding the 7.3 ms/token of expert I/O -- per layer
       there is 0.643 ms to hide and 0.467 ms of cover, so >=0.176 ms must be
       exposed and exactly 0.176 is. Reordering only moves which term shows it
+- [ ] REJECTED: big.LITTLE pinning (10x X925 @3.9GHz + 10x A725 @2.808GHz).
+      main->big/control->little 4.253, +loaders->little 4.347, unpinned 4.347/4.355.
+      khead worse in every pinned variant -- it is bandwidth-bound and two
+      clusters give more aggregate path width than one faster one
 - [x] OMP team 10 -> 8 workers: khead 10.4 -> 7.8 ms/token (-24%), 4.373 -> 4.389,
       6/6 exact. 10 OMP + 6 control + loaders + network did not fit 20 cores
 - [ ] MEASURED: SiTU is the only serial CPU loop left, but it sits inside the
