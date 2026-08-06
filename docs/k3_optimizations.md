@@ -343,3 +343,54 @@ right after an async `k3_net_allreduce_start` and `netmoe` is only 0.145 — the
 shared-expert compute is *covering* the latent collective. Shrinking it gains
 nothing unless the collective shrinks with it. Measure the collective in
 isolation before optimising either.
+
+---
+
+## The stated open list, resolved
+
+Three of the four items were already implemented; checking beat assuming.
+
+- [x] **lm_head sharded + argmax allreduce** — already in (`kimi_k3.c:2499`).
+      Each rank takes a contiguous vocab range and only the argmax crosses the
+      wire; the full head is kept when `temp>0`, `K3_LOGITS` or trace need the
+      whole vector. `head` measures 0.203 s/100 tokens, which is what a
+      quarter of a 1.17 GB int8 matrix costs and a quarter of what a replicated
+      one would.
+
+- [x] **4-wide consecutive fold for the exact int4 kernel** — already in and the
+      default (`K3_DENSE_I4W=4`). W=8 is bit-exact and halves the loads again but
+      measured SLOWER (shared gate 377 -> 296 GB/s): 32 threads is one warp, so
+      24 blocks/SM reaches only 768 threads.
+
+- [x] **Is `K3_DENSE_DEV_GB` or the 64 MB cap binding?** — neither. The cap
+      stopped being 64 MB when the 4-wide fold made mirroring pay for lm_head
+      too; it is 2 GB and guards only against one tensor eating the budget. With
+      a budget set, 16.06 GB is placed, 0.00 skipped for budget, 0.00 for cap.
+      **The real finding: the speed harness was passing `DEVGB=0`, which
+      disables mirroring outright.** Every measurement this session ran that way.
+
+      | | tok/s | mirrored |
+      |---|---|---|
+      | DEVGB=0 | 4.699 | 0.00 GB |
+      | DEVGB=auto | 5.153 | 16.06 GB |
+      | DEVGB=24 | 5.178 | 16.06 GB |
+
+      auto and 24 resolve to the same budget, so their 0.5% spread is the noise
+      floor. Mirroring is bit-exact (6/6 identical) — same kernel, same order,
+      different placement.
+
+- [ ] **float4 shared loads for the w2 (2-bit) expert kernel** — still not
+      validatable end to end: this deployment runs the 1-bit store.
+
+## Where decode time goes now (5.21 tok/s, standard prompt)
+
+`shared` 3.53 and `arwork` 2.73 are two legs of one overlap: the shared-expert
+compute exists to cover the latent allreduce. `netmoe` 0.27 is the exposed
+remainder. Cutting either leg alone gains nothing — the other becomes the floor.
+That pair is ~20% of decode and needs both halves attacked together, which
+retires "optimise the largest term" as a strategy here.
+
+- [x] **One persistent allreduce worker** — `allreduce_start` spawned a thread
+      per call, 9108 per 100 decode tokens. arspawn 0.181 -> 0.011, and arwork
+      fell 3.248 -> 2.733 because creating a thread also delayed the collective's
+      *start*. 5.139 -> 5.211 tok/s, 6/6 byte-identical.
