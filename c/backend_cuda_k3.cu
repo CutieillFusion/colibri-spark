@@ -1637,7 +1637,41 @@ extern "C" void *coli_k3_devmirror(const void *host, size_t bytes) {
     if (bytes > (size_t)2048 * 1024 * 1024) { g_devmir_cap_skip += bytes; return nullptr; }
     if (bytes > g_devmir_left) { g_devmir_budget_skip += bytes; return nullptr; }
     void *d = nullptr;
-    if (cudaMalloc(&d, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    /* The mirror exists for large pages, not for device locality -- this GPU is
+     * integrated, so cudaMalloc does not move the bytes anywhere, it just maps
+     * them at a coarser granularity than the SMMU gives host-registered pages.
+     * That means the tensor is now resident TWICE in the same LPDDR5X, which
+     * the startup banner says outright, and 16.06 GB is held twice.
+     *
+     * cudaMallocManaged would be dereferenceable from both sides, so the host
+     * copy could be freed and every pointer repointed at the managed one -- no
+     * duplicate and, unlike free()ing the host copy outright, no way for a CPU
+     * fallback to reach a dangling pointer.
+     *
+     * MEASURED WORSE ON BOTH COUNTS, so that route is closed:
+     *
+     *     e2e      5.206 -> 4.796 tok/s   -7.9%
+     *     shared   3.509 -> 4.440
+     *     kout     2.949 -> 3.212
+     *     RSS      70.94 -> 86.21 GB
+     *
+     * Managed pages do not keep whatever mapping cudaMalloc gets here -- the
+     * dense timers all regress. And RSS went UP 15.3 GB rather than down,
+     * which says the duplication was never visible in RSS to begin with:
+     * cudaMalloc'd device pages on this integrated part are physically
+     * resident but not charged to the process, while managed pages are. So
+     * "free the host copy and save 16 GB" cannot be validated by watching RSS,
+     * and this particular way of doing it costs 8% besides.
+     *
+     * K3_DENSE_MANAGED=1 to re-run the A/B. */
+    static int mgd = -1;
+    if (mgd < 0) { const char *e = getenv("K3_DENSE_MANAGED"); mgd = e ? atoi(e) : 0; }
+    /* No cudaMemAdvise/cudaMemPrefetchAsync: CUDA 13 changed both to take a
+     * cudaMemLocation struct, and the cudaMemcpy below populates the pages
+     * anyway. Keeping the call portable matters more than the hint. */
+    if (mgd) {
+        if (cudaMallocManaged(&d, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    } else if (cudaMalloc(&d, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
     if (cudaMemcpy(d, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
         cudaGetLastError(); cudaFree(d); return nullptr;
     }
