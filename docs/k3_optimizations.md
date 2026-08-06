@@ -280,3 +280,66 @@ last. Each must be landed and gated SEPARATELY so a failure is attributable.
 Even a perfect fabric only reaches ~4.33 tok/s (256 - 53 = 203 ms/token), so
 the collective work alone was never going to deliver 5. Reaching 5 needs the
 non-exact list above AND the fabric.
+
+---
+
+## Context scaling (this round)
+
+The earlier list was written from a short-prompt profile. A sweep across
+138/513/1963/4863-token prompts showed every weight-bound term (kproj, shared,
+latent, router, ctljoin) flat to within 2-3% over a 35x context increase, while
+`matt` fit `0.83 + 0.00356*T` s per 100 decode tokens. At T=4863, matt alone was
+18.1 s of a 63 s/100-token decode. Long context is an MLA-attention problem, not
+a weights problem.
+
+- [x] **Vectorise the bf16 KV loops** — the score and context loops walked the
+      cache through `kv_dec()` (u16 load, widen, shift, type-pun), which gcc will
+      not vectorise. One X925 core: 2.35 GMAC/s scalar, 19.96 GMAC/s with
+      `vshll_n_u16(v,16)` reinterpreted as f32 — 8.5x. At ctx 1963 this took
+      decode 3.06 -> 3.62 tok/s (+18.2%) and prefill 6.66 -> 8.04 (+20.7%).
+      **matt was compute-bound on the conversion, not bandwidth-bound on the
+      cache** — which is why every cache-traffic theory had failed to move it.
+
+- [x] **Tile both operands in the prefill GEMM** — the prefill kernel had been
+      rewritten twice on the theory that its shape was the cost. Counting bytes
+      showed why that kept failing: both shapes were row-parallel, so every block
+      re-read the whole activation block — 2.8 GB of x against 12.4 MB of
+      weights, ~1.05 TB/s at the measured rate, i.e. the L2 roofline. Tiling to
+      32 rows x 32 tokens cuts x traffic 32x. 7.57 -> 8.19 tok/s.
+
+- [ ] ~~**Head-batched MLA attention**~~ — MEASURED SLOWER (-14% decode, +74%
+      prefill matt), left off behind `K3_MATT_BATCH`. "24 heads each re-read the
+      cache" counts LOGICAL reads; the heads run concurrently on the same L, so
+      the hardware already served them from cache. Batching swapped which operand
+      is re-read and quadrupled the OpenMP regions per token. Byte-identical
+      output, so the construction was right and the premise was wrong.
+
+### The pattern, seventh confirmation
+
+Removing work wins; moving or batching it loses. Vectorising `kv_dec` removed
+instructions and won 18%. Head-batching rearranged the same instructions and lost
+14%. Every accepted win this project has taken removes work (device mirror
+budget, fused SiTU, split cross-exchange, batched 1-bit expert kernels, tiled
+prefill, NEON KV); every rejected one moved it.
+
+### Quality
+
+Budget loosened to e2e PCC >= 0.999. Teacher-forced against the exact path:
+
+| change | e2e PCC | min/position | top-1 |
+|---|---|---|---|
+| NEON KV only | 0.999994 | 0.999908 | 100% |
+| tile prefill only | 0.999902 | 0.998689 | 100% |
+| both (shipped) | 0.999504 | 0.997518 | 100% |
+
+Free-running output is coherent and semantically equivalent but no longer
+byte-identical: the dense path feeds the router, and the router picks top-16 of
+896, so any reordering can flip an expert.
+
+### Next
+
+`shared` (4.470 s/100 tok) is now the largest decode term, but its timer starts
+right after an async `k3_net_allreduce_start` and `netmoe` is only 0.145 — the
+shared-expert compute is *covering* the latent collective. Shrinking it gains
+nothing unless the collective shrinks with it. Measure the collective in
+isolation before optimising either.
