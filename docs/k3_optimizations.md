@@ -501,3 +501,41 @@ project already paid for once.
 So the win is real and blocked on memory headroom, not on being wrong. It
 becomes available if expert residency is reduced some other way -- for example
 releasing host copies of mirrored tensors, which is still open.
+
+### Memory is fungible between the mirror and the expert cache
+
+The open question was always phrased as "is the mirror budget binding?". At the
+standard prompt it is not -- RSS is 71 GB of 121, nothing is skipped, and more
+mirror is free. At ctx 1963 RSS is 98 GB and `load` shows 0.87 s/100 tokens of
+real expert streaming, so there the two consumers genuinely compete. Measured at
+ctx 1963, two warm passes each:
+
+| | tok/s | mirrored | RSS | expert hit |
+|---|---|---|---|---|
+| DEVGB=auto, EGB=88 | 3.932 | 16.06 GB | 97.99 | 99.0% |
+| DEVGB=8, EGB=96 | 3.907 | 8.00 GB | 103.02 | 99.8% |
+
+-0.6%, inside noise. Moving 8 GB from one to the other changes nothing: what the
+dense path loses in bandwidth the expert cache gives back in hit rate. **A GB is
+a GB**, and the earlier DEVGB=0 vs auto result (4.699 -> 5.153, +9.6% for 16 GB
+of mirror) prices what a GB is worth.
+
+That reframes the largest remaining item. This GPU is integrated, so
+`coli_k3_devmirror` does not move the weights to separate memory -- it
+DUPLICATES them in the same LPDDR5X, which the startup log says outright
+("placement duplicates weights in shared RAM and shrinks the expert cache by the
+same amount"). 16.06 GB is currently held twice.
+
+Recovering the host half is not a trade like the table above; it is 16 GB of
+pure gain, and on the pricing above that is worth roughly what mirroring itself
+is worth. It also unblocks the vectorised control dot, which needs only 1.5 GB.
+
+- [ ] **Free the host copy of mirrored tensors.** Weights are `pread` into heap
+      (st.h deliberately avoids mmap), so this is a real `free()`, not an
+      madvise. The risk is precise and must be handled first: `w_matmul` falls
+      back to the CPU path on `w_blob(w)` whenever `coli_k3_dense` declines a
+      shape, and `w_rowdot`/`w_addrow` read `w->f`/`w->q8` directly. Freeing
+      without proving no path can reach the host copy turns a decline into a
+      use-after-free. The safe shape is to free only tensors whose GPU path is
+      unconditional for every shape they are called with, and to make the
+      fallback assert rather than read freed memory.
