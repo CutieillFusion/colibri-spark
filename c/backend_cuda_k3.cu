@@ -28,6 +28,7 @@
  */
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstring>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1025,6 +1026,145 @@ __global__ void k3_dense_i4g_exactW_S(float *__restrict__ y, const float *__rest
     }
 }
 
+
+/* ---------------- prefill GEMM, warp-per-row ------------------------------
+ * The first prefill kernel was a decode GEMV wearing a loop: 64 threads (two
+ * warps) per block, a 256-lane tree reduction and ~7 block-wide barriers PER
+ * TOKEN, so a 32-token chunk paid ~256 barriers per block. It recovered only
+ * part of the gap -- prefill sits at 7.4 tok/s against a ~97 tok/s weight
+ * floor, so the shape is the cost, not the bytes.
+ *
+ * This is the shape the expert path already uses (warp_row_dot_w1): one WARP
+ * owns an output row, reduces with __shfl_down_sync, and never touches a block
+ * barrier. Eight warps per block stage eight weight rows in shared (32 KB at
+ * I=7168) and walk all C tokens against them.
+ *
+ * NOT bit-exact against decode: a 32-lane shuffle reduction sums in a different
+ * order than the 256-lane tree. That is the point of a separate prefill
+ * implementation -- gate it on the quality harness, not the reference hash. */
+#define K3_PF_WARPS 8
+__global__ void k3_dense_i4g_pf(float *__restrict__ y, const float *__restrict__ x,
+                                const unsigned char *__restrict__ q4,
+                                const float *__restrict__ scales,
+                                int I, int O, int gsh, int ng, int S) {
+    int warp = (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31);
+    int o = blockIdx.x * K3_PF_WARPS + warp;
+    size_t rb = (size_t)((I + 1) >> 1);
+    size_t rbA = (rb + 15) & ~(size_t)15;
+
+    extern __shared__ unsigned char shp[];
+    unsigned char *w   = shp + (size_t)warp * rbA;
+    float         *scl = (float *)(shp + (size_t)K3_PF_WARPS * rbA) + (size_t)warp * ng;
+    if (o < O) {
+        for (size_t i = lane; i < rb; i += 32) w[i] = q4[(size_t)o * rb + i];
+        for (int g = lane; g < ng; g += 32) scl[g] = scales[(size_t)o * ng + g];
+    }
+    __syncwarp();
+    if (o >= O) return;
+
+    for (int t = 0; t < S; t++) {
+        const float *xs = x + (size_t)t * I;
+        float a = 0.f;
+        for (int i = lane * 4; i + 3 < I; i += 128) {
+            int g = i >> gsh; if (g >= ng) g = ng - 1;
+            float sc = scl[g];
+            float4 xx = *(const float4 *)(xs + i);
+            unsigned char b0 = w[(i >> 1)], b1 = w[(i >> 1) + 1];
+            a += xx.x * (float)((int)(b0 & 15) - 8) * sc;
+            a += xx.y * (float)((int)(b0 >> 4)  - 8) * sc;
+            a += xx.z * (float)((int)(b1 & 15) - 8) * sc;
+            a += xx.w * (float)((int)(b1 >> 4)  - 8) * sc;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+        if (!lane) y[(size_t)t * O + o] = a;
+    }
+}
+
+/* ---------------- prefill GEMM, 2D tiled ----------------------------------
+ * Both earlier prefill kernels were row-parallel: every block re-read the WHOLE
+ * activation block. At O=3072, I=7168, S=32 that is
+ *   weights  12.4 MB   (each row staged once -- already minimal)
+ *   x       384 blocks x 918 KB = 2.8 GB   (226x the weights)
+ * x is only 918 KB so it lives in L2, but 2.8 GB of L2 reads at the measured
+ * 2.69 ms/call is ~1.05 TB/s -- the L2 roofline. That is why neither halving
+ * the barriers (warp shape, +2%) nor cutting DRAM weight traffic moved it:
+ * prefill was never DRAM-bound, it was bound on re-reading activations.
+ *
+ * So tile both operands. A block owns 32 output rows x 32 tokens and walks the
+ * reduction in 256-element steps, staging x[32][256] and w[32][256/8] in
+ * shared. x is now read once per ROW-TILE rather than once per ROW:
+ *   (O/32) x S x I x 4 = 88 MB, a 32x cut, and weights stay at 12.4 MB.
+ * Each staged weight nibble feeds 4 FMAs (one per token the warp owns), which
+ * is also what lifts arithmetic intensity off the shared-memory port.
+ *
+ * Lane owns a row and warp owns 4 tokens, so ws[] is indexed by lane (padded
+ * +1 uint32 to spread banks) and xs[] is warp-uniform (a broadcast, free).
+ *
+ * NOT bit-exact against decode -- the reduction runs in 256-element tiles in
+ * thread-local order rather than a 256-lane tree. Gate on the quality harness. */
+#define K3_TG_O 32
+#define K3_TG_S 32
+#define K3_TG_I 256
+__global__ __launch_bounds__(256) void
+k3_dense_i4g_tg(float *__restrict__ y, const float *__restrict__ x,
+                const unsigned char *__restrict__ q4, const float *__restrict__ scales,
+                int I, int O, int ng, int S) {
+    int lane = (int)(threadIdx.x & 31), warp = (int)(threadIdx.x >> 5);
+    int o0 = blockIdx.x * K3_TG_O, t0 = blockIdx.y * K3_TG_S;
+    int o  = o0 + lane;
+    size_t rb = (size_t)(I >> 1);
+
+    __shared__ float        xs[K3_TG_S][K3_TG_I];
+    __shared__ unsigned int ws[K3_TG_O][K3_TG_I / 8 + 1];   /* +1: bank spread   */
+    __shared__ float        ss[K3_TG_O][K3_TG_I / 64 + 1];  /* +1: 5 is coprime  */
+
+    float a[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) a[j] = 0.f;
+
+    for (int i0 = 0; i0 < I; i0 += K3_TG_I) {
+        for (int p = (int)threadIdx.x; p < K3_TG_S * (K3_TG_I / 4); p += 256) {
+            int t = p / (K3_TG_I / 4), c = (p % (K3_TG_I / 4)) * 4, tg = t0 + t;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tg < S) v = *(const float4 *)(x + (size_t)tg * I + i0 + c);
+            *(float4 *)&xs[t][c] = v;
+        }
+        for (int p = (int)threadIdx.x; p < K3_TG_O * (K3_TG_I / 8); p += 256) {
+            int r = p / (K3_TG_I / 8), c = p % (K3_TG_I / 8);
+            ws[r][c] = (o0 + r < O)
+                     ? *(const unsigned int *)(q4 + (size_t)(o0 + r) * rb + (i0 >> 1) + c * 4)
+                     : 0u;
+        }
+        for (int p = (int)threadIdx.x; p < K3_TG_O * (K3_TG_I / 64); p += 256) {
+            int r = p / (K3_TG_I / 64), c = p % (K3_TG_I / 64);
+            int g = (i0 >> 6) + c; if (g >= ng) g = ng - 1;
+            ss[r][c] = (o0 + r < O) ? scales[(size_t)(o0 + r) * ng + g] : 0.f;
+        }
+        __syncthreads();
+
+        #pragma unroll 4
+        for (int c = 0; c < K3_TG_I / 8; c++) {
+            unsigned int wv = ws[lane][c];
+            float        sc = ss[lane][c >> 3];
+            int          k  = c * 8;
+            #pragma unroll
+            for (int n = 0; n < 8; n++) {
+                float wq = (float)((int)((wv >> (n * 4)) & 15u) - 8) * sc;
+                #pragma unroll
+                for (int j = 0; j < 4; j++) a[j] += xs[warp * 4 + j][k + n] * wq;
+            }
+        }
+        __syncthreads();
+    }
+    if (o >= O) return;
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {
+        int t = t0 + warp * 4 + j;
+        if (t < S) y[(size_t)t * O + o] = a[j];
+    }
+}
+
 /* ---------------- fp16 dense GEMV (fmt 2) ---------------------------------
  * For the router. int8 per-row quantization ties the absolute error to the row
  * maximum -- about 2% of a typical weight when the row spans 4 sigma -- and
@@ -1742,8 +1882,37 @@ extern "C" int coli_k3_dense_s(float *y, const float *x, const void *w, const fl
     if (!ensure_dense_scratch((int)((size_t)S * I), (int)((size_t)S * O))) return 0;
     if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)S * I * sizeof(float),
                             cudaMemcpyHostToDevice, g_stream), "prefill x")) return 0;
+    static int shape = -1;
+    if (shape < 0) {
+        const char *e = getenv("K3_PF_SHAPE");
+        shape = !e                  ? 2
+              : !strcmp(e, "tree")  ? 0
+              : !strcmp(e, "warp")  ? 1 : 2;
+    }
+    size_t rbA = ((rb + 15) & ~(size_t)15);
+    size_t shw = (size_t)K3_PF_WARPS * rbA + (size_t)K3_PF_WARPS * ng * sizeof(float);
+    /* 2D tile: needs a g64 store and a reduction length that divides evenly. */
+    if (shape == 2 && gs == 64 && (I % K3_TG_I) == 0) {
+        dim3 gr((O + K3_TG_O - 1) / K3_TG_O, (S + K3_TG_S - 1) / K3_TG_S);
+        k3_dense_i4g_tg<<<gr, 256, 0, g_stream>>>(
+            g_dy, g_dx, (const unsigned char *)w, scales, I, O, ng, S);
+        if (!ck(cudaGetLastError(), "prefill tile launch")) return 0;
+        goto pf_done;
+    }
+    if (shape && shw <= (size_t)mx) {
+        if (shw > 48u * 1024u &&
+            cudaFuncSetAttribute(k3_dense_i4g_pf,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shw)
+            != cudaSuccess) { cudaGetLastError(); goto pf_tree; }
+        k3_dense_i4g_pf<<<(O + K3_PF_WARPS - 1) / K3_PF_WARPS, K3_PF_WARPS * 32, shw, g_stream>>>(
+            g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng, S);
+        if (!ck(cudaGetLastError(), "prefill warp launch")) return 0;
+        goto pf_done;
+    }
+pf_tree:
     k3_dense_i4g_exactW_S<4><<<O, 64, shb, g_stream>>>(
         g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng, S);
+pf_done:;
     if (!ck(cudaGetLastError(), "prefill launch")) return 0;
     if (!ck(cudaMemcpyAsync(y, g_dy, (size_t)S * O * sizeof(float),
                             cudaMemcpyDeviceToHost, g_stream), "prefill y")) return 0;
