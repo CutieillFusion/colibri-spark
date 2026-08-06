@@ -112,6 +112,43 @@ experts (93 % of bytes) are already at 4.25 bits/weight and cannot shrink
 losslessly; sub-4-bit expert re-encodes (fmt=5/6) would be double quantization
 of QAT weights and are deliberately not offered here.
 
+## Provisioning from scratch
+
+Rebuilt end to end after a reboot cleared `/tmp` and took the staged snapshot
+and both expert stores with it. The full chain, in order:
+
+```
+# 1. snapshot (1.56 TB, 96 shards) -- keep it OFF /tmp
+rsync -a --partial --inplace /nas/models/moonshotai/Kimi-K3/ <node>:$K/Kimi-K3/
+
+# 2. tokenizer.json -- GENERATED, the HF repo ships only a raw tiktoken vocab
+python3 tools/k3_tokenizer.py $K/Kimi-K3 --check "Hello world"
+
+# 3. 1-bit expert store (425.4 GB, slot 5,160,960 B = 4.92 MiB)
+pack_experts_2bit.py --src $K/Kimi-K3 --out $K/K3-w1 --bits 1 --workers 6
+
+# 4. per-rank shards (106.4 GB each) -- c/tools/k3_shard_expert_store.py
+shard.py $K/K3-w1 <r> 4 out.bin   # then K3_W1_DIR + K3_W2_SHARD=r/4
+```
+
+Two traps worth naming. `tokenizer.json` is easy to miss because it is
+generated rather than downloaded, and the engine only complains at serve time
+(`serve mode needs tokenizer.json`) after a 134 s load. And `/tmp` is cleared at
+every boot: `/usr/lib/tmpfiles.d/tmp.conf` carries `D /tmp 1777 root root 30d`,
+where the `D` means empty-on-boot. The working set now lives under
+`/home/norquistdylan/k3data`.
+
+Distribution is topology-aware. `/nas` is a spinning disk over NFS that tops out
+near 60 MB/s, so exactly one node pulls from it and the rest copy over the local
+fabric, each shard forwarded as soon as its size matches the source exactly --
+`rsync --inplace` leaves an in-flight file short, so a partial cannot propagate.
+That pipelining took the restore from ~10.5 h serial to ~6 h.
+
+Verified after rebuild: snapshot 0 files differing from `/nas` on all four
+nodes, store byte-exact at 425,428,254,720 B, tokenizer merges replay matching
+tiktoken, and throughput **4.529 / 4.598** against **4.563 / 4.559** before the
+outage.
+
 ## Tokenizer
 
 The HF repo ships only a raw tiktoken vocab (`tiktoken.model`).
