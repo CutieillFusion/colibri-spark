@@ -447,3 +447,57 @@ thread competes with the OpenMP pool for the same ten cores).
 The same config measured 5.211 and 5.275 tok/s in two separate script runs.
 Cross-run drift exceeds the ~0.5% within-run spread, so only both-arms-in-one-
 script comparisons are valid. Every A/B above runs its arms back to back.
+
+---
+
+## Round 4: the CPU and the GPU are fighting over one memory system
+
+Round 3 inferred this from a failed batching experiment. Round 4 has direct
+evidence, from a change that runs entirely on the CPU.
+
+The KDA control path (`kda_control_b1`) stores fa/fb/bp unquantised and reduces
+them with `for(i) v+=x[i]*w[i]`. gcc cannot vectorise that -- FP addition is not
+associative and this build has no `-ffast-math`. One X925 core, 152 rows of
+I=7168: **1.96 GMAC/s scalar, 19.86 with NEON, 10.1x.** That is the third
+unvectorised CPU loop found this project (after matt's `kv_dec`), and the
+pattern is now worth stating: *anything the engine keeps in fp32 or an odd width
+and reduces with a plain loop is probably running at a tenth of its speed.*
+
+With it on, at the standard prompt (s/100 tokens):
+
+    ctlwork  2.72 -> 2.19    ctljoin 0.89 -> 0.44
+    kproj    3.22 -> 2.85    attn   10.08 -> 9.55
+
+**`kproj` fell 12% for a change that never touches the GPU.** That is the direct
+confirmation: less CPU traffic on LPDDR5X means more bandwidth for the dense
+kernel. It also explains the 112 vs 234.5 GB/s gap without any appeal to
+launch overhead.
+
+### Why it is still off
+
+End to end it is a wash, and at ctx 1963 with EGB=88 it OOM-kills all four ranks
+(confirmed in the kernel log).
+
+fa/fb/bp produce the KDA gate and beta, so reordering their reduction changes the
+recurrence, the residual stream, and therefore **which experts the router picks**.
+A different expert set has a different cache footprint: RSS came out at exactly
+72.47 GB with it on and 70.94 GB with it off, in both A/B orderings --
+deterministic, not timing. At ctx 1963 the scalar arm already sits at 97.9 GB of
+121, so a 1.5 GB shift is fatal.
+
+Trading expert cache for it does not pay either. At ctx 1963:
+
+| | tok/s | RSS | attn | moe | load |
+|---|---|---|---|---|---|
+| FDOT=0, EGB=88 | 3.916 | 97.9 | 13.010 | 11.454 | 0.858 |
+| FDOT=1, EGB=80 | 3.955 | 94.0 | 12.324 | 12.114 | 1.511 |
+
++1.0%, inside noise. The attention side gains 0.686 s and the smaller expert
+cache gives back 0.660 s. EGB=84 would split the difference but lands ~2 GB from
+an OOM cliff that grows with context, and "a throughput number from a workload
+that never reaches peak residency is not a safe configuration" is a rule this
+project already paid for once.
+
+So the win is real and blocked on memory headroom, not on being wrong. It
+becomes available if expert residency is reduced some other way -- for example
+releasing host copies of mirrored tensors, which is still open.
