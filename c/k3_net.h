@@ -421,6 +421,13 @@ static int       g_ar_active = 0;
  * separately charges pthread_create, which runs once per MoE layer per token --
  * ~9200 thread creations per 100 decode tokens. */
 static double    g_ar_t0 = 0, g_ar_end = 0, g_ar_dur = 0, g_ar_spawn = 0;
+/* One worker for the process, woken by condvar, instead of a fresh thread per
+ * call. pthread_create measured 19 us x 9108 calls = 0.175 s per 100 decode
+ * tokens; a condvar handshake is ~1-2 us. Removing work, not moving it. */
+static pthread_mutex_t g_ar_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_ar_cv = PTHREAD_COND_INITIALIZER;
+static int       g_ar_req = 0, g_ar_done = 1, g_ar_quit = 0, g_ar_started = 0;
+static int       g_ar_persist = -1;
 static long      g_ar_calls = 0;
 
 static void *k3_ar_worker(void *unused) {
@@ -432,6 +439,29 @@ static void *k3_ar_worker(void *unused) {
      * 0.974 -> 1.054 s/100 when the split applied here, against netkda -12.4%
      * and netmla -19% at the exposed sites. Payload reduction pays on exposed
      * collectives only. */
+    for (;;) {
+        pthread_mutex_lock(&g_ar_mu);
+        while (!g_ar_req && !g_ar_quit) pthread_cond_wait(&g_ar_cv, &g_ar_mu);
+        if (g_ar_quit) { pthread_mutex_unlock(&g_ar_mu); return NULL; }
+        g_ar_req = 0;
+        pthread_mutex_unlock(&g_ar_mu);
+
+        int save2 = g_net_split; g_net_split = 0;
+        k3_net_allreduce(g_ar_v, g_ar_n);
+        g_net_split = save2;
+        g_ar_end = k3_now();
+
+        pthread_mutex_lock(&g_ar_mu);
+        g_ar_done = 1;
+        pthread_cond_signal(&g_ar_cv);
+        pthread_mutex_unlock(&g_ar_mu);
+    }
+}
+
+/* The pre-existing shape: one thread per call, joined by wait(). Kept so
+ * K3_AR_PERSIST=0 measures exactly what it measured before. */
+static void *k3_ar_worker_once(void *unused) {
+    (void)unused;
     int save = g_net_split; g_net_split = 0;
     k3_net_allreduce(g_ar_v, g_ar_n);
     g_net_split = save;
@@ -441,27 +471,46 @@ static void *k3_ar_worker(void *unused) {
 
 static void k3_net_allreduce_start(float *v, size_t n) {
     if (g_net_world <= 1) return;
+    if (g_ar_persist < 0) { const char *e = getenv("K3_AR_PERSIST"); g_ar_persist = e ? atoi(e) : 1; }
     g_ar_v = v; g_ar_n = n;
     g_ar_t0 = k3_now();
-    double sp0 = g_ar_t0;
-    if (pthread_create(&g_ar_th, NULL, k3_ar_worker, NULL) != 0) {
-        k3_net_allreduce(v, n);          /* fall back to blocking */
-        return;
+    if (g_ar_persist) {
+        if (!g_ar_started) {
+            if (pthread_create(&g_ar_th, NULL, k3_ar_worker, NULL) != 0) {
+                k3_net_allreduce(v, n); return;      /* fall back to blocking */
+            }
+            g_ar_started = 1;
+        }
+        pthread_mutex_lock(&g_ar_mu);
+        g_ar_done = 0; g_ar_req = 1;
+        pthread_cond_signal(&g_ar_cv);
+        pthread_mutex_unlock(&g_ar_mu);
+    } else if (pthread_create(&g_ar_th, NULL, k3_ar_worker_once, NULL) != 0) {
+        k3_net_allreduce(v, n); return;
     }
-    g_ar_spawn += k3_now() - sp0;
+    g_ar_spawn += k3_now() - g_ar_t0;
     g_ar_calls++;
     g_ar_active = 1;
 }
 
 static void k3_net_allreduce_wait(void) {
     if (g_net_world <= 1 || !g_ar_active) return;
-    pthread_join(g_ar_th, NULL);
+    if (g_ar_persist) {
+        pthread_mutex_lock(&g_ar_mu);
+        while (!g_ar_done) pthread_cond_wait(&g_ar_cv, &g_ar_mu);
+        pthread_mutex_unlock(&g_ar_mu);
+    } else pthread_join(g_ar_th, NULL);
     g_ar_dur += g_ar_end - g_ar_t0;
     g_ar_active = 0;
 }
 
 static void k3_net_finalize(void) {
     if (g_net_world <= 1) return;
+    if (g_ar_started) {
+        pthread_mutex_lock(&g_ar_mu); g_ar_quit = 1;
+        pthread_cond_signal(&g_ar_cv); pthread_mutex_unlock(&g_ar_mu);
+        pthread_join(g_ar_th, NULL); g_ar_started = 0;
+    }
     for (int i = 0; i < K3_NET_MAX; i++) if (g_net_fd[i] >= 0) close(g_net_fd[i]);
     if (g_net_up >= 0) close(g_net_up);
     if (g_net_cross >= 0) close(g_net_cross);
