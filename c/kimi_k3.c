@@ -68,6 +68,7 @@
 #include <unistd.h>
 #endif
 #include <pthread.h>
+#include <sys/mman.h>
 #include <stdatomic.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -262,6 +263,7 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
      * identical. */
     ColiCudaTensor *cuda; int cuda_device; int8_t cuda_failed, cuda_placed;
     int8_t k3_reg, k3_dense_off;      /* zero-copy dense path: registered / declined */
+    int8_t k3_htouched;               /* this tensor's HOST blob was dereferenced */
     int8_t fmt_reported;              /* census: shape logged once */
     int8_t gs_reported;
     int8_t pf_reported;
@@ -714,7 +716,7 @@ static W w_rows(const W *w, int r0, int nrows){
     W v = *w;
     v.O = nrows;
 #ifdef COLI_CUDA
-    v.cuda = NULL; v.cuda_placed = 0; v.cuda_failed = 0; v.k3_reg = 0; v.k3_dense_off = 0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
+    v.cuda = NULL; v.cuda_placed = 0; v.cuda_failed = 0; v.k3_reg = 0; v.k3_dense_off = 0; v.k3_htouched = 0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
 #endif
     if(w->fmt==0)      v.f  = w->f  + (int64_t)r0*w->I;
     else if(w->fmt==1){ v.q8 = w->q8 + (int64_t)r0*w->I; v.s = w->s + r0; }
@@ -740,7 +742,7 @@ static W w_cols(const W *w, int i0, int n){
     W v = *w;
     v.I = n;
 #ifdef COLI_CUDA
-    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
+    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0; v.k3_htouched=0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
 #endif
     int64_t O=w->O;
     if(w->fmt==0){
@@ -783,7 +785,7 @@ static W w_concat4(const W *a, const W *b, const W *c, const W *d, int r0, int n
     const W *src[4]={a,b,c,d};
     W v=*a; v.O=4*n;
 #ifdef COLI_CUDA
-    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
+    v.cuda=NULL; v.cuda_placed=0; v.cuda_failed=0; v.k3_reg=0; v.k3_dense_off=0; v.k3_htouched=0; v.k3_dw=NULL; v.k3_ds=NULL; v.k3_dev_tried=0;
 #endif
     if(a->fmt==1){
         v.q8=malloc((size_t)4*n*a->I); v.s=falloc((int64_t)4*n);
@@ -808,6 +810,76 @@ static W w_concat4(const W *a, const W *b, const W *c, const W *d, int r0, int n
 
 
 #ifdef COLI_CUDA
+/* ---- reclaiming the host half of a mirrored tensor ------------------------
+ * This GPU is integrated: coli_k3_devmirror does not move bytes to separate
+ * memory, it re-maps them at a coarser granularity, so a mirrored tensor is
+ * resident TWICE in one LPDDR5X pool. 16.06 GB is held twice, and none of it
+ * shows in RSS -- cudaMalloc'd device pages are not charged to the process --
+ * so real occupancy is ~114 of 121 GB, not the 98 the profiler reports.
+ *
+ * Reclaiming the host half is worth ~16 GB but cannot be done with free():
+ * w_matmul falls back to the CPU on w_blob(w) whenever coli_k3_dense declines
+ * a shape, w_rowdot/w_addrow read w->f/w->q8 directly, and w_rows() hands out
+ * ALIASING views into a parent's buffer. A missed reader would not crash, it
+ * would return whatever malloc put there next -- plausible-looking garbage,
+ * the one failure mode worth engineering against here.
+ *
+ * So: unpin (the pages are cudaHostRegistered, and pinned pages cannot be
+ * discarded), madvise(MADV_DONTNEED) to actually return the physical pages,
+ * then mprotect(PROT_NONE) so any reader we failed to account for takes an
+ * immediate SIGSEGV at a known address instead of reading zeros. The pointer
+ * is never free()d, so malloc cannot hand the range out again.
+ *
+ * Eligibility is decided by observation, not by argument: every host-side
+ * reader marks its tensor, the sweep runs after a full request has exercised
+ * both prefill and decode shapes, and any range that was read is skipped. */
+typedef struct { void *p; size_t n; } K3Range;
+static K3Range g_mir[8192]; static int g_mir_n=0;
+static void   *g_htouch[8192]; static int g_htouch_n=0;
+static pthread_mutex_t g_mir_mu=PTHREAD_MUTEX_INITIALIZER;
+
+static void k3_mir_register(void *p, size_t n){
+    if(!p||!n) return;
+    pthread_mutex_lock(&g_mir_mu);
+    if(g_mir_n<(int)(sizeof g_mir/sizeof *g_mir)){ g_mir[g_mir_n].p=p; g_mir[g_mir_n].n=n; g_mir_n++; }
+    pthread_mutex_unlock(&g_mir_mu);
+}
+/* Called once per tensor from every path that dereferences a host blob. */
+static void k3_host_touch(const void *p){
+    if(!p) return;
+    pthread_mutex_lock(&g_mir_mu);
+    if(g_htouch_n<(int)(sizeof g_htouch/sizeof *g_htouch)) g_htouch[g_htouch_n++]=(void*)p;
+    pthread_mutex_unlock(&g_mir_mu);
+}
+#define K3_HOST_TOUCH(w) do{ if(!(w)->k3_htouched){ ((W*)(w))->k3_htouched=1; \
+                             k3_host_touch(w_blob(w)); } }while(0)
+
+static void k3_host_reclaim_sweep(void){
+    long pg=sysconf(_SC_PAGESIZE);
+    size_t got=0; int n=0, skipped=0, tiny=0;
+    pthread_mutex_lock(&g_mir_mu);
+    for(int i=0;i<g_mir_n;i++){
+        uintptr_t lo=(uintptr_t)g_mir[i].p, hi=lo+g_mir[i].n;
+        int touched=0;
+        for(int t=0;t<g_htouch_n;t++){
+            uintptr_t q=(uintptr_t)g_htouch[t];
+            if(q>=lo&&q<hi){ touched=1; break; }
+        }
+        if(touched){ skipped++; continue; }
+        uintptr_t a=(lo+(uintptr_t)pg-1)&~(uintptr_t)(pg-1), b=hi&~(uintptr_t)(pg-1);
+        if(b<=a){ tiny++; continue; }
+        coli_k3_unregister(g_mir[i].p);                 /* pinned pages survive madvise */
+        if(madvise((void*)a,b-a,MADV_DONTNEED)==0 && mprotect((void*)a,b-a,PROT_NONE)==0){
+            got+=b-a; n++;
+        }
+    }
+    pthread_mutex_unlock(&g_mir_mu);
+    fprintf(stderr,"[K3/RECLAIM] %d ranges returned %.2f GB; %d skipped (read on host), "
+                   "%d too small to page-align\n",n,got/1e9,skipped,tiny);
+}
+#endif
+
+#ifdef COLI_CUDA
 static int w_k3_ptrs_any(const W *w, const void **blob, const float **sc){
     if(!g_k3_dense_gpu || !g_k3_cuda || w->k3_dense_off) return 0;
     if(w->fmt!=1 && w->fmt!=2 && w->fmt!=4) return 0;
@@ -822,9 +894,12 @@ static int w_k3_ptrs_any(const W *w, const void **blob, const float **sc){
     }
     if(!mw->k3_dev_tried){
         void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
-        if(dw){ if(w->fmt==2){ mw->k3_dw=dw; mw->k3_ds=NULL; }
+        if(dw){ if(w->fmt==2){ mw->k3_dw=dw; mw->k3_ds=NULL;
+                               k3_mir_register((void*)w_blob(w),(size_t)w->O*rb); }
                 else { void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
-                       if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; } } }
+                       if(ds){ mw->k3_dw=dw; mw->k3_ds=ds;
+                               k3_mir_register((void*)w_blob(w),(size_t)w->O*rb);
+                               k3_mir_register((void*)w->s,(size_t)w->O*nsc*sizeof(float)); } } }
         mw->k3_dev_tried=1;
     }
     *blob = mw->k3_dw ? (const void*)mw->k3_dw : w_blob(w);
@@ -955,6 +1030,7 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
             }
         }
         if(mw->cuda_placed){
+            if(w->fmt!=2) K3_HOST_TOUCH(w);        /* passes the host blob down */
             if(w->fmt!=2 &&
                coli_cuda_matmul(&mw->cuda,y,x,w_blob(w),w->s,w->fmt,S,w->I,w->O,
                                 mw->cuda_device,w->gs)) return;
@@ -964,6 +1040,13 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
                     "after an error; falling back to CPU\n",w->O,w->I,w->fmt,mw->cuda_device);
         }
     }
+#endif
+    /* Everything below reads the HOST blob. This is the fallback the reclaim
+     * sweep must never surprise: reaching it after the pages were returned
+     * would read whatever came next, not crash. Marking here is what makes the
+     * tensor ineligible. */
+#ifdef COLI_CUDA
+    K3_HOST_TOUCH(w);
 #endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
     else if(w->fmt==2){                 /* fp16 weights: expand and dot */
@@ -986,6 +1069,9 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
 /* acc[0..I) += coef * row r (MLA absorb builds q_abs from kv_b rows) */
 static void w_addrow(const W *w, int r, float coef, float *acc){
     int I=w->I;
+#ifdef COLI_CUDA
+    K3_HOST_TOUCH(w);                 /* dereferences the host blob directly */
+#endif
     if(w->fmt==0){ const float *p=w->f+(int64_t)r*I; for(int i=0;i<I;i++) acc[i]+=coef*p[i]; }
     else if(w->fmt==1){ const int8_t *p=w->q8+(int64_t)r*I; float s=w->s[r]*coef;
         for(int i=0;i<I;i++) acc[i]+=s*p[i]; }
@@ -998,6 +1084,9 @@ static void w_addrow(const W *w, int r, float coef, float *acc){
 }
 static float w_rowdot(const W *w, int r, const float *x){
     int I=w->I; float a=0;
+#ifdef COLI_CUDA
+    K3_HOST_TOUCH(w);                 /* dereferences the host blob directly */
+#endif
     if(w->fmt==0){ const float *p=w->f+(int64_t)r*I; for(int i=0;i<I;i++) a+=x[i]*p[i]; return a; }
     if(w->fmt==1){ const int8_t *p=w->q8+(int64_t)r*I; for(int i=0;i<I;i++) a+=x[i]*p[i]; return a*w->s[r]; }
     { int rb=(I+1)/2, ng=(I+w->gs-1)/w->gs; const uint8_t *p=w->q4+(int64_t)r*rb;
@@ -2955,6 +3044,14 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         fflush(stdout); free(ids); return;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+#ifdef COLI_CUDA
+    /* Sweep AFTER the first request: mirrors are made lazily on first use, and
+     * only a completed prefill+decode has exercised every shape both paths see. */
+    { static int reqs=0;
+      if(reqs==1 && getenv("K3_FREE_HOST") && atoi(getenv("K3_FREE_HOST")))
+          k3_host_reclaim_sweep();
+      if(reqs<2) reqs++; }
+#endif
     model_state_reset(m);
     kv_alloc(m,np+q->max_tok+8);
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
