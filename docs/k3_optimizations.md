@@ -584,3 +584,63 @@ on the local nvcc and failed on spark1's, and an A/B then ran for minutes
 against a stale binary -- second instance of the failure that script exists to
 prevent. It now checks make's exit status. **The local and cluster toolchains
 differ; spark1's build is the authoritative one.**
+
+---
+
+## Round 6: reclaiming the duplicated host copy
+
+Round 5 closed the safe route (managed memory: -7.9%) and left only the risky
+one -- a real reclaim, plus proving no path can reach `w_blob(w)`.
+
+- [x] **Reclaim the host half of mirrored tensors** — 9.61 GB returned.
+
+`free()` is not usable: `w_matmul` falls back to the CPU on `w_blob(w)` whenever
+`coli_k3_dense` declines a shape, `w_rowdot`/`w_addrow` dereference `w->f`/
+`w->q8` directly, and `w_rows()` hands out ALIASING views into a parent buffer.
+A missed reader would not crash -- it would read whatever malloc placed there
+next and emit plausible output.
+
+So: **unpin, discard, protect.**
+
+    coli_k3_unregister    pages are cudaHostRegistered; pinned pages survive madvise
+    madvise(DONTNEED)     actually returns the physical pages
+    mprotect(PROT_NONE)   a missed reader SIGSEGVs at a known address, never zeros
+
+The pointer is never freed, so malloc cannot re-issue the range. Eligibility is
+decided by **observation, not argument**: every host-side reader marks its
+tensor, and the sweep runs at the start of the SECOND request, because mirrors
+are created lazily and only a completed prefill+decode has exercised every shape.
+
+    [K3/RECLAIM] 1248 ranges returned 9.61 GB; 0 skipped (read on host)
+
+Nothing mirrored is ever read on the host in this configuration. Output is
+byte-identical, 6/6, as it must be -- no arithmetic changed.
+
+### The payoff
+
+The reclaim is worth nothing by itself: the expert cache is sized by
+`K3_EXPERT_GB` and does not grow into headroom on its own. It is worth what it
+*unlocks*. EGB=100 previously OOM-killed the ranks; with 9.61 GB back it fits.
+At ctx 1963, warm2:
+
+| | tok/s | expert hit | RSS |
+|---|---|---|---|
+| EGB=88, no reclaim | 3.879 | 99.0% | 97.9 |
+| **EGB=100 + reclaim** | **4.476** | 100.0% | 98.1 |
+| EGB=96 + reclaim + FDOT=1 | 4.168 | 99.8% | 98.1 |
+
+**+15.4%.** The last row is worth noting: even with headroom available, the
+vectorised control dot still does not pay for the memory it displaces -- the
+same verdict round 4 reached, now tested with the constraint relaxed.
+
+At the standard 38-token prompt the same config is 5.094 vs 5.166, **-1.4%**:
+the cache already hits 100% there, so a bigger one buys nothing and the extra
+slots cost a little. The gain is entirely in the regime where the cache binds.
+
+### Left opt-in
+
+`K3_FREE_HOST=1`, default off. It passed 6/6 with 0 ranges skipped, and it fails
+loudly by construction rather than silently -- but "loudly" still means a
+SIGSEGV, and a shape that only some future prompt reaches on the CPU would take
+the server down. Recommended for long-context serving together with EGB=100;
+not defaulted.
