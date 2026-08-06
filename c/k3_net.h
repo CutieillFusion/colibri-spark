@@ -414,6 +414,14 @@ static pthread_t g_ar_th;
 static float    *g_ar_v = NULL;
 static size_t    g_ar_n = 0;
 static int       g_ar_active = 0;
+/* Overlap accounting. t_shared covers this collective, so the shared-expert
+ * timer reads high whether or not that compute is on the critical path. To tell
+ * "real work" from "hidden latency" we need the collective's own wall time
+ * (start -> completion), not just the exposed wait after it. g_ar_spawn
+ * separately charges pthread_create, which runs once per MoE layer per token --
+ * ~9200 thread creations per 100 decode tokens. */
+static double    g_ar_t0 = 0, g_ar_end = 0, g_ar_dur = 0, g_ar_spawn = 0;
+static long      g_ar_calls = 0;
 
 static void *k3_ar_worker(void *unused) {
     (void)unused;
@@ -427,22 +435,28 @@ static void *k3_ar_worker(void *unused) {
     int save = g_net_split; g_net_split = 0;
     k3_net_allreduce(g_ar_v, g_ar_n);
     g_net_split = save;
+    g_ar_end = k3_now();
     return NULL;
 }
 
 static void k3_net_allreduce_start(float *v, size_t n) {
     if (g_net_world <= 1) return;
     g_ar_v = v; g_ar_n = n;
+    g_ar_t0 = k3_now();
+    double sp0 = g_ar_t0;
     if (pthread_create(&g_ar_th, NULL, k3_ar_worker, NULL) != 0) {
         k3_net_allreduce(v, n);          /* fall back to blocking */
         return;
     }
+    g_ar_spawn += k3_now() - sp0;
+    g_ar_calls++;
     g_ar_active = 1;
 }
 
 static void k3_net_allreduce_wait(void) {
     if (g_net_world <= 1 || !g_ar_active) return;
     pthread_join(g_ar_th, NULL);
+    g_ar_dur += g_ar_end - g_ar_t0;
     g_ar_active = 0;
 }
 

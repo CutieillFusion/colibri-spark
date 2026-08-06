@@ -2851,6 +2851,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     double da0=m->t_attn, de0=m->t_moe, dd0=m->t_eload, dh0=m->t_head;
     double dr0=m->t_router, dtop0=m->t_topk, dl0=m->t_latent;
     double ds0=m->t_shared, dx0=m->t_expert, dn0=m->t_rnorm;
+    double dar0=g_ar_dur, das0=g_ar_spawn; long dac0=g_ar_calls;
     double dkpr0=m->t_kproj, dkc0=m->t_kconv, dkh0=m->t_khead, dko0=m->t_kout;
     double dcj0=m->t_ctljoin, dcw0=g_ctl_secs;
     double dnk0=m->t_net_kda, dnm0=m->t_net_mla, dnx0=m->t_net_moe;
@@ -2915,7 +2916,8 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            "router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
            "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f "
            "mproj=%.3f mcache=%.3f matt=%.3f mout=%.3f ctlwork=%.3f ctljoin=%.3f "
-           "netkda=%.3f netmla=%.3f netmoe=%.3f ctlstart=%.3f resmix=%.3f\n",
+           "netkda=%.3f netmla=%.3f netmoe=%.3f ctlstart=%.3f resmix=%.3f "
+           "arwork=%.3f arspawn=%.3f arcalls=%ld\n",
            m->t_attn-da0,m->t_moe-de0,m->t_eload-dd0,m->t_head-dh0,
            k3_net_secs()-dnet0,(unsigned long long)(k3_net_calls()-dnc0),
            m->t_router-dr0,m->t_topk-dtop0,m->t_latent-dl0,
@@ -2924,7 +2926,8 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            m->t_mproj-dmpr0,m->t_mcache-dmc0,m->t_matt-dma0,m->t_mout-dmo0,
            g_ctl_secs-dcw0,m->t_ctljoin-dcj0,
            m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0,g_ctl_start-dcs0,
-           g_resmix_secs-drm0);
+           g_resmix_secs-drm0,
+           g_ar_dur-dar0,g_ar_spawn-das0,g_ar_calls-dac0);
     if(getenv("K3_NET_TTFB") && atoi(getenv("K3_NET_TTFB")) && g_ttfb_calls)
         fprintf(stderr,"[K3/NET] exchanges=%llu  peer-not-ready=%.3f s (%.0f%%)  "
                 "bytes-moving=%.3f s (%.0f%%)  -> %.0f us/exchange waiting, %.0f us moving\n",

@@ -1441,7 +1441,7 @@ extern "C" size_t coli_k3_devmirror_used(void) { return g_devmir_used; }
 /* Which limit actually bound: the byte budget, or the per-tensor cap. */
 extern "C" void coli_k3_devmirror_report(void) {
     fprintf(stderr, "[K3/EXP] dense mirrors: %.2f GB placed, %.2f GB skipped for budget, "
-                    "%.2f GB skipped over the 64 MB cap\n",
+                    "%.2f GB skipped over the 2 GB cap\n",
             g_devmir_used/1e9, g_devmir_budget_skip/1e9, g_devmir_cap_skip/1e9);
 }
 
