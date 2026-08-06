@@ -145,6 +145,7 @@ static inline float kv_dec(kvq h)  { union{uint32_t u;float f;}b; b.u=(uint32_t)
  * and it gets the PCC gate. kvaxpy_ is elementwise: each acc[i] sees the same
  * adds in the same order, so that one IS bit-exact. */
 static int g_kvneon = 1;                      /* K3_KVNEON=0 restores the scalar loops */
+static int g_mattb  = 0;                      /* head-batched MLA: correct but slower, see below */
 #if defined(__ARM_NEON) && !defined(K3_KV_FP32)
 static inline float kvdot_(const float *q, const kvq *L, int n){
     float32x4_t a0=vdupq_n_f32(0), a1=vdupq_n_f32(0);
@@ -1723,6 +1724,96 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
         free(tg);
     } else w_matmul(gv,x,&a->g,C);
     m->t_mproj+=now_s()-mt0; mt0=now_s();
+    int Hl=mh1-mh0;
+    if(g_mattb && Hl>1){
+        /* Head-batched MLA attention.
+         *
+         * Every head reads the SAME KV rows, but the per-head loop walks the
+         * whole cache once PER HEAD -- 24 passes over nt*kvl per layer per
+         * token on this rank. Vectorising kv_dec took matt from 7.73 to 2.86
+         * s/100 tokens at ctx 1963 and thereby moved the binding constraint
+         * from the conversion onto that access pattern.
+         *
+         * So put t in the outer position and the heads inside: each L[t] is
+         * loaded once and consumed by all 24 heads out of L1, and DRAM sees
+         * the cache once per layer rather than once per head. The absorbed
+         * queries (Hl x kvl = 49 KB) become the re-read operand instead, but
+         * they are L2-resident where the cache is not.
+         *
+         * Bit-exact against the per-head loop: each sc[h][t] is the same dot
+         * product, and splitting kvl across threads gives every clat[h][i] a
+         * private accumulator that sees the same t in the same order -- no
+         * reduction, no races. Confirmed empirically: 6/6 prompts byte-identical.
+         *
+         * MEASURED SLOWER, so this is off by default (K3_MATT_BATCH=1 to try
+         * it again). A/B at ctx 1963, one binary:
+         *
+         *                    per-head   batched
+         *     decode tok/s      3.597     3.098    -14%
+         *     matt (decode)     2.806     3.369
+         *     matt (prefill)   34.618    60.207    +74%
+         *
+         * The premise was wrong. "24 heads each re-read the cache" counts
+         * LOGICAL reads: the heads run concurrently on the same L, so the
+         * hardware was already serving those from cache and DRAM never saw 24
+         * passes. Batching does not remove traffic, it swaps which operand is
+         * re-read -- per t we now touch all Hl*kvl of absorbed query (49 KB,
+         * scattered across 24 arrays) instead of one contiguous 2 KB row -- and
+         * it turns one OpenMP region per token into four. Prefill suffers most
+         * because C=32 pays those barriers 32 times per chunk.
+         *
+         * Seventh instance of the pattern this engine keeps showing: on a
+         * shared-memory box, REMOVING work wins and MOVING or BATCHING work
+         * loses. The kv_dec vectorisation above removed instructions and won
+         * 18%; this rearranges the same instructions and loses 14%. */
+        int64_t ntmax=(int64_t)pos0+C;
+        float *qab=falloc((int64_t)Hl*kvl), *cla=falloc((int64_t)Hl*kvl);
+        float *scm=falloc((int64_t)Hl*ntmax);
+        for(int tt=0;tt<C;tt++){
+            int nt=pos0+tt+1;
+            const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
+            float *ctxt=ctx+(int64_t)tt*H*vh;
+            #pragma omp parallel for schedule(static)
+            for(int hh=0;hh<Hl;hh++){
+                const float *qp=qvt+(int64_t)(mh0+hh)*qh;
+                int rbase=(mh0+hh)*(c->qk_nope+vh);
+                float *qa=qab+(int64_t)hh*kvl; memset(qa,0,kvl*sizeof(float));
+                for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qa);
+            }
+            #pragma omp parallel for schedule(static)
+            for(int t=0;t<nt;t++){
+                const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
+                for(int hh=0;hh<Hl;hh++){
+                    const float *qrp=qvt+(int64_t)(mh0+hh)*qh+c->qk_nope;
+                    scm[(int64_t)hh*nt+t]=(kvdot_(qab+(int64_t)hh*kvl,Lt,kvl)
+                                          +kvdot_(qrp,Rt,qr))*c->attn_scale;
+                }
+            }
+            #pragma omp parallel for schedule(static)
+            for(int hh=0;hh<Hl;hh++) softmax_(scm+(int64_t)hh*nt,nt);
+            memset(cla,0,(size_t)Hl*kvl*sizeof(float));
+            #pragma omp parallel
+            {
+                int nth=omp_get_num_threads(), tid=omp_get_thread_num();
+                int per=(((kvl+nth-1)/nth)+7)&~7;      /* keep slices 8-aligned */
+                int i0=tid*per, i1=i0+per>kvl?kvl:i0+per;
+                if(i0<kvl) for(int t=0;t<nt;t++){
+                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl;
+                    for(int hh=0;hh<Hl;hh++)
+                        kvaxpy_(cla+(int64_t)hh*kvl+i0,Lt+i0,scm[(int64_t)hh*nt+t],i1-i0);
+                }
+            }
+            #pragma omp parallel for schedule(static)
+            for(int hh=0;hh<Hl;hh++){
+                int h=mh0+hh, rbase=h*(c->qk_nope+vh);
+                float *cx=ctxt+(int64_t)h*vh, *cl=cla+(int64_t)hh*kvl;
+                for(int d=0;d<vh;d++)
+                    cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,cl)*sigmoidf_(gvt[(int64_t)h*vh+d]);
+            }
+        }
+        free(qab); free(cla); free(scm);
+        goto matt_done;
+    }
     for(int tt=0;tt<C;tt++){
         int nt=pos0+tt+1;
         const float *qvt=qv+(int64_t)tt*H*qh, *gvt=gv+(int64_t)tt*H*vh;
@@ -1765,6 +1856,7 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                 cx[d]=w_rowdot(&a->kvb,rbase+c->qk_nope+d,clat)*sigmoidf_(gvt[(int64_t)h*vh+d]);
         }
     }
+matt_done:
     m->t_matt+=now_s()-mt0; mt0=now_s();
     if(wsz>1 && mhn>0){
         float *cc=falloc((int64_t)C*mhn*vh);
@@ -2663,6 +2755,7 @@ static int serve_read_req(ServeReq *q, const char *active){
         setenv(id,val,1);
         int live = 1;
         if(!strcmp(id,"K3_KVNEON"))      g_kvneon=atoi(val);
+        else if(!strcmp(id,"K3_MATT_BATCH")) g_mattb=atoi(val);
         else if(!strcmp(id,"K3_CHUNK")||!strcmp(id,"K3_MAXT")) ;      /* re-read per request */
         else live = 0;
         printf("SETOK %s=%s live=%d\n",id,val,live); fflush(stdout);
@@ -2925,6 +3018,7 @@ int main(int argc, char **argv){
     }
     float temp=getenv("COLI_TEMP")?(float)atof(getenv("COLI_TEMP")):0.f;
     if(getenv("K3_KVNEON")) g_kvneon=atoi(getenv("K3_KVNEON"));
+    if(getenv("K3_MATT_BATCH")) g_mattb=atoi(getenv("K3_MATT_BATCH"));
     int nlayers=getenv("K3_LAYERS")?atoi(getenv("K3_LAYERS")):0;
     Model m;
     model_init(&m,snap,nlayers);
