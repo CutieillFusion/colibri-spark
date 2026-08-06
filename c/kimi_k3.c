@@ -397,6 +397,75 @@ static void *kda_control_worker(void *p){ double a=now_s(); g_ctl_start+=a-g_ctl
                                           kda_control_b1((KdaCtrlJob*)p);
                                           g_ctl_secs+=now_s()-a; return NULL; }
 
+/* Same per-call-thread shape the latent allreduce had, so the same fix was
+ * tried: one worker parked on a condvar instead of a pthread_create per KDA
+ * layer per token (6900 per 100 decode tokens).
+ *
+ * MEASURED MUCH WORSE, off by default. A/B at the standard prompt:
+ *
+ *                  per-call   persistent
+ *     decode tok/s    5.275        2.406    -54%
+ *     ctlstart        0.209        1.354
+ *     ctljoin         0.911        3.084
+ *     arwork          2.850        9.832
+ *
+ * The allreduce worker wins from exactly the property this one lacks. That
+ * thread blocks on sockets: it sleeps, holds no core, and competes with nothing
+ * -- so keeping it alive removes a create and lets the exchange start at once.
+ * kda_control_b1 is CPU-bound and runs against the OpenMP pool on the same ten
+ * cores. A thread created per call is placed fresh by the scheduler on whatever
+ * is free; a resident one holds a core the pool wants, and under K3_PIN the
+ * contention is not resolvable. It degraded the allreduce as well (arwork 3.4x)
+ * because two resident threads plus the pool oversubscribe the cluster.
+ *
+ * The rule this refines: persistent workers pay for I/O-bound work and cost for
+ * CPU-bound work. K3_CTL_PERSIST=1 to re-run the A/B. */
+static pthread_mutex_t g_ctl_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_ctl_cv = PTHREAD_COND_INITIALIZER;
+static KdaCtrlJob     *g_ctl_job = NULL;
+static pthread_t       g_ctl_th;
+static int g_ctl_req=0, g_ctl_done=1, g_ctl_quit=0, g_ctl_started=0, g_ctl_persist=-1;
+/* default 0: see the A/B above */
+
+static void *kda_control_persist(void *unused){
+    (void)unused;
+    for(;;){
+        pthread_mutex_lock(&g_ctl_mu);
+        while(!g_ctl_req && !g_ctl_quit) pthread_cond_wait(&g_ctl_cv,&g_ctl_mu);
+        if(g_ctl_quit){ pthread_mutex_unlock(&g_ctl_mu); return NULL; }
+        g_ctl_req=0;
+        pthread_mutex_unlock(&g_ctl_mu);
+        double a=now_s(); g_ctl_start+=a-g_ctl_spawn;
+        kda_control_b1(g_ctl_job);
+        g_ctl_secs+=now_s()-a;
+        pthread_mutex_lock(&g_ctl_mu);
+        g_ctl_done=1; pthread_cond_signal(&g_ctl_cv);
+        pthread_mutex_unlock(&g_ctl_mu);
+    }
+}
+
+/* Returns 1 when the job was handed off and ctl_join() must be called. */
+static int kda_control_submit(KdaCtrlJob *j, pthread_t *fallback){
+    if(g_ctl_persist<0){ const char *e=getenv("K3_CTL_PERSIST"); g_ctl_persist=e?atoi(e):0; }
+    if(!g_ctl_persist) return pthread_create(fallback,NULL,kda_control_worker,j)==0 ? 2 : 0;
+    if(!g_ctl_started){
+        if(pthread_create(&g_ctl_th,NULL,kda_control_persist,NULL)!=0) return 0;
+        g_ctl_started=1;
+    }
+    g_ctl_job=j;
+    pthread_mutex_lock(&g_ctl_mu);
+    g_ctl_done=0; g_ctl_req=1;
+    pthread_cond_signal(&g_ctl_cv);
+    pthread_mutex_unlock(&g_ctl_mu);
+    return 1;
+}
+static void kda_control_join(int mode, pthread_t fallback){
+    if(mode==2){ pthread_join(fallback,NULL); return; }
+    pthread_mutex_lock(&g_ctl_mu);
+    while(!g_ctl_done) pthread_cond_wait(&g_ctl_cv,&g_ctl_mu);
+    pthread_mutex_unlock(&g_ctl_mu);
+}
+
 
 /* Tensor parallelism is a property of the multi-node split, NOT of the CUDA
  * backend -- model_init, kda_forward and mla_forward all use these
@@ -1481,7 +1550,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
     { const char *e=getenv("K3_KDA_OVERLAP"); if(e) ctl_wanted=atoi(e); }
     int ctl_overlap=C==1 && g_k3_cuda && g_k3_dense_gpu && ctl_wanted;
     g_ctl_spawn=now_s();
-    if(ctl_overlap && pthread_create(&ctlth,NULL,kda_control_worker,&cj)==0) ctl_active=1;
+    if(ctl_overlap) ctl_active=kda_control_submit(&cj,&ctlth);
 #endif
     if(wsz>1 && hn>0){
         if(!a->sh_ready){
@@ -1533,7 +1602,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         m->t_kproj+=now_s()-kp0;
     }
     double kf0=now_s();
-    if(ctl_active) pthread_join(ctlth,NULL);
+    if(ctl_active) kda_control_join(ctl_active,ctlth);
     else if(C==1){ double a=now_s(); kda_control_b1(&cj); g_ctl_secs+=now_s()-a; }
     else {
         w_matmul(t1,x,&a->fa,C);
