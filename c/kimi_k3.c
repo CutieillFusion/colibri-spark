@@ -990,10 +990,13 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
             if(!mw->k3_dev_tried){
                 void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
                 if(dw){
-                    if(w->fmt==2){ mw->k3_dw=dw; mw->k3_ds=NULL; }
+                    if(w->fmt==2){ mw->k3_dw=dw; mw->k3_ds=NULL;
+                                   k3_mir_register((void*)w_blob(w),(size_t)w->O*rb); }
                     else {
                         void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
-                        if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; }   /* both or neither */
+                        if(ds){ mw->k3_dw=dw; mw->k3_ds=ds;     /* both or neither */
+                                k3_mir_register((void*)w_blob(w),(size_t)w->O*rb);
+                                k3_mir_register((void*)w->s,(size_t)w->O*nsc*sizeof(float)); }
                     }
                 }
                 mw->k3_dev_tried=1;
@@ -2405,7 +2408,9 @@ static int w_k3_ptrs(const W *w, const void **blob, const float **sc){
     if(!mw->k3_dev_tried){
         void *dw=coli_k3_devmirror(w_blob(w),(size_t)w->O*rb);
         if(dw){ void *ds=coli_k3_devmirror(w->s,(size_t)w->O*nsc*sizeof(float));
-                if(ds){ mw->k3_dw=dw; mw->k3_ds=ds; } }
+                if(ds){ mw->k3_dw=dw; mw->k3_ds=ds;
+                        k3_mir_register((void*)w_blob(w),(size_t)w->O*rb);
+                        k3_mir_register((void*)w->s,(size_t)w->O*nsc*sizeof(float)); } }
         mw->k3_dev_tried=1;
     }
     *blob = mw->k3_dw ? (const void*)mw->k3_dw : w_blob(w);
