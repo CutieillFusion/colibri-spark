@@ -76,6 +76,10 @@ Two more facts that shape the list:
       2.691 -> 2.121 s/100 (-21%), 6/6 byte-identical. ncu found the reason the
       old assumption was wrong: Waves Per SM 1.56, DRAM 19% of peak -- the expert
       kernels are TAIL-bound, not bandwidth-bound
+- [ ] BIGGEST REMAINING LEVER: ~80% of collective time is rank arrival skew.
+      TTFB says 33 us/exchange moving bytes, RTT says ~27 us latency, leaving
+      ~216 us of skew. Both links measure ~54 us RTT, so the 1 GbE bridge is NOT
+      a latency floor. ~35 ms/token at stake; thread count does not move it
 - [ ] PARTIAL: rank-0 0/4 shard cuts cross-rank spread 0.417 -> 0.265 but is a
       dead heat end to end; kept for symmetry and 319 GB of disk
 - [x] BUG FIX: K3_EXPERT_BATCH=1 crashed the engine (2-bit kernels on a 1-bit

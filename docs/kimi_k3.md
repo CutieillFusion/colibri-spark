@@ -166,6 +166,46 @@ achieved active warps per SM, 14.5% lower L1/TEX throughput and 17% more
 SM-active cycles. That is an occupancy/latency effect, not a bandwidth one,
 which retires the memory-contention story but does not replace it.
 
+### The collectives are 80% rank SKEW, not fabric -- and both links have equal latency
+
+`K3_NET_TTFB=1` splits every exchange into time-before-the-first-byte-arrives and
+time-with-bytes-moving. Over a full run:
+
+    exchanges=112,718   peer-not-ready=31.117 s (89%)   bytes-moving=3.752 s (11%)
+                     -> 276 us/exchange waiting, 33 us moving
+
+Only 11% of collective time moves bytes. Measuring raw RTT then splits the other
+89% cleanly:
+
+| | bridge (1 GbE) | pair (200 GbE) |
+|---|---|---|
+| RTT avg | **0.054 ms** | 0.050 ms |
+| RTT min | 0.034 ms | 0.027 ms |
+
+**The 1 GbE bridge has the same latency as the 200 GbE pair link.** So per
+exchange: 33 us moving bytes, ~27 us of one-way latency, and **~216 us -- about
+80% -- of rank arrival skew.** The fabric is not the constraint in any sense
+that matters; the ranks simply do not arrive together.
+
+This retires a framing this log carried for its whole history. The 1 GbE bridge
+was treated as a hard floor of ~21-32 ms/token of wire time; the real wire time
+is 11% of the collective and the bridge is not even latency-disadvantaged. It
+also explains why the payload split was worth only ~12% on netkda: halving bytes
+halves the 11%. (It does do exactly that -- bytes-moving goes 60 -> 33 us with
+the split on, and end to end 4.598/4.587 -> 4.801/4.778, so it is worth keeping,
+just not for the reason it was built.)
+
+What does NOT move the skew: thread count. OMPT 6, 8 and 12 all land at
+4.83/4.80/4.83 with the wait fraction at 95/89/90%. So it is not OpenMP
+contention, which was the obvious suspect after the oversubscription result.
+
+The size of the prize is worth stating plainly. Exposed collectives are ~44
+ms/token, so ~35 ms of that is skew. Perfect rank synchronisation would be worth
+roughly 20%. The measured per-rank expert-time spread is only 2.65 ms/token,
+about 29 us/layer against ~216 us/exchange of skew, so systematic work imbalance
+does not explain it either -- something per-collective and jittery does, and
+that is the next thing to instrument.
+
 ## Provisioning from scratch
 
 Rebuilt end to end after a reboot cleared `/tmp` and took the staged snapshot

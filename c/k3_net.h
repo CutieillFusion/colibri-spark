@@ -65,6 +65,14 @@ static int    g_net_up = -1;               /* upstream: leader, or root for a le
 static int    g_net_cross = -1;            /* optional rank r <-> r+2 direct bridge */
 static int    g_net_rd2 = 0;               /* two-phase 4-rank recursive doubling */
 static int    g_net_split = 1;             /* halve the bridge payload; K3_NET_SPLIT=0 off */
+/* Time-to-first-byte across the exchange. netkda is 416 us/layer where the
+ * wire time after the payload split should be ~150; splitting the wait into
+ * "peer was not ready" and "bytes moving" says whether the rest is arrival
+ * jitter (a balance problem) or transport (a fabric problem). K3_NET_TTFB=1. */
+static int    g_net_ttfb = 0;
+static double g_ttfb_wait = 0, g_ttfb_move = 0;
+static uint64_t g_ttfb_calls = 0;
+
 static float *g_net_scratch = NULL;
 static size_t g_net_scratch_n = 0;
 static double g_net_secs = 0;              /* time parked in collectives */
@@ -144,6 +152,7 @@ static int k3_net_init(void) {
     int port = getenv("K3_MASTER_PORT") ? atoi(getenv("K3_MASTER_PORT")) : 29555;
     g_net_rd2 = getenv("K3_NET_RD2") ? atoi(getenv("K3_NET_RD2")) : 0;
     g_net_split = getenv("K3_NET_SPLIT") ? atoi(getenv("K3_NET_SPLIT")) : 1;
+    g_net_ttfb  = getenv("K3_NET_TTFB") ? atoi(getenv("K3_NET_TTFB")) : 0;
     if (g_net_rd2 && (g_net_world != 4 || g_net_gsize != 2)) {
         fprintf(stderr,"[K3/NET] K3_NET_RD2 requires world=4, group=2\n"); exit(1);
     }
@@ -247,6 +256,7 @@ static void k3_reduce_from(int fd, float *v, size_t n) {
  * prefill payloads larger than the socket send buffer (two blocking sends
  * could otherwise deadlock).
  */
+
 static void k3_exchange_add(int fd, float *v, size_t n) {
     if (g_net_scratch_n < n) {
         g_net_scratch = (float*)realloc(g_net_scratch, n*sizeof(float));
@@ -256,6 +266,7 @@ static void k3_exchange_add(int fd, float *v, size_t n) {
     const char *tx = (const char*)v;
     char *rx = (char*)g_net_scratch;
     size_t bytes=n*sizeof(float), ns=0, nr=0;
+    double t_enter = g_net_ttfb ? k3_now() : 0, t_first = 0;
     while (ns<bytes || nr<bytes) {
         int progress=0;
         if (ns<bytes) {
@@ -266,7 +277,8 @@ static void k3_exchange_add(int fd, float *v, size_t n) {
         }
         if (nr<bytes) {
             ssize_t k=recv(fd,rx+nr,bytes-nr,MSG_DONTWAIT);
-            if (k>0) { nr+=(size_t)k; progress=1; }
+            if (k>0) { if (g_net_ttfb && !t_first) t_first = k3_now();
+                       nr+=(size_t)k; progress=1; }
             else if (k==0) { fprintf(stderr,"[K3/NET] exchange EOF\n"); exit(1); }
             else if (errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR) {
                 fprintf(stderr,"[K3/NET] exchange recv\n"); exit(1); }
@@ -281,6 +293,12 @@ static void k3_exchange_add(int fd, float *v, size_t n) {
         }
     }
     for (size_t i=0;i<n;i++) v[i]+=g_net_scratch[i];
+    if (g_net_ttfb) {
+        double now = k3_now();
+        g_ttfb_wait += (t_first ? t_first : now) - t_enter;   /* peer not ready */
+        g_ttfb_move += t_first ? now - t_first : 0;           /* bytes moving */
+        g_ttfb_calls++;
+    }
 }
 
 /* v[0..n) := elementwise sum over all ranks. Blocking; every rank must call it

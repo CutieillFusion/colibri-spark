@@ -2694,6 +2694,13 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
            g_ctl_secs-dcw0,m->t_ctljoin-dcj0,
            m->t_net_kda-dnk0,m->t_net_mla-dnm0,m->t_net_moe-dnx0,g_ctl_start-dcs0,
            g_resmix_secs-drm0);
+    if(getenv("K3_NET_TTFB") && atoi(getenv("K3_NET_TTFB")) && g_ttfb_calls)
+        fprintf(stderr,"[K3/NET] exchanges=%llu  peer-not-ready=%.3f s (%.0f%%)  "
+                "bytes-moving=%.3f s (%.0f%%)  -> %.0f us/exchange waiting, %.0f us moving\n",
+                (unsigned long long)g_ttfb_calls, g_ttfb_wait,
+                100.0*g_ttfb_wait/(g_ttfb_wait+g_ttfb_move+1e-9), g_ttfb_move,
+                100.0*g_ttfb_move/(g_ttfb_wait+g_ttfb_move+1e-9),
+                1e6*g_ttfb_wait/g_ttfb_calls, 1e6*g_ttfb_move/g_ttfb_calls);
     if(g_dense_census) fprintf(stderr,"[K3/EXP] experts run=%ld over %ld layer-calls (%.3f per call)\n",
             (long)atomic_load_explicit(&g_exp_n,memory_order_relaxed),
             (long)atomic_load_explicit(&g_exp_layers,memory_order_relaxed),
