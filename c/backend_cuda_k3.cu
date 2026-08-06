@@ -1264,6 +1264,103 @@ __global__ void k3_dense_i4g_exactR(float *__restrict__ y, const float *__restri
     }
 }
 
+/* ---------------- exactW, ILP variant --------------------------------------
+ * ncu on the shipped exactW<4>, all tensors mirrored, says nothing is
+ * saturated:
+ *     Memory 21.85%   Compute 21.85%   L1/TEX 26.68%   L2 14.99%
+ *     achieved occupancy 115%, 55.3 active warps/SM
+ * High occupancy with every pipe near a fifth of peak is the signature of a
+ * LATENCY bound, not a bandwidth or compute bound. So the fix is more memory
+ * work in flight per thread, not fewer bytes.
+ *
+ * Two changes, both leaving the arithmetic and its order untouched:
+ *
+ *   1. The weight pair was two separate 1-byte loads at consecutive addresses.
+ *      i = 4p + 256k makes i>>1 even, so the pair is 2-byte aligned and can be
+ *      one ushort load -- half the weight load instructions, same bytes.
+ *   2. Unroll the reduction loop by 2. Iterations i and i+256 are independent
+ *      up to the accumulator update, so this puts two float4 loads and two
+ *      weight loads in flight instead of one, while each a[j] still accumulates
+ *      strictly in increasing i. Bit-exact by construction.
+ *
+ * K3_DENSE_ILP=0 selects the original. */
+template<int W>
+__global__ void k3_dense_i4g_exactW_ilp(float *__restrict__ y, const float *__restrict__ x,
+                                        const unsigned char *__restrict__ q4,
+                                        const float *__restrict__ scales,
+                                        int I, int O, int gsh, int ng) {
+    enum { T = 256 / W };
+    int o = blockIdx.x;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+    const unsigned char *w = q4 + (size_t)o * rb;
+    const float *scl = scales + (size_t)o * ng;
+    int p = (int)threadIdx.x;
+    float a[W];
+    #pragma unroll
+    for (int j = 0; j < W; j++) a[j] = 0.f;
+
+    int i = p * W;
+    for (; i + W - 1 + 256 < I; i += 512) {          /* two strides per trip */
+        int g0 = i >> gsh;             if (g0 >= ng) g0 = ng - 1;
+        int g1 = (i + 256) >> gsh;     if (g1 >= ng) g1 = ng - 1;
+        float sc0 = scl[g0], sc1 = scl[g1];
+        #pragma unroll
+        for (int q = 0; q < W / 4; q++) {
+            float4 x0 = *(const float4 *)(x + i + q * 4);
+            float4 x1 = *(const float4 *)(x + i + 256 + q * 4);
+            unsigned short p0 = *(const unsigned short *)(w + (i >> 1) + q * 2);
+            unsigned short p1 = *(const unsigned short *)(w + ((i + 256) >> 1) + q * 2);
+            unsigned int b0 = p0 & 0xffu, b1 = p0 >> 8, c0 = p1 & 0xffu, c1 = p1 >> 8;
+            a[q*4+0] += x0.x * (float)((int)(b0 & 15) - 8) * sc0;
+            a[q*4+1] += x0.y * (float)((int)(b0 >> 4)  - 8) * sc0;
+            a[q*4+2] += x0.z * (float)((int)(b1 & 15) - 8) * sc0;
+            a[q*4+3] += x0.w * (float)((int)(b1 >> 4)  - 8) * sc0;
+            a[q*4+0] += x1.x * (float)((int)(c0 & 15) - 8) * sc1;
+            a[q*4+1] += x1.y * (float)((int)(c0 >> 4)  - 8) * sc1;
+            a[q*4+2] += x1.z * (float)((int)(c1 & 15) - 8) * sc1;
+            a[q*4+3] += x1.w * (float)((int)(c1 >> 4)  - 8) * sc1;
+        }
+    }
+    for (; i + W - 1 < I; i += 256) {                /* odd trip, if any */
+        int g = i >> gsh; if (g >= ng) g = ng - 1;
+        float sc = scl[g];
+        #pragma unroll
+        for (int q = 0; q < W / 4; q++) {
+            float4 xx = *(const float4 *)(x + i + q * 4);
+            unsigned short pp = *(const unsigned short *)(w + (i >> 1) + q * 2);
+            unsigned int b0 = pp & 0xffu, b1 = pp >> 8;
+            a[q*4+0] += xx.x * (float)((int)(b0 & 15) - 8) * sc;
+            a[q*4+1] += xx.y * (float)((int)(b0 >> 4)  - 8) * sc;
+            a[q*4+2] += xx.z * (float)((int)(b1 & 15) - 8) * sc;
+            a[q*4+3] += xx.w * (float)((int)(b1 >> 4)  - 8) * sc;
+        }
+    }
+
+    __shared__ float sh[W][T];
+    #pragma unroll
+    for (int j = 0; j < W; j++) sh[j][p] = a[j];
+    __syncthreads();
+    for (int n = T / 2; n >= 1; n >>= 1) {
+        if (p < n) {
+            #pragma unroll
+            for (int j = 0; j < W; j++) sh[j][p] += sh[j][p+n];
+        }
+        __syncthreads();
+    }
+    if (!p) {
+        float v[W];
+        #pragma unroll
+        for (int j = 0; j < W; j++) v[j] = sh[j][0];
+        #pragma unroll
+        for (int step = W / 2; step >= 1; step >>= 1) {
+            #pragma unroll
+            for (int j = 0; j < step; j++) v[j] += v[j + step];
+        }
+        y[o] = v[0];
+    }
+}
+
 template<int W>
 __global__ void k3_dense_i4g_exactW(float *__restrict__ y, const float *__restrict__ x,
                                     const unsigned char *__restrict__ q4,
@@ -1552,9 +1649,16 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
         if (i4w == 4 && gs >= 4 && !(I & 3) && I <= rthr)
             k3_dense_i4g_exactR<4,4><<<(O + 3) / 4, 256, 0, g_stream>>>(
                 g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
-        else if (i4w == 4 && gs >= 4 && !(I & 3))
-            k3_dense_i4g_exactW<4><<<O, 64, 0, g_stream>>>(
-                g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
+        else if (i4w == 4 && gs >= 4 && !(I & 3)) {
+            static int ilp = -1;
+            if (ilp < 0) { const char *e = getenv("K3_DENSE_ILP"); ilp = e ? atoi(e) : 1; }
+            if (ilp)
+                k3_dense_i4g_exactW_ilp<4><<<O, 64, 0, g_stream>>>(
+                    g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
+            else
+                k3_dense_i4g_exactW<4><<<O, 64, 0, g_stream>>>(
+                    g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
+        }
         else
             k3_dense_i4g_exact<<<O, 128, 0, g_stream>>>(
                 g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
