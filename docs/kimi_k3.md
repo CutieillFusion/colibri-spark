@@ -250,6 +250,48 @@ There is no headroom above it without giving back device-mirror RAM -- the host
 copy of every mirrored tensor is still resident, and releasing it would free
 ~16 GB, which is the obvious next move.
 
+### Prefill never used any of this work -- S != 1 fell off the fast path entirely
+
+`coli_k3_dense` opened with `if (!g_ready || S != 1 || ...) return 0;`, so every
+prefill matmul fell through to the generic `quant_matmul`. That is **1370 us a
+launch against 91 us** for the exact kernel, and it is why nsys showed
+`quant_matmul` taking 64.2% of GPU time on only 5,193 launches while the exact
+kernel took 24.1% on 29,287. Prefill got none of the device mirroring, the
+4-wide fold, or the exact int4 path -- and measured 235 ms/token against
+decode's ~200, i.e. batching made it *slower*, which is the tell.
+
+`k3_dense_i4g_exactW_S<W>` is what batching should have bought: the block stages
+its weight row in shared memory once (rb bytes + ng scales -- 4 KB at I=7168,
+19 KB at 33792) and walks the C activation vectors against it, so DRAM weight
+traffic drops C-fold while x stays L2-resident. Per (row, token) the arithmetic
+and its order are exactly the S==1 kernel's.
+
+| | prefill ms/token | request wall |
+|---|---|---|
+| generic, cold | 275.0 | 310.3 s |
+| **new GEMM, cold** | **194.4** | **136.6 s** |
+| new GEMM, warm | 144.4 | 100.2 s |
+
+-29% cold and the request more than halves. Decode on the same cold run went
+0.591 -> 2.712 tok/s as well, because prefill no longer evicts the expert cache
+on its way through. Six-prompt output **6/6 byte-identical**, which is stronger
+than expected -- the change swaps which kernel computes prefill, and the tokens
+did not move.
+
+A census (`K3_DENSE_CENSUS=1`) confirms it engages rather than silently
+declining: **gemm=9984, generic=4496, zero declines**. The 4496 are `fmt != 4` --
+MLA and lm_head are int8 because `K3_MLA_BITS` and `K3_HEAD_BITS` default to 8,
+so there is no int4 GEMM for them to take.
+
+**It is still ~14x off the floor.** Weight traffic amortised C-fold should put
+prefill near 10 ms/token (2.8 dense + 7.5 expert at C=32); it is at 144. Dense
+is no longer the term. The cold generic PROF2 shows `expert=55.1` and
+`netmoe=68.2` against decode's 2.1 and 0.5, which points at expert-cache
+thrashing: a 32-token chunk draws ~390 unique experts of 896 per layer against
+210 cache slots. The constraint has changed shape -- small chunks used to be
+punished because dense did not amortise, and no longer are -- so there is
+probably an optimum well below `K3_CHUNK=32`.
+
 ## Provisioning from scratch
 
 Rebuilt end to end after a reboot cleared `/tmp` and took the staged snapshot

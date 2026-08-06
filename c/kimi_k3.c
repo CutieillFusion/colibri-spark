@@ -155,6 +155,7 @@ typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I,
     int8_t k3_reg, k3_dense_off;      /* zero-copy dense path: registered / declined */
     int8_t fmt_reported;              /* census: shape logged once */
     int8_t gs_reported;
+    int8_t pf_reported;
     /* Optional device copies for the exact dense kernel. Host-registered pages
      * reach the GPU through the SMMU at 4 KB granularity; cudaMalloc'd memory
      * uses large pages, which measured up to 1.65x on the SAME kernel. Null
@@ -368,6 +369,10 @@ static void k3_head_shard(int H, int *h0, int *hn){
  * quant_matmul is 64% of GPU time at 1.37 ms a call against 91 us for
  * k3_dense_i4g_exactW, so the split matters more than either kernel does. */
 static _Atomic long g_dp_k3=0, g_dp_off=0, g_dp_fmt=0, g_dp_par=0;
+/* Which path a PREFILL (S>1) dense call actually takes. The S>1 GEMM was added
+ * because the generic kernel is 15x slower per launch, but prefill barely
+ * moved, so count rather than assume. */
+static _Atomic long g_pf_gemm=0, g_pf_f16=0, g_pf_generic=0, g_pf_cpu=0;
 /* How many routed experts this rank actually ran. Per-rank expert time is
  * reproducibly ordered 0 > 1 > 3 > 2 across runs, which is a fixed bias rather
  * than per-token variance, so the question is whether the ranks run different
@@ -666,6 +671,25 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
                        fprintf(stderr,"[K3/DENSE] generic: I=%d O=%d fmt=%d bytes=%.1fMB\n",
                                w->I,w->O,w->fmt,(double)w->I*w->O*4/1e6); } }
                else if(omp_in_parallel()) atomic_fetch_add_explicit(&g_dp_par,1,memory_order_relaxed); }
+    /* Prefill (S>1) for int4: one launch, weight row staged per block, C tokens
+     * walked against it. Without this the generic quant_matmul runs -- 1370 us
+     * a launch against 91 us -- and prefill gets none of the mirroring, the
+     * 4-wide fold or the exact path. */
+#ifdef COLI_CUDA
+    if(g_k3_dense_gpu && g_k3_cuda && !w->k3_dense_off && !omp_in_parallel()
+       && S>1 && w->fmt==4){
+        const void *bl; const float *sc;
+        if(w_k3_ptrs_any(w,&bl,&sc) &&
+           coli_k3_dense_s(y,x,bl,sc,w->fmt,S,w->I,w->O,w->gs)){
+            if(g_dense_census) atomic_fetch_add_explicit(&g_pf_gemm,1,memory_order_relaxed);
+            return; }
+        if(g_dense_census && !((W*)w)->pf_reported){ ((W*)w)->pf_reported=1;
+            fprintf(stderr,"[K3/PREFILL] GEMM declined I=%d O=%d fmt=%d gs=%d S=%d\n",
+                    w->I,w->O,w->fmt,w->gs,S); }
+    }
+    if(S>1 && g_dense_census && w->fmt!=4)
+        atomic_fetch_add_explicit(&g_pf_generic,1,memory_order_relaxed);
+#endif
     /* fp16 has no CPU path worth using and the generic CUDA path cannot take
      * it, so drive the S==1 kernel once per token for prefill. Without this the
      * teacher-forced logits capture -- which is prefill only -- would measure
@@ -2701,6 +2725,9 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
                 100.0*g_ttfb_wait/(g_ttfb_wait+g_ttfb_move+1e-9), g_ttfb_move,
                 100.0*g_ttfb_move/(g_ttfb_wait+g_ttfb_move+1e-9),
                 1e6*g_ttfb_wait/g_ttfb_calls, 1e6*g_ttfb_move/g_ttfb_calls);
+    if(g_dense_census) fprintf(stderr,"[K3/PREFILL] S>1 dense calls: gemm=%ld generic-fmt=%ld\n",
+            (long)atomic_load_explicit(&g_pf_gemm,memory_order_relaxed),
+            (long)atomic_load_explicit(&g_pf_generic,memory_order_relaxed));
     if(g_dense_census) fprintf(stderr,"[K3/EXP] experts run=%ld over %ld layer-calls (%.3f per call)\n",
             (long)atomic_load_explicit(&g_exp_n,memory_order_relaxed),
             (long)atomic_load_explicit(&g_exp_layers,memory_order_relaxed),

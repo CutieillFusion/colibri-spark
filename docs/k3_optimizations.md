@@ -80,6 +80,13 @@ Two more facts that shape the list:
       cache misses, which were the straggler creating collective skew. 100 is
       faster (5.157) but OOM-kills on long runs -- lazy slots hide the ceiling
       from a short benchmark
+- [x] PREFILL GEMM (k3_dense_i4g_exactW_S): S!=1 fell off the fast path entirely,
+      so prefill ran the 15x-slower generic kernel. 275 -> 194 ms/prefill-token
+      cold, request 310 -> 137 s, 6/6 byte-identical. Census: gemm=9984
+      generic=4496 (the 4496 are int8 MLA/lm_head), zero declines
+- [ ] OPEN: prefill still ~14x off its 10 ms/token floor -- expert cache thrashes
+      at C=32 (~390 unique of 896 per layer vs 210 slots). Sweep K3_CHUNK now that
+      small chunks are no longer punished by dense
 - [ ] NEXT: release the host copy of mirrored tensors (~16 GB) to raise the
       cache ceiling further
 - [ ] LARGELY EXPLAINED: ~80% of collective time is rank arrival skew.

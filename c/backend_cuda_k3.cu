@@ -946,6 +946,85 @@ __global__ void k3_router_exact(float *__restrict__ sc, const float *__restrict_
 }
 
 
+
+/* ---------------- prefill: one weight read, C tokens ------------------------
+ * coli_k3_dense returned 0 for S != 1, so every prefill matmul fell back to the
+ * generic quant_matmul -- 1370 us a launch against 91 us for the exact kernel,
+ * and nsys duly showed it eating 64% of GPU time. Prefill therefore got none of
+ * the mirroring, the 4-wide fold, or the exact int4 path, and measured 235
+ * ms/token against decode's ~200: batching made it WORSE, not better.
+ *
+ * This is what batching is supposed to buy. The block stages its weight row in
+ * shared memory ONCE (rb bytes + ng scales -- 4 KB at I=7168, 19 KB at 33792)
+ * and then walks the C activation vectors against it, so DRAM weight traffic
+ * drops C-fold while x stays L2-resident (32 tokens x 7168 x 4B = 918 KB).
+ *
+ * Per (row, token) the arithmetic and its order are exactly the S==1 kernel's,
+ * so prefill becomes numerically consistent with decode -- which the generic
+ * path was not. */
+template<int W>
+__global__ void k3_dense_i4g_exactW_S(float *__restrict__ y, const float *__restrict__ x,
+                                      const unsigned char *__restrict__ q4,
+                                      const float *__restrict__ scales,
+                                      int I, int O, int gsh, int ng, int S) {
+    enum { T = 256 / W };
+    int o = blockIdx.x;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+
+    extern __shared__ unsigned char shw[];
+    unsigned char *w  = shw;
+    float         *scl = (float *)(shw + ((rb + 15) & ~(size_t)15));
+    for (size_t i = threadIdx.x; i < rb; i += blockDim.x) w[i] = q4[(size_t)o * rb + i];
+    for (int g = threadIdx.x; g < ng; g += blockDim.x) scl[g] = scales[(size_t)o * ng + g];
+    __syncthreads();
+
+    __shared__ float sh[W][T];
+    int p = (int)threadIdx.x;
+    for (int t = 0; t < S; t++) {
+        const float *xs = x + (size_t)t * I;
+        float a[W];
+        #pragma unroll
+        for (int j = 0; j < W; j++) a[j] = 0.f;
+        for (int i = p * W; i + W - 1 < I; i += 256) {
+            int g = i >> gsh;
+            if (g >= ng) g = ng - 1;
+            float sc = scl[g];
+            #pragma unroll
+            for (int q = 0; q < W / 4; q++) {
+                float4 xx = *(const float4 *)(xs + i + q * 4);
+                unsigned char b0 = w[(i >> 1) + q * 2], b1 = w[(i >> 1) + q * 2 + 1];
+                a[q*4+0] += xx.x * (float)((int)(b0 & 15) - 8) * sc;
+                a[q*4+1] += xx.y * (float)((int)(b0 >> 4)  - 8) * sc;
+                a[q*4+2] += xx.z * (float)((int)(b1 & 15) - 8) * sc;
+                a[q*4+3] += xx.w * (float)((int)(b1 >> 4)  - 8) * sc;
+            }
+        }
+        #pragma unroll
+        for (int j = 0; j < W; j++) sh[j][p] = a[j];
+        __syncthreads();
+        for (int n = T / 2; n >= 1; n >>= 1) {
+            if (p < n) {
+                #pragma unroll
+                for (int j = 0; j < W; j++) sh[j][p] += sh[j][p + n];
+            }
+            __syncthreads();
+        }
+        if (!p) {
+            float v[W];
+            #pragma unroll
+            for (int j = 0; j < W; j++) v[j] = sh[j][0];
+            #pragma unroll
+            for (int step = W / 2; step >= 1; step >>= 1) {
+                #pragma unroll
+                for (int j = 0; j < step; j++) v[j] += v[j + step];
+            }
+            y[(size_t)t * O + o] = v[0];
+        }
+        __syncthreads();
+    }
+}
+
 /* ---------------- fp16 dense GEMV (fmt 2) ---------------------------------
  * For the router. int8 per-row quantization ties the absolute error to the row
  * maximum -- about 2% of a typical weight when the row spans 4 sigma -- and
@@ -1524,4 +1603,35 @@ extern "C" int coli_k3_expert_batch_w1(const void *const *w1p, const void *const
     if (!ck(cudaMemcpyAsync(hz_all, g_hz_b, (size_t)n * latent * sizeof(float),
                             cudaMemcpyDeviceToHost, g_stream), "w1 batch hz")) return 0;
     return ck(cudaStreamSynchronize(g_stream), "w1 batch sync");
+}
+
+/* Prefill path: fmt 4 with S>1. Weight row staged once per block, C tokens
+ * walked against it. K3_PREFILL_GPU=0 falls back to the generic kernel. */
+extern "C" int coli_k3_dense_s(float *y, const float *x, const void *w, const float *scales,
+                               int fmt, int S, int I, int O, int gs) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("K3_PREFILL_GPU"); en = e ? atoi(e) : 1; }
+    if (!en || !g_ready || fmt != 4 || S < 2 || I <= 0 || O <= 0) return 0;
+    if (gs <= 0 || (gs & (gs - 1)) || (I & (gs - 1)) || (I & 3)) return 0;
+    int gsh = 0; while ((1 << gsh) < gs) gsh++;
+    int ng = (I + gs - 1) / gs;
+    size_t rb = (size_t)((I + 1) >> 1);
+    size_t shb = ((rb + 15) & ~(size_t)15) + (size_t)ng * sizeof(float);
+    int mx = 0;
+    cudaDeviceGetAttribute(&mx, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    if (shb > (size_t)mx) return 0;                    /* row will not fit; caller falls back */
+    if (shb > 48u * 1024u) {
+        if (cudaFuncSetAttribute(k3_dense_i4g_exactW_S<4>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shb)
+            != cudaSuccess) { cudaGetLastError(); return 0; }
+    }
+    if (!ensure_dense_scratch((int)((size_t)S * I), (int)((size_t)S * O))) return 0;
+    if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)S * I * sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "prefill x")) return 0;
+    k3_dense_i4g_exactW_S<4><<<O, 64, shb, g_stream>>>(
+        g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng, S);
+    if (!ck(cudaGetLastError(), "prefill launch")) return 0;
+    if (!ck(cudaMemcpyAsync(y, g_dy, (size_t)S * O * sizeof(float),
+                            cudaMemcpyDeviceToHost, g_stream), "prefill y")) return 0;
+    return ck(cudaStreamSynchronize(g_stream), "prefill sync");
 }

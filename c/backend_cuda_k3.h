@@ -88,6 +88,11 @@ int  coli_k3_expert_batch_w1(const void *const *w1p, const void *const *w1s,
                              int n, float *hz_all, const float *z,
                              int latent, int inter, float beta1, float beta2);
 
+/* Prefill dense GEMM: fmt 4, S>1. Same per-(row,token) arithmetic as
+ * coli_k3_dense, weight row read once per block instead of once per token. */
+int  coli_k3_dense_s(float *y, const float *x, const void *w, const float *scales,
+                     int fmt, int S, int I, int O, int gs);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus
