@@ -125,6 +125,60 @@ static inline kvq kv_enc(float f){
 static inline float kv_dec(kvq h)  { union{uint32_t u;float f;}b; b.u=(uint32_t)h<<16; return b.f; }
 #endif
 
+/* ---------- bf16 KV-cache inner loops -------------------------------------
+ * The MLA score and context loops walk the cache through kv_dec(): a u16 load,
+ * a widen, a 16-bit shift and a type-pun before the multiply. gcc will not
+ * vectorise that shape, and it is the term that grows with context --
+ * matt = 0.83 + 0.00356*T seconds per 100 decode tokens, 54% of decode at
+ * T=4863. Measured on one X925 core at nt=4863, kvl=512, 24 heads:
+ *     scalar/union   25.45 ms/pass    2.35 GMAC/s
+ *     NEON widen      2.99 ms/pass   19.96 GMAC/s   (8.5x)
+ * So matt was compute-bound on the conversion, not bandwidth-bound on the
+ * cache -- which is why it stayed flat under every cache-traffic change.
+ *
+ * bf16 -> f32 is exactly a shift left by 16, so vshll_n_u16(v,16) reinterpreted
+ * as f32 converts four elements in one instruction. Two accumulators, the same
+ * convention the int8/int4 weight kernels in quant.h already use.
+ *
+ * kvdot_ reorders the reduction (8 partial sums rather than one running total),
+ * so it is not bit-exact -- pairwise accumulation is if anything more accurate,
+ * and it gets the PCC gate. kvaxpy_ is elementwise: each acc[i] sees the same
+ * adds in the same order, so that one IS bit-exact. */
+static int g_kvneon = 1;                      /* K3_KVNEON=0 restores the scalar loops */
+#if defined(__ARM_NEON) && !defined(K3_KV_FP32)
+static inline float kvdot_(const float *q, const kvq *L, int n){
+    float32x4_t a0=vdupq_n_f32(0), a1=vdupq_n_f32(0);
+    int i=0;
+    for(;i+7<n;i+=8){
+        uint16x8_t v=vld1q_u16(L+i);
+        a0=vfmaq_f32(a0, vld1q_f32(q+i),   vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v),16)));
+        a1=vfmaq_f32(a1, vld1q_f32(q+i+4), vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(v),16)));
+    }
+    float s=vaddvq_f32(a0)+vaddvq_f32(a1);
+    for(;i<n;i++) s+=q[i]*kv_dec(L[i]);
+    return s;
+}
+static inline void kvaxpy_(float *acc, const kvq *L, float s, int n){
+    float32x4_t sv=vdupq_n_f32(s);
+    int i=0;
+    for(;i+7<n;i+=8){
+        uint16x8_t v=vld1q_u16(L+i);
+        vst1q_f32(acc+i,   vfmaq_f32(vld1q_f32(acc+i),   sv,
+                  vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(v),16))));
+        vst1q_f32(acc+i+4, vfmaq_f32(vld1q_f32(acc+i+4), sv,
+                  vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(v),16))));
+    }
+    for(;i<n;i++) acc[i]+=s*kv_dec(L[i]);
+}
+#else
+static inline float kvdot_(const float *q, const kvq *L, int n){
+    float s=0; for(int i=0;i<n;i++) s+=q[i]*kv_dec(L[i]); return s;
+}
+static inline void kvaxpy_(float *acc, const kvq *L, float s, int n){
+    for(int i=0;i<n;i++) acc[i]+=s*kv_dec(L[i]);
+}
+#endif
+
 /* ---------- config ---------- */
 typedef struct {
     int hidden, n_layers, vocab, first_dense, dense_inter;
@@ -1680,17 +1734,30 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
             float qabs[4096]; memset(qabs,0,kvl*sizeof(float));
             for(int d=0;d<c->qk_nope;d++) w_addrow(&a->kvb,rbase+d,qp[d],qabs);
             float scbuf[512]; float *sc = (nt<=512) ? scbuf : falloc(nt);
-            for(int t=0;t<nt;t++){
-                const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
-                float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*kv_dec(Lt[i]);
-                for(int i=0;i<qr;i++) s2+=qrp[i]*kv_dec(Rt[i]);
-                sc[t]=s2*c->attn_scale;
+            /* Branch once per head, never inside the reduction, so the scalar
+             * arm measures what it measured before this change. */
+            if(g_kvneon){
+                for(int t=0;t<nt;t++){
+                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
+                    sc[t]=(kvdot_(qabs,Lt,kvl)+kvdot_(qrp,Rt,qr))*c->attn_scale;
+                }
+            } else {
+                for(int t=0;t<nt;t++){
+                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
+                    float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*kv_dec(Lt[i]);
+                    for(int i=0;i<qr;i++) s2+=qrp[i]*kv_dec(Rt[i]);
+                    sc[t]=s2*c->attn_scale;
+                }
             }
             softmax_(sc,nt);
             float clat[4096]; memset(clat,0,kvl*sizeof(float));
-            for(int t=0;t<nt;t++){
-                const kvq *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
-                for(int i=0;i<kvl;i++) clat[i]+=s2*kv_dec(Lt[i]);
+            if(g_kvneon){
+                for(int t=0;t<nt;t++) kvaxpy_(clat,m->Lc[li]+(int64_t)t*kvl,sc[t],kvl);
+            } else {
+                for(int t=0;t<nt;t++){
+                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
+                    for(int i=0;i<kvl;i++) clat[i]+=s2*kv_dec(Lt[i]);
+                }
             }
             if(nt>512) free(sc);
             float *cx=ctxt+(int64_t)h*vh;
@@ -2583,6 +2650,24 @@ static int serve_read_req(ServeReq *q, const char *active){
     if(!fgets(line,sizeof(line),stdin)) return -1;
     if(sscanf(line,"%15s %63s",cmd,id)<2) return 0;
     if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) return active&&!strcmp(active,id);
+    /* SET <key> <value>: retune a knob without paying the load again. Dense
+     * weights come in at ~1.5 s/layer, so a process restart costs 145 s while a
+     * warm measurement pass costs ~80 s -- an A/B that restarts per arm spends
+     * more time loading than measuring. Only knobs that are read per request
+     * (K3_CHUNK, K3_MAXT) or held in a global listed here actually change;
+     * anything cached in a lazily-initialised static keeps its first value, so
+     * the reply echoes what was applied and the harness can assert on it. */
+    if(!strcmp(cmd,"SET")){
+        char val[64]="";
+        if(sscanf(line,"%*s %*s %63s",val)!=1){ printf("ERROR SET needs a value\n"); fflush(stdout); return 0; }
+        setenv(id,val,1);
+        int live = 1;
+        if(!strcmp(id,"K3_KVNEON"))      g_kvneon=atoi(val);
+        else if(!strcmp(id,"K3_CHUNK")||!strcmp(id,"K3_MAXT")) ;      /* re-read per request */
+        else live = 0;
+        printf("SETOK %s=%s live=%d\n",id,val,live); fflush(stdout);
+        return 0;
+    }
     if(strcmp(cmd,"SUBMIT")) return 0;
     int slot, plen, max_tok; float temp, top_p;
     if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5||
@@ -2839,6 +2924,7 @@ int main(int argc, char **argv){
         printf("\n"); free(wire); free(wid); return 0;
     }
     float temp=getenv("COLI_TEMP")?(float)atof(getenv("COLI_TEMP")):0.f;
+    if(getenv("K3_KVNEON")) g_kvneon=atoi(getenv("K3_KVNEON"));
     int nlayers=getenv("K3_LAYERS")?atoi(getenv("K3_LAYERS")):0;
     Model m;
     model_init(&m,snap,nlayers);
