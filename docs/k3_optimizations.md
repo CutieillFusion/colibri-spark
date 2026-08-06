@@ -394,3 +394,56 @@ retires "optimise the largest term" as a strategy here.
       per call, 9108 per 100 decode tokens. arspawn 0.181 -> 0.011, and arwork
       fell 3.248 -> 2.733 because creating a thread also delayed the collective's
       *start*. 5.139 -> 5.211 tok/s, 6/6 byte-identical.
+
+---
+
+## Round 3: where the dense path actually loses
+
+`ncu` on the shipped `exactW<4>` with every tensor mirrored shows Memory 21.85%,
+Compute 21.85%, L1 26.68%, L2 14.99% at 115% achieved occupancy. High occupancy
+with every pipe near a fifth of peak reads as latency-bound, so the first move
+was more memory work in flight.
+
+- [x] **ILP variant** (ushort weight load instead of two byte loads, reduction
+      unrolled by 2) — 5.227 -> 5.278 tok/s, kout -5.9%, 6/6 byte-identical.
+      ncu called it a wash at kernel level (320 vs 322 us); under replay
+      instrumentation a 1% change is invisible, so the e2e A/B decides.
+
+- [ ] ~~**Batched dense** (N tensors, one x, one sync)~~ — MEASURED 7.5% WORSE.
+
+### The real constraint
+
+Per rank the KDA projections are 4 x [3072, 7168] at 4032 B/row = 3.42 GB/token
+over 69 layers. Against kproj = 3.06 s/100 tokens that is **112 GB/s, versus
+234.5 GB/s for the same kernel on mirrored weights in isolation.** The dense path
+gets 48% of what the kernel can do.
+
+That gap is not round-trip overhead, and batching proved it: removing three of
+four uploads and three of four syncs made kproj 38% *worse*. The tell was
+`ctlwork` — the concurrent CPU control thread got 47% slower without doing
+anything different. One long kernel holds the memory system against the CPU
+where several shorter ones leave gaps.
+
+So the isolated 234.5 GB/s was measured with nothing else running, and in
+production the CPU is on the same LPDDR5X. **Half the dense bandwidth is not
+available, and no amount of kernel work will recover it.** The lever is CPU-side
+traffic, not GPU-side efficiency.
+
+A first attempt to confirm this by halving `OMP_NUM_THREADS` left kproj unchanged
+(3.073 vs 3.072) — but the concurrent consumer is the single KDA control thread,
+which `OMP_NUM_THREADS` does not size. That test was aimed at the wrong thread.
+
+### Threading
+
+- [x] **Persistent allreduce worker** — +1.4%, 6/6 identical.
+- [ ] ~~**Persistent KDA control worker**~~ — 54% SLOWER.
+
+Refined rule: persistent workers pay for I/O-bound work (the allreduce thread
+sleeps on sockets and holds no core) and cost for CPU-bound work (the control
+thread competes with the OpenMP pool for the same ten cores).
+
+### Measurement hygiene
+
+The same config measured 5.211 and 5.275 tok/s in two separate script runs.
+Cross-run drift exceeds the ~0.5% within-run spread, so only both-arms-in-one-
+script comparisons are valid. Every A/B above runs its arms back to back.
