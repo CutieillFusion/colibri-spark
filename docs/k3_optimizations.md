@@ -644,3 +644,34 @@ loudly by construction rather than silently -- but "loudly" still means a
 SIGSEGV, and a shape that only some future prompt reaches on the CPU would take
 the server down. Recommended for long-context serving together with EGB=100;
 not defaulted.
+
+### Registering the other three mirror sites
+
+The first sweep returned 9.61 GB of 16.06 with **0 skipped and 0 unaligned** --
+and those zeros were the tell. Nothing was being rejected, so the shortfall had
+to be ranges the registry never saw. `coli_k3_devmirror` is called from four
+places and only one was instrumented.
+
+    before   1248 ranges   9.61 GB   0 skipped     0 unaligned
+    after    1700 ranges  14.47 GB  120 skipped   38 unaligned
+
+90% of the mirror now comes back. The remainder is the router's derived int8
+copies, whose f32 original is deliberately left registered because the exact
+pass reads ~29 of 896 rows on the host.
+
+**The 120 skipped ranges matter more than the extra 4.86 GB.** They are the
+first evidence the tripwire fires at all: with one site instrumented, every
+registered tensor happened to be GPU-only, so "0 skipped" could equally have
+meant the marking was broken. 120 mirrored tensors *are* read on the host and
+are correctly excluded -- exactly the ranges that would have become
+plausible-looking garbage under a naive `free()`. Still 6/6 byte-identical.
+
+### Expert cache, at ctx 1963 (warm2)
+
+| EGB | slots/layer | tok/s | vs baseline |
+|---|---|---|---|
+| 88 (no reclaim) | 185 | 3.879 | — |
+| 100 + reclaim | 210 | 4.377 | +12.8% |
+| **110 + reclaim** | **231** | **4.614** | **+19.0%** |
+
+Still climbing at 110. EGB=100 OOM-killed the ranks before the reclaim existed.
