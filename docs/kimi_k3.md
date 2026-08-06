@@ -112,6 +112,60 @@ experts (93 % of bytes) are already at 4.25 bits/weight and cannot shrink
 losslessly; sub-4-bit expert re-encodes (fmt=5/6) would be double quantization
 of QAT weights and are deliberately not offered here.
 
+### ncu says the expert kernels are TAIL-bound, and batching them is +3%
+
+With performance counters unblocked, profiling `k3_w1_gate_up_fast` and
+`k3_w1_down_fast` in-engine gives the number every earlier hypothesis had
+assumed away:
+
+    Waves Per SM              1.56
+    Memory Throughput        18.8 %   of peak
+    L2 Cache Throughput       7.0 %   of peak
+    Compute (SM) Throughput  18.7 %   of peak
+
+The grid barely fills the machine once and nothing is near saturation. These
+kernels are **tail-bound**, not bandwidth-bound -- the opposite of what this log
+had assumed about the expert tier for its whole history.
+
+Decode applies every routed expert of a layer to the SAME `z`, so they are
+independent and can share a launch with `blockIdx.y` selecting the expert. The
+2-bit store already had that path; the 1-bit store this deployment actually runs
+did not, so `k3_w1_gate_up_fast_b` and `k3_w1_down_fast_b` were added. About 4.6
+experts a layer per rank takes 1.56 waves to ~7 and collapses ~846 launches a
+token into ~184.
+
+| | tok/s | expert s/100 |
+|---|---|---|
+| one launch per expert | 4.502 / 4.538 | 2.691 |
+| **batched** | **4.648 / 4.668** | **2.121 (-21%)** |
+
+Six-prompt free-running output **6/6 byte-identical** -- only the launch geometry
+changed, so each (expert, row) runs exactly the arithmetic it ran alone.
+
+`K3_EXPERT_BATCH` is now on by default. Its old note said batching lost
+0.58 -> 0.51 tok/s because waiting for every expert to load beat overlapping
+load with compute; that was measured when the expert tier still missed often. It
+does not any more (hit rate 99.6%), and the trade reversed exactly as that note
+predicted it would.
+
+### The rank-0 store asymmetry: real, but not the 20% gap
+
+Rank 0 was the only rank without `K3_W2_SHARD`, so it indexed all 896 experts
+and read its quarter at 4x stride from the 425 GB store while the others read
+packed 106 GB stores. Building it a proper 0/4 shard cut the cross-rank expert
+spread from **0.417 to 0.265 (-36%)**, which is what symmetry should do, but end
+to end it was a dead heat -- 4.500/4.500 against 4.500/4.468 across alternating
+reps. spark1 holds both stores, 531 GB against ~117 GB of page cache, so they
+evict each other and the per-run swing on the expert term (2.304, 2.532, 2.640,
+2.689 across runs) is larger than the ~1% being measured. Kept for symmetry and
+the 319 GB it frees, not claimed as a throughput win.
+
+The ncu comparison itself still does not explain the gap. Same kernel, same
+grid, same clock, identical DRAM and L2 throughput -- but rank 0 shows 13% fewer
+achieved active warps per SM, 14.5% lower L1/TEX throughput and 17% more
+SM-active cycles. That is an occupancy/latency effect, not a bandwidth one,
+which retires the memory-contention story but does not replace it.
+
 ## Provisioning from scratch
 
 Rebuilt end to end after a reboot cleared `/tmp` and took the staged snapshot

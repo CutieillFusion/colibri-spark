@@ -80,6 +80,14 @@ int  coli_k3_router2(float *scores, const float *x,
                      const float *wf32, const float *rbias,
                      int E, int I, int K, float delta);
 
+/* Batched 1-bit expert application: one launch for all n experts of a layer.
+ * Bit-exact -- only the launch geometry differs from coli_k3_expert_w1. */
+int  coli_k3_expert_batch_w1(const void *const *w1p, const void *const *w1s,
+                             const void *const *w2p, const void *const *w2s,
+                             const void *const *w3p, const void *const *w3s,
+                             int n, float *hz_all, const float *z,
+                             int latent, int inter, float beta1, float beta2);
+
 void coli_k3_shutdown(void);
 
 #ifdef __cplusplus

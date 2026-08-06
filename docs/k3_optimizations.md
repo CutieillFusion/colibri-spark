@@ -72,6 +72,12 @@ Two more facts that shape the list:
 - [x] split the exposed collectives only: netmoe -15%, 4.362 -> 4.391, 6/6 exact
 - [ ] REJECTED: SO_BUSY_POLL -- inapplicable, the exchange loop uses MSG_DONTWAIT
       so recv() never blocks and the option only affects blocking receives
+- [x] BATCHED 1-BIT EXPERT KERNELS, default ON: 4.502 -> 4.648 (+3.0%), expert
+      2.691 -> 2.121 s/100 (-21%), 6/6 byte-identical. ncu found the reason the
+      old assumption was wrong: Waves Per SM 1.56, DRAM 19% of peak -- the expert
+      kernels are TAIL-bound, not bandwidth-bound
+- [ ] PARTIAL: rank-0 0/4 shard cuts cross-rank spread 0.417 -> 0.265 but is a
+      dead heat end to end; kept for symmetry and 319 GB of disk
 - [x] BUG FIX: K3_EXPERT_BATCH=1 crashed the engine (2-bit kernels on a 1-bit
       store); guard now checks !w1_mode. Untestable here until a 2-bit store exists
 - [ ] CLOSED BY ARITHMETIC: hiding the 7.3 ms/token of expert I/O -- per layer

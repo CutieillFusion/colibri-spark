@@ -1321,7 +1321,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     /* K3_EXPERT_GPU=1 moves the routed-expert matmuls onto the GPU. Needs a
      * device from K3_GPUS; measured on GB10 this is where ~84% of decode time
      * sits, of which only ~14% is I/O. */
-    g_k3_expert_batch = getenv("K3_EXPERT_BATCH")?atoi(getenv("K3_EXPERT_BATCH")):0;
+    g_k3_expert_batch = getenv("K3_EXPERT_BATCH")?atoi(getenv("K3_EXPERT_BATCH")):1;
     g_k3_dense_gpu    = getenv("K3_DENSE_GPU")?atoi(getenv("K3_DENSE_GPU")):1;
     /* NOTE: g_k3_tp_attn is resolved EARLIER, before the weights load -- the
      * head-sliced loads below depend on it, and reading it here would be too
@@ -1887,18 +1887,21 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
          * each with its own z, and the batched kernel shares one. */
         int batchable=0;
 #ifdef COLI_CUDA
-        /* OFF by default: measured 0.51 vs 0.58 tok/s. Collapsing a layer into
-         * one launch removes ~1472 syncs/token, but the per-expert loop below
-         * deliberately overlaps I/O with compute (expert j computes while j+1
-         * loads) and batching waits for ALL of them first -- eload went 5.1 ->
-         * 8.3 s, more than the syncs were worth. Keep it for the residency
-         * endgame, where there is no I/O left to hide and the trade reverses. */
+        /* ON by default since the 1-bit batch kernels landed. The old note said
+         * batching lost 0.58 -> 0.51 tok/s because waiting for every expert to
+         * load beat overlapping load with compute -- that was measured when the
+         * expert tier still missed often. It no longer does (hit rate 99.6%),
+         * and ncu says why batching now wins: the single-expert kernels run at
+         * Waves Per SM = 1.56 with DRAM at 19% of peak, i.e. tail-bound, not
+         * bandwidth-bound. One launch for a layer's ~4.6 experts takes that to
+         * ~7 waves. Measured 4.502/4.538 -> 4.648/4.668, expert 2.691 -> 2.121
+         * s/100, six-prompt output 6/6 byte-identical. */
         /* !w1_mode is required: coli_k3_expert_batch_w2 launches the 2-bit
          * kernels unconditionally, so on a 1-bit store it walks every slot with
          * 2-bit strides and runs off the end -- K3_EXPERT_BATCH=1 killed the
          * engine with an illegal memory access. The single-expert path at
          * expert_apply already dispatches on w1_mode; this guard did not. */
-        batchable = (g_k3_expert_batch && C==1 && m->w2_fd && !m->w1_mode
+        batchable = (g_k3_expert_batch && C==1 && m->w2_fd
                      && g_k3_expert_gpu && nb<=64);
         for(int j=0;j<nb&&batchable;j++) if(pcnt[base+j]!=1) batchable=0;
 #endif
@@ -1927,8 +1930,14 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 p2b[j]=b+m->e_w1p+m->e_w1s;                s2b[j]=(uint8_t*)p2b[j]+m->e_w2p;
                 p3[j]=(uint8_t*)s2b[j]+m->e_w2s;           s3[j]=(uint8_t*)p3[j]+m->e_w1p;
             }
-            if(coli_k3_expert_batch_w2(p1,s1,p2b,s2b,p3,s3,nb,m->hz_batch,Z,
-                                       m->c.latent,m->c.moe_inter,m->c.situ_b1,m->c.situ_b2)){
+            /* w1_mode picks the sign-bit kernels; the 2-bit entry point would
+             * walk a 1-bit slot with 2-bit strides and run off the end. */
+            int bok = m->w1_mode
+              ? coli_k3_expert_batch_w1(p1,s1,p2b,s2b,p3,s3,nb,m->hz_batch,Z,
+                                        m->c.latent,m->c.moe_inter,m->c.situ_b1,m->c.situ_b2)
+              : coli_k3_expert_batch_w2(p1,s1,p2b,s2b,p3,s3,nb,m->hz_batch,Z,
+                                        m->c.latent,m->c.moe_inter,m->c.situ_b1,m->c.situ_b2);
+            if(bok){
                 g_k3_exp_gpu+=nb;
                 for(int j=0;j<nb;j++){
                     const float *h=m->hz_batch+(int64_t)j*m->c.latent;

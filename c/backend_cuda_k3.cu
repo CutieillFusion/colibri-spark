@@ -523,6 +523,55 @@ __global__ void k3_w1_down_fast(float *__restrict__ hz,
     if (lane == 0) hz[o] = t;
 }
 
+
+/* ---------------- batched 1-bit expert kernels -----------------------------
+ * ncu on the single-expert path: Waves Per SM = 1.56. The grid barely fills the
+ * machine once, so these kernels are tail-bound rather than bandwidth-bound --
+ * DRAM and L2 throughput both sit near 19% and 7% of peak. Decode applies every
+ * routed expert of a layer to the SAME z, so they are independent and can share
+ * one launch: blockIdx.y selects the expert. About 4.6 experts a layer per rank
+ * turns 1.56 waves into ~7 and collapses ~846 launches a token into ~184.
+ *
+ * Bit-exact: each (expert, row) pair runs exactly the arithmetic it ran alone,
+ * in the same order. Only the launch geometry changes.
+ *
+ * The 2-bit store already had this (k3_w2_*_b); the 1-bit store is what this
+ * deployment actually runs, and it did not. */
+__global__ void k3_w1_gate_up_fast_b(float *__restrict__ gate_all,
+                                     const K3Expert *__restrict__ ex,
+                                     const float *__restrict__ z,
+                                     int I, int O, float beta1, float beta2) {
+    const K3Expert e = ex[blockIdx.y];
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[(i >> 5) * K3_W1_SHSTRIDE + (i & 31)] = z[i];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    int ng = I >> 5; size_t rb = (size_t)(I >> 3);
+    float a = c_w1a[0];
+    float g1 = warp_row_dot_w1(e.w1p + (size_t)o*rb, e.w1s + (size_t)o*ng, shx, ng, lane) * a;
+    float g3 = warp_row_dot_w1(e.w3p + (size_t)o*rb, e.w3s + (size_t)o*ng, shx, ng, lane) * a;
+    if (lane == 0)
+        gate_all[(size_t)blockIdx.y * O + o] =
+              beta1 * tanhf(g1 / beta1) * (1.f / (1.f + expf(-g1)))
+            * beta2 * tanhf(g3 / beta2);
+}
+
+__global__ void k3_w1_down_fast_b(float *__restrict__ hz_all,
+                                  const K3Expert *__restrict__ ex,
+                                  const float *__restrict__ gate_all, int I, int O) {
+    const K3Expert e = ex[blockIdx.y];
+    const float *gate = gate_all + (size_t)blockIdx.y * I;
+    for (int i = threadIdx.x; i < I; i += blockDim.x) shx[(i >> 5) * K3_W1_SHSTRIDE + (i & 31)] = gate[i];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int o = blockIdx.x * K3_WARPS + warp;
+    if (o >= O) return;
+    int ng = I >> 5; size_t rb = (size_t)(I >> 3);
+    float t = warp_row_dot_w1(e.w2p + (size_t)o*rb, e.w2s + (size_t)o*ng, shx, ng, lane) * c_w1a[0];
+    if (lane == 0) hz_all[(size_t)blockIdx.y * O + o] = t;
+}
+
 extern "C" int coli_k3_expert_w1(const void *w1p, const void *w1s,
                                  const void *w2p, const void *w2s,
                                  const void *w3p, const void *w3s,
@@ -1440,4 +1489,39 @@ extern "C" int coli_k3_router2(float *scores, const float *x,
           nrep++;
       } }
     return ck(cudaStreamSynchronize(g_stream), "rt sync");
+}
+
+/* Batched 1-bit expert application. Mirrors coli_k3_expert_batch_w2 but drives
+ * the w1 (sign-bit) kernels, which is what a 1-bit store actually runs. */
+extern "C" int coli_k3_expert_batch_w1(const void *const *w1p, const void *const *w1s,
+                                       const void *const *w2p, const void *const *w2s,
+                                       const void *const *w3p, const void *const *w3s,
+                                       int n, float *hz_all, const float *z,
+                                       int latent, int inter, float beta1, float beta2) {
+    if (!g_ready || n < 1 || n > K3_BATCH_MAX) return 0;
+    if (latent != g_latent || inter != g_inter) return 0;
+    if (!ensure_batch(n, latent, inter)) return 0;
+
+    K3Expert host[K3_BATCH_MAX];
+    for (int j = 0; j < n; j++) {
+        host[j].w1p = (const unsigned char *)w1p[j]; host[j].w1s = (const unsigned char *)w1s[j];
+        host[j].w2p = (const unsigned char *)w2p[j]; host[j].w2s = (const unsigned char *)w2s[j];
+        host[j].w3p = (const unsigned char *)w3p[j]; host[j].w3s = (const unsigned char *)w3s[j];
+    }
+    if (!ck(cudaMemcpyAsync(g_dev_ex, host, (size_t)n * sizeof(K3Expert),
+                            cudaMemcpyHostToDevice, g_stream), "w1 batch desc")) return 0;
+    if (!ck(cudaMemcpyAsync(g_z, z, (size_t)latent * sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "w1 batch z")) return 0;
+    dim3 gu((unsigned)((inter + K3_WARPS - 1) / K3_WARPS), (unsigned)n);
+    dim3 dn((unsigned)((latent + K3_WARPS - 1) / K3_WARPS), (unsigned)n);
+    k3_w1_gate_up_fast_b<<<gu, K3_FAST_THREADS,
+                           K3_W1_SHFLOATS(latent)*sizeof(float), g_stream>>>(
+        g_gate_b, g_dev_ex, g_z, latent, inter, beta1, beta2);
+    k3_w1_down_fast_b<<<dn, K3_FAST_THREADS,
+                        K3_W1_SHFLOATS(inter)*sizeof(float), g_stream>>>(
+        g_hz_b, g_dev_ex, g_gate_b, inter, latent);
+    if (!ck(cudaGetLastError(), "w1 batch launch")) return 0;
+    if (!ck(cudaMemcpyAsync(hz_all, g_hz_b, (size_t)n * latent * sizeof(float),
+                            cudaMemcpyDeviceToHost, g_stream), "w1 batch hz")) return 0;
+    return ck(cudaStreamSynchronize(g_stream), "w1 batch sync");
 }
