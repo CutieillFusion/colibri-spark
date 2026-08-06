@@ -1593,6 +1593,29 @@ static size_t g_devmir_left = 0, g_devmir_used = 0;
 static size_t g_devmir_cap_skip = 0, g_devmir_budget_skip = 0;
 static int    g_devmir_init = 0;
 
+/* ---- live-settable knobs -------------------------------------------------
+ * These were function-local `static int x = -1; if (x<0) x = getenv(...)`
+ * latches, which is why the SET command reported live=0 for them. An A/B arm
+ * therefore needed a process restart, and a restart at ctx 1963 costs 146 s of
+ * load plus ~960 s refilling the expert cache -- 81% of an arm's wall clock
+ * spent on warmup that is then discarded. Hoisted to file scope so one loaded
+ * engine can serve every arm of a knob sweep. (K3_EXPERT_GB still cannot: the
+ * cache is sized at init.) */
+static int g_k_ilp = -1, g_k_multi = -1, g_k_pfshape = -1, g_k_i4w = -1, g_k_rthr = -1;
+static int k3_knob(int *slot, const char *env, int dflt) {
+    if (*slot < 0) { const char *e = getenv(env); *slot = e ? atoi(e) : dflt; }
+    return *slot;
+}
+extern "C" int coli_k3_set_knob(const char *k, int v) {
+    if      (!strcmp(k, "K3_DENSE_ILP"))     g_k_ilp     = v;
+    else if (!strcmp(k, "K3_DENSE_MULTI"))   g_k_multi   = v;
+    else if (!strcmp(k, "K3_PF_SHAPE"))      g_k_pfshape = v;
+    else if (!strcmp(k, "K3_DENSE_I4W"))     g_k_i4w     = v;
+    else if (!strcmp(k, "K3_DENSE_RTHRESH")) g_k_rthr    = v;
+    else return 0;
+    return 1;
+}
+
 extern "C" size_t coli_k3_devmirror_used(void) { return g_devmir_used; }
 /* Which limit actually bound: the byte budget, or the per-tensor cap. */
 extern "C" void coli_k3_devmirror_report(void) {
@@ -1684,18 +1707,14 @@ extern "C" void *coli_k3_devmirror(const void *host, size_t bytes) {
 extern "C" int coli_k3_dense_multi(float *const *ys, const float *x,
                                    const void *const *ws, const float *const *scales,
                                    int n, int fmt, int I, int O, int gs) {
-    static int en = -1;
-    if (en < 0) { const char *e = getenv("K3_DENSE_MULTI"); en = e ? atoi(e) : 0; }
-    if (!en || !g_ready || n < 2 || n > 8) return 0;
+    if (!k3_knob(&g_k_multi, "K3_DENSE_MULTI", 0) || !g_ready || n < 2 || n > 8) return 0;
     if (fmt != 4 || I <= 0 || O <= 0) return 0;
     if (gs < 4 || (gs & (gs - 1)) || (I & (gs - 1)) || (I & 3)) return 0;
     static int i4w = -1;
     if (i4w < 0) { const char *e = getenv("K3_DENSE_I4W"); i4w = e ? atoi(e) : 4; }
     if (i4w != 4) return 0;
     { const char *fe = getenv("K3_DENSE_EXACT"); if (fe && !atoi(fe)) return 0; }
-    static int ilp = -1;
-    if (ilp < 0) { const char *e = getenv("K3_DENSE_ILP"); ilp = e ? atoi(e) : 1; }
-    if (!ilp) return 0;                       /* shares the ILP row helper */
+    if (!k3_knob(&g_k_ilp, "K3_DENSE_ILP", 1)) return 0;   /* shares the ILP row helper */
     int gsh = 0; while ((1 << gsh) < gs) gsh++;
     int ng = (I + gs - 1) / gs;
     if (!ensure_dense_scratch(I, O * n)) return 0;
@@ -1777,9 +1796,7 @@ extern "C" int coli_k3_dense(float *y, const float *x, const void *w, const floa
             k3_dense_i4g_exactR<4,4><<<(O + 3) / 4, 256, 0, g_stream>>>(
                 g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
         else if (i4w == 4 && gs >= 4 && !(I & 3)) {
-            static int ilp = -1;
-            if (ilp < 0) { const char *e = getenv("K3_DENSE_ILP"); ilp = e ? atoi(e) : 1; }
-            if (ilp)
+            if (k3_knob(&g_k_ilp, "K3_DENSE_ILP", 1))
                 k3_dense_i4g_exactW_ilp<4><<<O, 64, 0, g_stream>>>(
                     g_dy, g_dx, (const unsigned char *)w, scales, I, O, gsh, ng);
             else
@@ -2113,13 +2130,13 @@ extern "C" int coli_k3_dense_s(float *y, const float *x, const void *w, const fl
     if (!ensure_dense_scratch((int)((size_t)S * I), (int)((size_t)S * O))) return 0;
     if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)S * I * sizeof(float),
                             cudaMemcpyHostToDevice, g_stream), "prefill x")) return 0;
-    static int shape = -1;
-    if (shape < 0) {
+    if (g_k_pfshape < 0) {
         const char *e = getenv("K3_PF_SHAPE");
-        shape = !e                  ? 2
-              : !strcmp(e, "tree")  ? 0
-              : !strcmp(e, "warp")  ? 1 : 2;
+        g_k_pfshape = !e                  ? 2
+                    : !strcmp(e, "tree")  ? 0
+                    : !strcmp(e, "warp")  ? 1 : 2;
     }
+    int shape = g_k_pfshape;
     size_t rbA = ((rb + 15) & ~(size_t)15);
     size_t shw = (size_t)K3_PF_WARPS * rbA + (size_t)K3_PF_WARPS * ng * sizeof(float);
     /* 2D tile: needs a g64 store and a reduction length that divides evenly. */

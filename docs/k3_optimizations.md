@@ -675,3 +675,49 @@ plausible-looking garbage under a naive `free()`. Still 6/6 byte-identical.
 | **110 + reclaim** | **231** | **4.614** | **+19.0%** |
 
 Still climbing at 110. EGB=100 OOM-killed the ranks before the reclaim existed.
+
+---
+
+## Round 7: iteration speed, and what it immediately caught
+
+Measuring the harness itself: at ctx 1963 one A/B arm costs 1366 s, of which
+**81% is warmup that gets discarded**.
+
+| stage | s | share | |
+|---|---|---|---|
+| model load | 146 | 11% | repeated per arm |
+| cold | 455 | 33% | fills expert cache — discarded |
+| warm1 | 508 | 37% | *still* filling at EGB=110 — discarded |
+| **warm2** | **257** | **19%** | the only number used |
+
+- [x] **Live knobs + one engine per sweep.** The `SET` command existed but
+      reported `live=0` for nearly everything, because the knobs were
+      function-local `static int x = -1; if (x<0) x = getenv(...)` latches.
+      Hoisted to file scope behind `coli_k3_set_knob`, and the driver gained
+      `ARMS="KNOB=V,KNOB=V,..."` with `PASSES=N`, running every arm against one
+      loaded engine.
+
+      **53 s per measurement against 253 s — 4.8x** — and arms can be
+      interleaved, which controls for drift instead of hoping it cancels.
+
+      `K3_EXPERT_GB` is deliberately *not* live: the cache is sized at init. The
+      driver prints a WARNING when a knob reports `live=0` rather than silently
+      measuring the same configuration twice, which is the failure this whole
+      mechanism could otherwise introduce.
+
+### It found a false positive in its first run
+
+Re-measuring `K3_DENSE_ILP` interleaved, four passes per arm:
+
+    ILP=0   5.238 5.231 5.256 5.256   mean 5.245
+    ILP=1   5.237 5.232 5.256 5.264   mean 5.247   +0.04%
+
+The committed claim was **+1.0%**, from one pass per restart. Within-arm spread
+here is 0.48%, and the run shows a clear upward drift across its own 8 passes
+(5.23 early, 5.26 late) — so the original comparison was reading that drift.
+**The ILP kernel is neutral, not a 1% win.** It stays because it is bit-exact
+and costs nothing, not because it is faster.
+
+That is the real argument for this change: two rounds ago the FDOT A/B flipped
+sign between orderings and cost two extra full A/Bs to diagnose. Interleaved
+passes would have shown it immediately.
