@@ -206,6 +206,50 @@ about 29 us/layer against ~216 us/exchange of skew, so systematic work imbalance
 does not explain it either -- something per-collective and jittery does, and
 that is the next thing to instrument.
 
+### Past 5 tok/s: the expert cache was the straggler, and RAM is the ceiling
+
+Chasing the collective skew ended somewhere unexpected. Per-rank TTFB identified
+rank 0 as the straggler -- its two RD2 partners waited longest -- and the cause
+was not compute:
+
+| rank | cache hit | load (un-hidden I/O) | expert s/100 |
+|---|---|---|---|
+| **0** | **99.6%** | **0.824** | **2.149** |
+| 1 | 99.9% | 0.325 | 1.732 |
+| 2 | 99.9% | 0.286 | 1.667 |
+| 3 | 99.9% | 0.342 | 1.759 |
+
+Rank 0 missed ~4x more often and paid 8.2 ms/token of exposed I/O against ~3.2
+for the others. **Batching made this matter far more than it used to**: the old
+per-expert loop overlapped load with compute (expert j computed while j+1
+loaded) and a batch waits for all of them first. The batching commit's own note
+predicted the trade would reverse; it did, and this is the other half of it.
+
+Enlarging the LRU removes the misses, and with them the skew:
+
+| K3_EXPERT_GB | slots/layer | tok/s | hit | rank0 load | expert spread |
+|---|---|---|---|---|---|
+| 80 | 168 | 4.810 / 4.797 | 99.6% | 0.798 | 0.482 |
+| **88** | **185** | **5.033 / 5.025** | **99.9%** | **0.317** | -- |
+| 100 | 210 | 5.144 / 5.157 | 100.0% | 0.000 | 0.086 |
+
+**But 100 is not usable.** The slots allocate lazily, so a 300-token benchmark
+never reaches the ceiling while a six-prompt run does:
+
+    Out of memory: Killed process (kimi_k3) ... anon-rss:92,980,172 kB
+
+210 slots is 98.1 GB of cache, and with ~24 GB of model and ~16 GB of device
+mirrors that exceeds the 121 GB box. The benchmark reported 71.6 GB RSS and hid
+it completely. **A throughput number from a workload that does not reach peak
+residency is not a safe configuration**, and the only instrument that caught it
+was the long-form generation, which is also the quality gate.
+
+88 is the setting that survives: 185 slots, 86.4 GB ceiling, six-prompt run 6/6
+complete and 6/6 byte-identical, and it still takes the engine past 5 tok/s.
+There is no headroom above it without giving back device-mirror RAM -- the host
+copy of every mirrored tensor is still resident, and releasing it would free
+~16 GB, which is the obvious next move.
+
 ## Provisioning from scratch
 
 Rebuilt end to end after a reboot cleared `/tmp` and took the staged snapshot

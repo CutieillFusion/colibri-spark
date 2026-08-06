@@ -76,7 +76,13 @@ Two more facts that shape the list:
       2.691 -> 2.121 s/100 (-21%), 6/6 byte-identical. ncu found the reason the
       old assumption was wrong: Waves Per SM 1.56, DRAM 19% of peak -- the expert
       kernels are TAIL-bound, not bandwidth-bound
-- [ ] BIGGEST REMAINING LEVER: ~80% of collective time is rank arrival skew.
+- [x] K3_EXPERT_GB 80 -> 88: 4.810 -> 5.033 tok/s, PAST 5. Removes rank 0's
+      cache misses, which were the straggler creating collective skew. 100 is
+      faster (5.157) but OOM-kills on long runs -- lazy slots hide the ceiling
+      from a short benchmark
+- [ ] NEXT: release the host copy of mirrored tensors (~16 GB) to raise the
+      cache ceiling further
+- [ ] LARGELY EXPLAINED: ~80% of collective time is rank arrival skew.
       TTFB says 33 us/exchange moving bytes, RTT says ~27 us latency, leaving
       ~216 us of skew. Both links measure ~54 us RTT, so the 1 GbE bridge is NOT
       a latency floor. ~35 ms/token at stake; thread count does not move it
