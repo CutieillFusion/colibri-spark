@@ -1504,6 +1504,96 @@ __global__ void k3_dense_gate_up_situ(float *__restrict__ gate,
     }
 }
 
+
+/* Batched fused gate/up + SiTU for prefill.
+ *
+ * The S>1 path used to loop tokens with a full cudaStreamSynchronize EACH
+ * iteration -- 32 uploads, 32 launches, 32 downloads and 32 syncs for a
+ * 32-token chunk, re-reading both weight matrices from DRAM every token. It was
+ * the largest single prefill term at 14.4 s of 74.3.
+ *
+ * Here the block stages ITS w1 and w3 rows in shared memory once (2*rb bytes +
+ * 2*ng scales; 8 KB at I=7168) and walks all C tokens against them. Per
+ * (row, token) the arithmetic and its order are exactly the single-token
+ * kernel's, so values do not move. */
+__global__ void k3_dense_gate_up_situ_S(float *__restrict__ gate,
+                                        const float *__restrict__ x,
+                                        const unsigned char *__restrict__ w1p,
+                                        const float *__restrict__ w1s,
+                                        const unsigned char *__restrict__ w3p,
+                                        const float *__restrict__ w3s,
+                                        int I, int O, int gsh, int ng, int S,
+                                        float beta1, float beta2) {
+    enum { W = 4, T = 256 / W };
+    int o = blockIdx.x;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+
+    extern __shared__ unsigned char shg[];
+    unsigned char *a1 = shg;
+    unsigned char *a3 = shg + ((rb + 15) & ~(size_t)15);
+    float *s1 = (float *)(a3 + ((rb + 15) & ~(size_t)15));
+    float *s3 = s1 + ng;
+    for (size_t i = threadIdx.x; i < rb; i += blockDim.x) {
+        a1[i] = w1p[(size_t)o * rb + i];
+        a3[i] = w3p[(size_t)o * rb + i];
+    }
+    for (int g = threadIdx.x; g < ng; g += blockDim.x) {
+        s1[g] = w1s[(size_t)o * ng + g];
+        s3[g] = w3s[(size_t)o * ng + g];
+    }
+    __syncthreads();
+
+    __shared__ float sh[2][W][T];
+    int p = (int)threadIdx.x;
+    for (int t = 0; t < S; t++) {
+        const float *xs = x + (size_t)t * I;
+        float g1[W], g3[W];
+        #pragma unroll
+        for (int j = 0; j < W; j++) { g1[j] = 0.f; g3[j] = 0.f; }
+        for (int i = p * W; i + W - 1 < I; i += 256) {
+            int g = i >> gsh; if (g >= ng) g = ng - 1;
+            float c1 = s1[g], c3 = s3[g];
+            float4 xx = *(const float4 *)(xs + i);
+            unsigned char b0 = a1[(i >> 1)], b1 = a1[(i >> 1) + 1];
+            g1[0] += xx.x * (float)((int)(b0 & 15) - 8) * c1;
+            g1[1] += xx.y * (float)((int)(b0 >> 4)  - 8) * c1;
+            g1[2] += xx.z * (float)((int)(b1 & 15) - 8) * c1;
+            g1[3] += xx.w * (float)((int)(b1 >> 4)  - 8) * c1;
+            unsigned char d0 = a3[(i >> 1)], d1 = a3[(i >> 1) + 1];
+            g3[0] += xx.x * (float)((int)(d0 & 15) - 8) * c3;
+            g3[1] += xx.y * (float)((int)(d0 >> 4)  - 8) * c3;
+            g3[2] += xx.z * (float)((int)(d1 & 15) - 8) * c3;
+            g3[3] += xx.w * (float)((int)(d1 >> 4)  - 8) * c3;
+        }
+        #pragma unroll
+        for (int j = 0; j < W; j++) { sh[0][j][p] = g1[j]; sh[1][j][p] = g3[j]; }
+        __syncthreads();
+        for (int n = T / 2; n >= 1; n >>= 1) {
+            if (p < n) {
+                #pragma unroll
+                for (int m = 0; m < 2; m++)
+                    #pragma unroll
+                    for (int j = 0; j < W; j++) sh[m][j][p] += sh[m][j][p + n];
+            }
+            __syncthreads();
+        }
+        if (!p) {
+            float r[2];
+            #pragma unroll
+            for (int m = 0; m < 2; m++) {
+                float v0 = sh[m][0][0], v1 = sh[m][1][0], v2 = sh[m][2][0], v3 = sh[m][3][0];
+                v0 += v2; v1 += v3; r[m] = v0 + v1;
+            }
+            float gg = r[0], uu = r[1];
+            float sig = (float)(1.0 / (1.0 + exp(-(double)gg)));
+            gate[(size_t)t * O + o] = beta1 * tanhf(gg / beta1) * sig
+                                    * beta2 * tanhf(uu / beta2);
+        }
+        __syncthreads();
+    }
+}
+
 extern "C" int coli_k3_gate_up_situ(float *gate, const float *x,
                                     const void *w1p, const float *w1s,
                                     const void *w3p, const float *w3s,
@@ -1512,6 +1602,30 @@ extern "C" int coli_k3_gate_up_situ(float *gate, const float *x,
     if (!g_ready || I <= 0 || O <= 0 || S <= 0 || (I & 3)) return 0;
     if (gs < 4 || (gs & (gs - 1)) || (I & (gs - 1))) return 0;
     int gsh = 0; while ((1 << gsh) < gs) gsh++;
+    if (S > 1) {                       /* prefill: one launch for the whole chunk */
+        size_t rb = (size_t)((I + 1) >> 1), ng2 = (size_t)((I + gs - 1) / gs);
+        size_t shb = 2 * ((rb + 15) & ~(size_t)15) + 2 * ng2 * sizeof(float);
+        int mx = 0;
+        cudaDeviceGetAttribute(&mx, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        if (shb <= (size_t)mx) {
+            if (shb > 48u * 1024u &&
+                cudaFuncSetAttribute(k3_dense_gate_up_situ_S,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shb)
+                != cudaSuccess) { cudaGetLastError(); goto situ_pertoken; }
+            if (!ensure_dense_scratch((int)((size_t)S * I), (int)((size_t)S * O))) return 0;
+            if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)S * I * sizeof(float),
+                                    cudaMemcpyHostToDevice, g_stream), "situ x S")) return 0;
+            k3_dense_gate_up_situ_S<<<O, 64, shb, g_stream>>>(
+                g_dy, g_dx, (const unsigned char *)w1p, w1s,
+                (const unsigned char *)w3p, w3s, I, O, gsh, (I + gs - 1) / gs, S,
+                beta1, beta2);
+            if (!ck(cudaGetLastError(), "situ S launch")) return 0;
+            if (!ck(cudaMemcpyAsync(gate, g_dy, (size_t)S * O * sizeof(float),
+                                    cudaMemcpyDeviceToHost, g_stream), "situ y S")) return 0;
+            return ck(cudaStreamSynchronize(g_stream), "situ S sync");
+        }
+    }
+situ_pertoken:
     if (!ensure_dense_scratch(I, O)) return 0;
     for (int t = 0; t < S; t++) {
         if (!ck(cudaMemcpyAsync(g_dx, x + (size_t)t * I, (size_t)I * sizeof(float),

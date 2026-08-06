@@ -84,7 +84,13 @@ Two more facts that shape the list:
       so prefill ran the 15x-slower generic kernel. 275 -> 194 ms/prefill-token
       cold, request 310 -> 137 s, 6/6 byte-identical. Census: gemm=9984
       generic=4496 (the 4496 are int8 MLA/lm_head), zero declines
-- [ ] OPEN: prefill still ~14x off its 10 ms/token floor -- expert cache thrashes
+- [x] PROF2P: prefill phase instrumented at last (PROF2's baseline sat below the
+      prefill loop, leaving 74% of a prompted request unmeasured)
+- [x] BATCHED FUSED SiTU: was syncing once per token; shared 14.38 -> 7.34 s,
+      prefill 6.91 -> 7.40 tok/s, 6/6 byte-identical
+- [ ] NEXT: prefill kernels are decode-shaped -- 256-lane tree reduction with
+      block-wide syncs per token. Warp-per-row + shuffle + register tiling
+- [ ] OPEN: prefill still ~13x off its 10 ms/token floor -- expert cache thrashes
       at C=32 (~390 unique of 896 per layer vs 210 slots). Sweep K3_CHUNK now that
       small chunks are no longer punished by dense
 - [ ] NEXT: release the host copy of mirrored tensors (~16 GB) to raise the

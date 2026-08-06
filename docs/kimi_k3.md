@@ -292,6 +292,55 @@ thrashing: a 32-token chunk draws ~390 unique experts of 896 per layer against
 punished because dense did not amortise, and no longer are -- so there is
 probably an optimum well below `K3_CHUNK=32`.
 
+### PROF2 never measured prefill, and the first look explains a lot
+
+`PROF2` takes its baseline BELOW the prefill loop, so every term it reports is
+decode-only. On a 513-token prompt that left **74% of the request
+uninstrumented**, which is why two successive explanations for prefill's cost
+(expert thrashing, then weight traffic) were both wrong -- the chunk sweep
+contradicted each, and there was no instrument that could see the work.
+
+`PROF2P` snapshots the same timers around the prefill loop. The first real
+breakdown, 513 tokens in 74.3 s at 6.91 tok/s:
+
+| term | s | share |
+|---|---|---|
+| shared experts | 14.38 | 19% |
+| kproj | 10.63 | 14% |
+| expert | 9.85 | 13% |
+| kout (netkda 8.04) | 9.29 | 13% |
+| matt | 8.61 | 12% |
+| ctljoin | 6.31 | 8% |
+| **collectives (net)** | **20.49** | **28%** |
+
+### The fused SiTU was synchronising once per token
+
+`coli_k3_gate_up_situ` looped tokens with a full `cudaStreamSynchronize` EACH
+iteration: 32 uploads, 32 launches, 32 downloads and 32 syncs for a 32-token
+chunk, re-reading both weight matrices from DRAM every token. It was the largest
+prefill term.
+
+`k3_dense_gate_up_situ_S` stages the block's w1 and w3 rows in shared once
+(8 KB at I=7168) and walks all C tokens against them:
+
+| | shared | prefill tok/s |
+|---|---|---|
+| per-token loop | 14.38 s | 6.91 |
+| **batched** | **7.34 s** | **7.40** |
+
+Six-prompt output 6/6 byte-identical -- per (row, token) the arithmetic and its
+order are unchanged.
+
+### Prefill is still decode-shaped, and that is the remaining 13x
+
+At 7.40 tok/s against a ~97 tok/s weight-traffic floor, the structure is the
+problem, not the bytes. Both prefill kernels still do a **256-lane tree
+reduction with block-wide syncs per token** -- a decode GEMV wearing a loop.
+64 threads per block is two warps, and 32 tokens means ~256 block-wide barriers
+per block. The genuinely separate prefill shape is warp-per-row with shuffle
+reductions and register tiling over tokens, which removes the barriers
+entirely; `warp_row_dot_w1` in the expert path already demonstrates it.
+
 ## Provisioning from scratch
 
 Rebuilt end to end after a reboot cleared `/tmp` and took the staged snapshot

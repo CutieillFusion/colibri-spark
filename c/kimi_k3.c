@@ -2633,10 +2633,39 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     uint64_t hit0=m->hits, miss0=m->miss;
     float *lo=NULL;
     m->head_greedy = (q->temp <= 0.f);
+    /* PROF2 has always taken its baseline BELOW the prefill loop, so every term
+     * it reports is decode-only and prefill was 74% of a prompted request with
+     * no instrument on it at all. Snapshot the same timers around the loop and
+     * report the prefill deltas as PROF2P. */
+    double pa0=m->t_attn, pe0=m->t_moe, pd0=m->t_eload, ph0=m->t_head;
+    double pr0=m->t_router, ptop0=m->t_topk, pl0=m->t_latent;
+    double ps0=m->t_shared, px0=m->t_expert, pn0=m->t_rnorm;
+    double pkpr0=m->t_kproj, pkc0=m->t_kconv, pkh0=m->t_khead, pko0=m->t_kout;
+    double pcj0=m->t_ctljoin, pcw0=g_ctl_secs;
+    double pnk0=m->t_net_kda, pnm0=m->t_net_mla, pnx0=m->t_net_moe;
+    double prm0=g_resmix_secs;
+    double pmpr0=m->t_mproj, pma0=m->t_matt, pmo0=m->t_mout;
+    double pnet0=k3_net_secs(); uint64_t pnc0=k3_net_calls();
+    double pwall0=now_s();
     for(int i=0;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
         free(lo); lo=step_chunk(m,ids+i,i,C);
     }
+    { double pw=now_s()-pwall0;
+      fprintf(stderr,"PROF2P wall=%.3f np=%d chunk=%d tok/s=%.2f | attn=%.3f moe=%.3f load=%.3f head=%.3f "
+        "net=%.3f/%llu router=%.3f topk=%.3f latent=%.3f shared=%.3f expert=%.3f rnorm=%.3f "
+        "kproj=%.3f kconv=%.3f khead=%.3f kout=%.3f mproj=%.3f matt=%.3f mout=%.3f "
+        "ctlwork=%.3f ctljoin=%.3f netkda=%.3f netmla=%.3f netmoe=%.3f resmix=%.3f\n",
+        pw,np,chunk,np/(pw>0?pw:1),
+        m->t_attn-pa0,m->t_moe-pe0,m->t_eload-pd0,m->t_head-ph0,
+        k3_net_secs()-pnet0,(unsigned long long)(k3_net_calls()-pnc0),
+        m->t_router-pr0,m->t_topk-ptop0,m->t_latent-pl0,m->t_shared-ps0,
+        m->t_expert-px0,m->t_rnorm-pn0,
+        m->t_kproj-pkpr0,m->t_kconv-pkc0,m->t_khead-pkh0,m->t_kout-pko0,
+        m->t_mproj-pmpr0,m->t_matt-pma0,m->t_mout-pmo0,
+        g_ctl_secs-pcw0,m->t_ctljoin-pcj0,
+        m->t_net_kda-pnk0,m->t_net_mla-pnm0,m->t_net_moe-pnx0,
+        g_resmix_secs-prm0); }
     /* Decode-only snapshots.  The existing PROF line deliberately includes
      * prefill, which is useful for request accounting but obscures B=1 token
      * latency.  PROF2 excludes prefill and breaks the warm decode path into
