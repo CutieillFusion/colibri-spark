@@ -1284,17 +1284,14 @@ __global__ void k3_dense_i4g_exactR(float *__restrict__ y, const float *__restri
  *      strictly in increasing i. Bit-exact by construction.
  *
  * K3_DENSE_ILP=0 selects the original. */
+/* The per-row computation, shared by the single and batched launches so the
+ * two cannot drift apart numerically. Returns the row's value on thread 0. */
 template<int W>
-__global__ void k3_dense_i4g_exactW_ilp(float *__restrict__ y, const float *__restrict__ x,
-                                        const unsigned char *__restrict__ q4,
-                                        const float *__restrict__ scales,
-                                        int I, int O, int gsh, int ng) {
+__device__ __forceinline__ float k3_exact_row_ilp(const float *__restrict__ x,
+                                                  const unsigned char *__restrict__ w,
+                                                  const float *__restrict__ scl,
+                                                  int I, int gsh, int ng) {
     enum { T = 256 / W };
-    int o = blockIdx.x;
-    if (o >= O) return;
-    size_t rb = (size_t)((I + 1) >> 1);
-    const unsigned char *w = q4 + (size_t)o * rb;
-    const float *scl = scales + (size_t)o * ng;
     int p = (int)threadIdx.x;
     float a[W];
     #pragma unroll
@@ -1348,6 +1345,7 @@ __global__ void k3_dense_i4g_exactW_ilp(float *__restrict__ y, const float *__re
         }
         __syncthreads();
     }
+    float out = 0.f;
     if (!p) {
         float v[W];
         #pragma unroll
@@ -1357,8 +1355,69 @@ __global__ void k3_dense_i4g_exactW_ilp(float *__restrict__ y, const float *__re
             #pragma unroll
             for (int j = 0; j < step; j++) v[j] += v[j + step];
         }
-        y[o] = v[0];
+        out = v[0];
     }
+    __syncthreads();                     /* sh must not be reused before all lanes read */
+    return out;
+}
+
+template<int W>
+__global__ void k3_dense_i4g_exactW_ilp(float *__restrict__ y, const float *__restrict__ x,
+                                        const unsigned char *__restrict__ q4,
+                                        const float *__restrict__ scales,
+                                        int I, int O, int gsh, int ng) {
+    int o = blockIdx.x;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+    float v = k3_exact_row_ilp<W>(x, q4 + (size_t)o * rb, scales + (size_t)o * ng, I, gsh, ng);
+    if (!threadIdx.x) y[o] = v;
+}
+
+/* ---------------- batched dense: N tensors, one x, one sync -----------------
+ * Every coli_k3_dense call is a full round trip: upload x, launch, download y,
+ * cudaStreamSynchronize. The four KDA projections (q, k, v, g) multiply the
+ * SAME x, so per layer that is four uploads of the same 28.7 KB and four
+ * synchronisations.
+ *
+ * The arithmetic says how much that costs. Per rank the projections are
+ * 4 x [3072, 7168] at 4032 B/row = 49.5 MB/layer, 3.42 GB/token over 69 KDA
+ * layers. kproj measures 3.06 s/100 tokens = 30.6 ms/token, i.e. 112 GB/s,
+ * against 234.5 GB/s for the same kernel on mirrored weights. At 235 GB/s the
+ * bytes alone want ~53 us per call and the measurement says ~111 us, so more
+ * than half of kproj is per-call overhead rather than the kernel.
+ *
+ * So upload x once, select the weight matrix with blockIdx.y, and synchronise
+ * once. The downloads stay separate (the caller has four distinct
+ * destinations) but they are async and cost only their enqueue.
+ *
+ * MEASURED WORSE, off by default (K3_DENSE_MULTI=1 to re-run the A/B):
+ *
+ *     e2e        5.182 -> 4.795 tok/s   -7.5%
+ *     kproj      3.211 -> 4.437         +38%
+ *     ctlwork    2.705 -> 3.984         +47%
+ *
+ * The launch count was never the problem. Four launches of 3072 blocks and one
+ * of 12288 carry the same parallelism, but the four run as short kernels that
+ * each stream one 12.4 MB tensor, while the batch interleaves four weight
+ * streams through L2 at once. The tell is ctlwork: the CPU control thread that
+ * runs concurrently got 47% SLOWER without doing anything different, so the
+ * longer single kernel is holding the memory system against it. On a shared
+ * LPDDR5X the GPU and CPU are contending, and a kernel that runs longer in one
+ * stretch is worse for the pair than several that leave gaps -- even though the
+ * per-call round trip really is more than half of kproj by the byte arithmetic.
+ *
+ * Eighth instance of the same pattern: removing work wins, moving it loses. */
+struct K3DenseBatch { const unsigned char *q4[8]; const float *sc[8]; };
+
+template<int W>
+__global__ void k3_dense_i4g_exactW_multi(float *__restrict__ y, const float *__restrict__ x,
+                                          K3DenseBatch b, int I, int O, int gsh, int ng) {
+    int o = blockIdx.x, j = blockIdx.y;
+    if (o >= O) return;
+    size_t rb = (size_t)((I + 1) >> 1);
+    float v = k3_exact_row_ilp<W>(x, b.q4[j] + (size_t)o * rb, b.sc[j] + (size_t)o * ng,
+                                  I, gsh, ng);
+    if (!threadIdx.x) y[(size_t)j * O + o] = v;
 }
 
 template<int W>
@@ -1584,6 +1643,40 @@ extern "C" void *coli_k3_devmirror(const void *host, size_t bytes) {
     }
     g_devmir_left -= bytes; g_devmir_used += bytes;
     return d;
+}
+
+/* Batched S==1 dense: N tensors sharing one x, one upload, one synchronise.
+ * Returns 0 when it cannot help so the caller keeps its per-tensor loop. */
+extern "C" int coli_k3_dense_multi(float *const *ys, const float *x,
+                                   const void *const *ws, const float *const *scales,
+                                   int n, int fmt, int I, int O, int gs) {
+    static int en = -1;
+    if (en < 0) { const char *e = getenv("K3_DENSE_MULTI"); en = e ? atoi(e) : 0; }
+    if (!en || !g_ready || n < 2 || n > 8) return 0;
+    if (fmt != 4 || I <= 0 || O <= 0) return 0;
+    if (gs < 4 || (gs & (gs - 1)) || (I & (gs - 1)) || (I & 3)) return 0;
+    static int i4w = -1;
+    if (i4w < 0) { const char *e = getenv("K3_DENSE_I4W"); i4w = e ? atoi(e) : 4; }
+    if (i4w != 4) return 0;
+    { const char *fe = getenv("K3_DENSE_EXACT"); if (fe && !atoi(fe)) return 0; }
+    static int ilp = -1;
+    if (ilp < 0) { const char *e = getenv("K3_DENSE_ILP"); ilp = e ? atoi(e) : 1; }
+    if (!ilp) return 0;                       /* shares the ILP row helper */
+    int gsh = 0; while ((1 << gsh) < gs) gsh++;
+    int ng = (I + gs - 1) / gs;
+    if (!ensure_dense_scratch(I, O * n)) return 0;
+    if (!ck(cudaMemcpyAsync(g_dx, x, (size_t)I * sizeof(float),
+                            cudaMemcpyHostToDevice, g_stream), "multi x")) return 0;
+    K3DenseBatch b;
+    for (int j = 0; j < n; j++) { b.q4[j] = (const unsigned char *)ws[j]; b.sc[j] = scales[j]; }
+    for (int j = n; j < 8; j++) { b.q4[j] = b.q4[0]; b.sc[j] = b.sc[0]; }
+    dim3 gr((unsigned)O, (unsigned)n);
+    k3_dense_i4g_exactW_multi<4><<<gr, 64, 0, g_stream>>>(g_dy, g_dx, b, I, O, gsh, ng);
+    if (!ck(cudaGetLastError(), "multi launch")) return 0;
+    for (int j = 0; j < n; j++)
+        if (!ck(cudaMemcpyAsync(ys[j], g_dy + (size_t)j * O, (size_t)O * sizeof(float),
+                                cudaMemcpyDeviceToHost, g_stream), "multi y")) return 0;
+    return ck(cudaStreamSynchronize(g_stream), "multi sync");
 }
 
 /* S==1 only (decode GEMV). Returns 0 when it cannot help, so the caller keeps

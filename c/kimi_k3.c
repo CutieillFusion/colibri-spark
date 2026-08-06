@@ -782,6 +782,21 @@ static int w_k3_dense_one(float *y, const float *x, const W *w){
     if(!w_k3_ptrs_any(w,&bl,&sc)) return 0;
     return coli_k3_dense(y,x,bl,sc,w->fmt,1,w->I,w->O,w->gs);
 }
+
+/* N tensors against one x in a single round trip. Every dense call uploads x,
+ * launches, downloads y and synchronises the stream; the four KDA projections
+ * share x, so per layer that is four uploads of the same vector and four
+ * synchronisations for one kernel's worth of bytes. */
+static int w_k3_dense_many(float *const *ys, const float *x, const W *const *ws, int n){
+    const void *bl[8]; const float *sc[8];
+    if(n<2||n>8) return 0;
+    for(int j=0;j<n;j++){
+        if(!w_k3_ptrs_any(ws[j],&bl[j],&sc[j])) return 0;
+        if(ws[j]->fmt!=ws[0]->fmt||ws[j]->I!=ws[0]->I||
+           ws[j]->O!=ws[0]->O||ws[j]->gs!=ws[0]->gs) return 0;
+    }
+    return coli_k3_dense_multi(ys,x,bl,sc,n,ws[0]->fmt,ws[0]->I,ws[0]->O,ws[0]->gs);
+}
 #endif
 
 static void w_matmul(float *y, const float *x, const W *w, int S){
@@ -1585,13 +1600,22 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
                            tmp+(int64_t)t*4*pn+(int64_t)u2*pn,(size_t)pn*sizeof(float));
             free(tmp);
         } else {
-            float *tmp=falloc((int64_t)C*pn);
+            float *tmp=falloc((int64_t)C*pn*4);
             W *sw[4]={&a->qs,&a->ks,&a->vs,&a->gs};
-            for(int u2=0;u2<4;u2++){
-                w_matmul(tmp,x,sw[u2],C);
-                for(int t=0;t<C;t++)
-                    memcpy(dst[u2]+(int64_t)t*P+p0,tmp+(int64_t)t*pn,(size_t)pn*sizeof(float));
+            int batched=0;
+#ifdef COLI_CUDA
+            if(C==1){
+                float *ys[4]={tmp,tmp+pn,tmp+2*(int64_t)pn,tmp+3*(int64_t)pn};
+                const W *cw[4]={sw[0],sw[1],sw[2],sw[3]};
+                batched=w_k3_dense_many(ys,x,cw,4);
             }
+#endif
+            if(!batched)
+                for(int u2=0;u2<4;u2++) w_matmul(tmp+(int64_t)u2*C*pn,x,sw[u2],C);
+            for(int u2=0;u2<4;u2++)
+                for(int t=0;t<C;t++)
+                    memcpy(dst[u2]+(int64_t)t*P+p0,
+                           tmp+(int64_t)u2*C*pn+(int64_t)t*pn,(size_t)pn*sizeof(float));
             free(tmp);
         }
         m->t_kproj+=now_s()-kp0;
