@@ -145,6 +145,7 @@ static inline float kv_dec(kvq h)  { union{uint32_t u;float f;}b; b.u=(uint32_t)
  * and it gets the PCC gate. kvaxpy_ is elementwise: each acc[i] sees the same
  * adds in the same order, so that one IS bit-exact. */
 static int g_kvneon = 1;                      /* K3_KVNEON=0 restores the scalar loops */
+static int g_fdot   = 0;                      /* K3_FDOT=1: faster, but see the note below */
 static int g_mattb  = 0;                      /* head-batched MLA: correct but slower, see below */
 #if defined(__ARM_NEON) && !defined(K3_KV_FP32)
 static inline float kvdot_(const float *q, const kvq *L, int n){
@@ -179,6 +180,59 @@ static inline void kvaxpy_(float *acc, const kvq *L, float s, int n){
     for(int i=0;i<n;i++) acc[i]+=s*kv_dec(L[i]);
 }
 #endif
+
+/* Plain fp32 dot. The KDA control path stores fa/fb/bp unquantised and reduces
+ * them with `for(i) v+=x[i]*w[i]`, which gcc cannot vectorise: FP addition is
+ * not associative and this build does not pass -ffast-math. Measured on one
+ * X925 core over 152 rows of I=7168:
+ *     scalar   0.557 ms/pass    1.96 GMAC/s
+ *     NEON     0.055 ms/pass   19.86 GMAC/s   (10.1x)
+ * Four accumulators, so the reduction order changes -- same category as kvdot_.
+ *
+ * OFF BY DEFAULT. It does speed up what it touches, consistently and in the
+ * predicted direction (standard prompt, s/100 tokens):
+ *
+ *     ctlwork  2.72 -> 2.19   ctljoin 0.89 -> 0.44
+ *     kproj    3.22 -> 2.85   attn   10.08 -> 9.55
+ *
+ * kproj falling 12% for a CPU-side change is independent confirmation that the
+ * GPU dense path is contending with the CPU for LPDDR5X: less CPU traffic, more
+ * GPU bandwidth. But end to end it is a wash (5.146 vs 5.163 mean over two
+ * A/Bs with the arms in both orders), and at ctx 1963 it OOM-kills all four
+ * ranks.
+ *
+ * The reason is not that it allocates anything. fa/fb/bp produce the KDA gate
+ * and beta, so a different summation order changes the recurrence, the residual
+ * stream, and therefore which experts the router picks. A different expert set
+ * has a different cache footprint: RSS came out at exactly 72.47 GB with it on
+ * and exactly 70.94 GB with it off, in both orderings -- deterministic, not
+ * timing. At ctx 1963 the scalar arm already sits at 98.07 GB of 121, so a
+ * 1.5 GB shift is fatal.
+ *
+ * So this is blocked on memory headroom rather than on being wrong: it needs
+ * EGB retuned down before it can be turned on, and that trade has to be
+ * measured (the 80 -> 88 expert-cache increase was itself worth +4.6%).
+ * K3_FDOT=1 to re-run the A/B. */
+#if defined(__ARM_NEON)
+static inline float fdot_(const float *x, const float *w, int n){
+    float32x4_t a0=vdupq_n_f32(0),a1=vdupq_n_f32(0),a2=vdupq_n_f32(0),a3=vdupq_n_f32(0);
+    int i=0;
+    for(;i+15<n;i+=16){
+        a0=vfmaq_f32(a0,vld1q_f32(x+i),   vld1q_f32(w+i));
+        a1=vfmaq_f32(a1,vld1q_f32(x+i+4), vld1q_f32(w+i+4));
+        a2=vfmaq_f32(a2,vld1q_f32(x+i+8), vld1q_f32(w+i+8));
+        a3=vfmaq_f32(a3,vld1q_f32(x+i+12),vld1q_f32(w+i+12));
+    }
+    float v=vaddvq_f32(a0)+vaddvq_f32(a1)+vaddvq_f32(a2)+vaddvq_f32(a3);
+    for(;i<n;i++) v+=x[i]*w[i];
+    return v;
+}
+#else
+static inline float fdot_(const float *x, const float *w, int n){
+    float v=0; for(int i=0;i<n;i++) v+=x[i]*w[i]; return v;
+}
+#endif
+
 
 /* ---------- config ---------- */
 typedef struct {
@@ -380,12 +434,17 @@ static void kda_control_b1(KdaCtrlJob *j){
                 w=j->a->bp.f+(int64_t)r*j->hidden; x=j->x;
                 dst=j->braw+j->h0+r; I=j->hidden;
             }
-            float v=0; for(int i=0;i<I;i++) v+=x[i]*w[i]; *dst=v;
+            float v;
+            if(g_fdot) v=fdot_(x,w,I);
+            else { v=0; for(int i=0;i<I;i++) v+=x[i]*w[i]; }
+            *dst=v;
         }
         #pragma omp for schedule(static)
         for(int r=0;r<j->pn;r++){
             const float *w=j->a->fb.f+(int64_t)r*j->hd;
-            float v=0; for(int i=0;i<j->hd;i++) v+=j->t1[i]*w[i];
+            float v;
+            if(g_fdot) v=fdot_(j->t1,w,j->hd);
+            else { v=0; for(int i=0;i<j->hd;i++) v+=j->t1[i]*w[i]; }
             j->graw[j->p0+r]=v;
         }
     }
@@ -3114,6 +3173,7 @@ int main(int argc, char **argv){
     }
     float temp=getenv("COLI_TEMP")?(float)atof(getenv("COLI_TEMP")):0.f;
     if(getenv("K3_KVNEON")) g_kvneon=atoi(getenv("K3_KVNEON"));
+    if(getenv("K3_FDOT")) g_fdot=atoi(getenv("K3_FDOT"));
     if(getenv("K3_MATT_BATCH")) g_mattb=atoi(getenv("K3_MATT_BATCH"));
     int nlayers=getenv("K3_LAYERS")?atoi(getenv("K3_LAYERS")):0;
     Model m;
