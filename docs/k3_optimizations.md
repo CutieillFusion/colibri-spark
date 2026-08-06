@@ -539,3 +539,48 @@ is worth. It also unblocks the vectorised control dot, which needs only 1.5 GB.
       use-after-free. The safe shape is to free only tensors whose GPU path is
       unconditional for every shape they are called with, and to make the
       fallback assert rather than read freed memory.
+
+---
+
+## Round 5: the de-duplication route is closed, and headroom is worse than reported
+
+The plan from round 4 was to recover the 16.06 GB that mirroring duplicates.
+`cudaMallocManaged` was the safe way to do it -- dereferenceable from both
+sides, so the host copy can be freed and the pointers repointed, with no way for
+a CPU fallback to reach a dangling pointer.
+
+- [ ] ~~**Managed-memory mirror**~~ — 7.9% SLOWER *and* uses more memory.
+
+    | | tok/s | shared | kout | RSS |
+    |---|---|---|---|---|
+    | cudaMalloc | 5.206 | 3.509 | 2.949 | 70.94 |
+    | cudaMallocManaged | 4.796 | 4.440 | 3.212 | 86.21 |
+
+Two things settled by that one run.
+
+**Managed pages do not keep the mapping.** Every dense timer regresses. Whatever
+`cudaMalloc` gets on this part, the unified allocator does not.
+
+**RSS has been lying.** It went UP 15.3 GB, not down. `cudaMalloc`'d device
+pages on this integrated GPU are physically resident but *not charged to the
+process*; managed pages are. So the duplication was never visible in RSS, the
+98 GB seen at ctx 1963 already excludes 16 GB that is really there, and real
+occupancy is ~114 of 121 GB. That explains the OOM that killed the vectorised
+control dot far better than "a 1.5 GB shift" did -- there was almost nothing
+left. It also means **no memory experiment in rounds 3-4 can be validated by
+watching RSS**, including the expert-cache-vs-mirror trade.
+
+### What that leaves
+
+Freeing the host copy is still the right idea and still worth ~16 GB, but it now
+has to be done by the risky route (real `free()`, plus proving no path can reach
+`w_blob(w)`), and its payoff can only be confirmed by throughput, not by RSS.
+
+### Tooling
+
+`deploy.sh` gated on `make ... | grep -iE " error"`. That missed a CUDA 13
+signature change (`cudaMemAdvise` now takes a `cudaMemLocation`) which compiled
+on the local nvcc and failed on spark1's, and an A/B then ran for minutes
+against a stale binary -- second instance of the failure that script exists to
+prevent. It now checks make's exit status. **The local and cluster toolchains
+differ; spark1's build is the authoritative one.**
