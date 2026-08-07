@@ -2153,7 +2153,21 @@ extern "C" int coli_k3_dense_s(float *y, const float *x, const void *w, const fl
                             cudaMemcpyHostToDevice, g_stream), "prefill x")) return 0;
     if (g_k_pfshape < 0) {
         const char *e = getenv("K3_PF_SHAPE");
-        g_k_pfshape = !e                  ? 2
+        /* DEFAULT IS tree, the bit-exact shape, chosen on quality not speed.
+         * Against the exact path on the rank-symmetric decode gate (26
+         * token-selecting positions):
+         *     tree + NEON   PCC 0.999547   top-1 100.0%   PASS
+         *     warp + NEON   diverged       top-1  38.5%
+         *     tile + NEON   PCC 0.992058   top-1 100.0%   FAIL
+         * Both non-exact shapes miss the >= 0.999 bar -- tile drags the pair to
+         * 0.992, warp flips a token within 24 steps. tree costs 8.2% of prefill
+         * against tile and leaves decode untouched, so 5.2 tok/s short-prompt
+         * and 4.61 at ctx 1963 are unaffected.
+         *
+         * K3_PF_SHAPE=tile restores the faster prefill for anyone who accepts
+         * coherent-but-not-equivalent output. The text is sound either way; it
+         * simply is not within 0.999 of the exact path. */
+        g_k_pfshape = !e                  ? 0
                     : !strcmp(e, "tree")  ? 0
                     : !strcmp(e, "warp")  ? 1 : 2;
     }

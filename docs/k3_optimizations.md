@@ -1219,3 +1219,40 @@ give up is the prefill GEMM, not the KV vectorisation.**
 
 - [ ] `K3_PF_SHAPE=warp` is also non-exact and unmeasured on the clean harness;
       it was +2.4% prefill over tree. Worth a capture before settling on tree.
+
+### warp also fails; tree is now the default
+
+| config | PCC (decode) | top-1 | verdict |
+|---|---|---|---|
+| **tree + NEON** | **0.999560** | 100.0% | **PASS** |
+| warp + NEON | — | 38.5% | diverged within 24 steps |
+| tile + NEON | 0.992240 | 100.0% | FAIL |
+
+Both non-exact prefill shapes miss the bar, and warp diverges exactly as
+tile-alone did (top-1 38.5%, max abs dlogit ~17) — the same near-tie token
+flipping in both.
+
+**`K3_PF_SHAPE` now defaults to `tree`.** You set the bar at PCC 0.999 and the
+shipped default was violating it at 0.992; complying is not a judgement call.
+Verified after the change: decode **5.180 / 5.207 tok/s**, unchanged, because
+the prefill shape does not touch decode. Prefill pays the 8.2%.
+
+`K3_PF_SHAPE=tile` restores it for anyone who accepts coherent-but-not-
+equivalent output.
+
+## Where this leaves the project
+
+**Shipping default: 5.19 tok/s short prompt, 4.61 at ctx 1963, PCC 0.9996 against
+the exact path on token-selecting positions.** The 5 tok/s target is met by the
+decode metric with quality that clears the stated bar.
+
+Two validated wins sit behind opt-in flags for reasons that are deployment
+decisions, not engineering ones:
+
+- `K3_FREE_HOST=1` — 14.47 GB reclaimed, unlocks EGB=110 (+19% at ctx 1963).
+  Opt-in because a host reader missed by the tripwire is a SIGSEGV.
+- `K3_FDOT=1` — +2.5% at ctx 1963, decode PCC 1.000000000. Opt-in because
+  without the reclaim it OOM-kills the ranks at long context.
+
+Together with `K3_EXPERT_GB=110` those give **4.72 tok/s at ctx 1963** at a
+measured quality that clears the bar.
