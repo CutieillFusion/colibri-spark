@@ -2811,6 +2811,20 @@ static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out)
  * Returns the LAST position's logits (falloc'd), or NULL pre-head. ---------- */
 static float *g_x0=NULL; static int g_x0_n=0;  /* K3_X0: injected inputs (validation) */
 static FILE *g_lfp=NULL;                       /* K3_LOGITS: per-position logit dump */
+/* K3_LOGITS_GEN=1 keeps that dump open through GENERATION as well.
+ *
+ * Without it the capture is prefill-only, because the file is closed the moment
+ * the prefill loop ends. Anything gated on C==1 -- kda_control_b1, the whole
+ * decode-side KDA control path -- therefore never executes while logits are
+ * being recorded, and a change confined to it scores a perfect PCC 1.000000000
+ * against a measurement that never ran it. That is not a pass, it is a blind
+ * spot, and it has already blessed one change (the GPU tree-reduction control)
+ * and nearly blessed the vectorised control dot.
+ *
+ * Note this disables lm_head sharding for the run (the shard needs only the
+ * argmax, so it never materialises full logits). That makes the measurement
+ * slower than production but is what lets it see every position. */
+static int g_lgen=0;
 static float *step_chunk(Model *m, const int *ids, int pos0, int C){
     Cfg *c=&m->c; int D=c->hidden;
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
@@ -3491,6 +3505,7 @@ int main(int argc, char **argv){
     fprintf(stderr,"[K3] prompt: %d tokens | ngen %d | temp %.2f\n",np,ngen,temp);
     int max_t=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):np+ngen;
     kv_alloc(&m,max_t);
+    if(getenv("K3_LOGITS_GEN")) g_lgen=atoi(getenv("K3_LOGITS_GEN"));
     if(getenv("K3_LOGITS")){
         g_lfp=fopen(getenv("K3_LOGITS"),"wb");
         if(!g_lfp){ perror(getenv("K3_LOGITS")); return 1; }
@@ -3510,7 +3525,7 @@ int main(int argc, char **argv){
         lo=step_chunk(&m,ids+i,i,Cc);
         fprintf(stderr,"\r[K3] prefill %d/%d (%.1fs)",i+Cc,np,now_s()-t0);
     }
-    if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
+    if(g_lfp && !g_lgen){ fclose(g_lfp); g_lfp=NULL; }   /* decode too when asked */
     fprintf(stderr,"\n[K3] prefill done in %.1fs (%.2f tok/s)\n",now_s()-t0,np/(now_s()-t0));
     if(!m.has_head||!lo){
         fprintf(stderr,"[K3] no head — trace written, stopping after prefill\n");
@@ -3556,6 +3571,7 @@ int main(int argc, char **argv){
     }
     if(lo) free(lo);
     double dt=now_s()-tg;
+    if(g_lfp){ fclose(g_lfp); g_lfp=NULL; }
     fprintf(stderr,"\n[K3] decode %d tokens in %.1fs (%.2f tok/s) | expert hit %.1f%% (%llu/%llu) | %.1f GB streamed\n",
             ntok,dt,ntok/dt,100.0*m.hits/(m.hits+m.miss+1e-9),
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);

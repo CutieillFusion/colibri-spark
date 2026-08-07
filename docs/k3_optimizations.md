@@ -1036,3 +1036,32 @@ logit capture (per-step dump during generation), which does not exist yet.
       decode-only change. The absence of it has now silently blessed one change
       (a GPU tree-reduction control, noted in `cmp_logits.py`) and nearly
       blessed this one.
+
+---
+
+## Round 13: the decode-path gate, half-built
+
+FDOT is worth +2.5% at long context and cannot be shipped because the quality
+harness cannot see it: `K3_LOGITS` closes its dump the moment prefill ends, and
+`kda_control_b1` only runs when `C==1`. A decode-only change scores a perfect
+PCC against a measurement that never executed it.
+
+Added `K3_LOGITS_GEN=1`, which keeps the dump open through generation.
+
+**It does not work as built.** Both capture runs stalled in prefill and hit
+their 1200 s timeout, writing only the first chunk. The reason is in the change
+itself: `K3_LOGITS` disables lm_head sharding (the shard computes only an argmax
+and never materialises logits), so every rank runs the full 1.17 GB head at
+*every* position — 37 GB per 32-token prefill chunk. With `--ngen 0` that was
+tolerable; holding the dump open makes decode pay it too, and the run no longer
+finishes.
+
+The fix is straightforward and not yet made: dump only the **last** position of
+each prefill chunk — which is all the prefill-only mode ever effectively
+captured — plus every decode position. That keeps the head cost at one pass per
+chunk instead of 32, and captures exactly the positions a decode-only change
+needs.
+
+- [ ] **Finish the decode logit capture** (dump last-of-chunk + all decode
+      positions). Until then FDOT's +2.5% stays unshippable, not because it is
+      suspect but because nothing here can measure it.
