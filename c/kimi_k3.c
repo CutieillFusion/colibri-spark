@@ -2882,7 +2882,14 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
         for(int t=0;t<C;t++){
             /* head only where needed: the chunk's last token (feeds sampling)
              * and every position when K3_LOGITS dumps teacher-forced logits */
-            if(!g_lfp && t<C-1) continue;
+            /* K3_LOGITS alone dumps EVERY prefill position, which is what the
+             * teacher-forced study wants. K3_LOGITS_GEN wants DECODE positions,
+             * and paying the unsharded 1.17 GB head at all 32 positions of a
+             * chunk costs 37 GB per chunk -- enough that the run stops
+             * finishing. In that mode keep prefill at last-of-chunk (all the
+             * prefill-only path ever effectively captured) and let decode, where
+             * C==1 so t==C-1 always, dump every step. */
+            if(t<C-1 && !(g_lfp && !g_lgen)) continue;
             res_mix(mix,hidden+(int64_t)t*D,bres+(int64_t)t*nbmax*D,nb,D,m->out_sw,c->eps);
             rmsnorm_(mix,mix,m->final_norm,D,c->eps);
             if(m->trace) fwrite(mix,sizeof(float),D,m->trace);

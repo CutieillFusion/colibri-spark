@@ -1065,3 +1065,32 @@ needs.
 - [ ] **Finish the decode logit capture** (dump last-of-chunk + all decode
       positions). Until then FDOT's +2.5% stays unshippable, not because it is
       suspect but because nothing here can measure it.
+
+### Why the decode capture deadlocks: a rank asymmetry in the harness
+
+Fixing the cost (last-of-chunk during prefill, every decode step) worked — the
+dump dropped from 32 positions per chunk to 1, exactly as intended. The run then
+**deadlocked**: all four ranks stalled at the same prefill chunk.
+
+The cause is not the fix. `run_logits.sh` sets `K3_LOGITS` **only on rank 0**,
+and the lm_head shard predicate keys on it:
+
+    int shard = hw>1 && m->head_greedy && !g_lfp && !m->trace && t==C-1;
+
+So rank 0 (`g_lfp` set) runs the full head and takes **no** argmax allreduce,
+while ranks 1-3 (`g_lfp` null) shard and **do**. That is a rank divergence
+around a collective. With `--ngen 0` the run happened to complete; holding the
+dump open through decode changes how often each side reaches that branch and
+turns it into a hang.
+
+**This casts a caveat on every teacher-forced PCC number in this document.**
+They were measured with rank 0 in a different head configuration from ranks 1-3.
+The results were internally consistent and discriminating — BFDOT failed at
+0.9926, tile/NEON passed at 0.9995 — so the comparisons are probably sound, but
+the configuration is not clean and should not be treated as authoritative until
+the capture sets `K3_LOGITS` on all four ranks (or the shard predicate stops
+keying on it).
+
+- [ ] **Set `K3_LOGITS` on every rank in the capture harness**, or decouple the
+      shard predicate from it. Blocks the decode gate, which blocks FDOT's
+      +2.5%, and retroactively cleans up the PCC record.
