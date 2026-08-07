@@ -24,8 +24,21 @@ HOSTS=(spark1 spark2 spark3 spark4)
 UP=("" 10.10.12.1 192.168.0.159 10.10.34.1)     # per-rank upstream address
 CROSS=("" "" 192.168.0.159 192.168.0.230)        # r2->r0 and r3->r1 Ethernet
 
+# K3_EXPERT_GB=107 is the SHARD ceiling, not a tuning choice: this rank owns
+# 896/4 = 224 experts per layer and 224 x 92 x 4.92 MiB = 106.4 GB, so 107 buys
+# every slot that can ever fill and anything above it is dead descriptors.
+# Measured at ctx 1963: 3.883 tok/s at the old 88 (83% coverage, 99.0% hit) vs
+# 4.4-4.6 at full residency -- the plateau that exists at short prompts is gone
+# at long context, where the FIRST 1% of misses costs ~12%.
+#
+# K3_FREE_HOST=1 is REQUIRED at this budget, not optional. Full residency puts
+# the box at 121 GB used / 0 GB available while RSS reports only 98 -- mirrored
+# pages are physically resident but not charged to the process. Sampling free(1)
+# through a ctx-1963 run: 36 of 44 samples at zero available without the
+# reclaim, 0 of 29 with it. EGB=100 OOM-killed a six-prompt run before this.
+# Set K3_FREE_HOST=0 to opt out; a host reader the tripwire misses is a SIGSEGV.
 COMMON="K3_WORLD=$WORLD K3_GROUP_SIZE=2 K3_MASTER_PORT=$PORT \
-K3_GPUS=0 K3_EXPERT_GPU=1 K3_EXPERT_GB=${K3_EGB:-28} K3_GPU_GB=${K3_GGB:-40} K3_MAXT=512 K3_TP_ATTN=${K3_TP_ATTN:-1} OMP_NUM_THREADS=${K3_OMP_THREADS:-10}"
+K3_GPUS=0 K3_EXPERT_GPU=1 K3_EXPERT_GB=${K3_EGB:-107} K3_FREE_HOST=${K3_FREE_HOST:-1} K3_GPU_GB=${K3_GGB:-40} K3_MAXT=512 K3_TP_ATTN=${K3_TP_ATTN:-1} OMP_NUM_THREADS=${K3_OMP_THREADS:-10}"
 if [ "$WORLD" = 4 ]; then RD2=${K3_NET_RD2:-1}; else RD2=${K3_NET_RD2:-0}; fi
 COMMON="$COMMON K3_NET_RD2=$RD2"
 
@@ -38,7 +51,7 @@ COMMON="$COMMON K3_NET_RD2=$RD2"
 # Each rank writes to its own node-local /tmp, so per-rank paths do not collide.
 for v in K3_ROUTE_STATS K3_BITS K3_MLA_BITS K3_HEAD_BITS K3_THINK K3_TRACE \
          K3_DENSE_GPU K3_DENSE_STAGE K3_DENSE_EXACT K3_KDA_OVERLAP \
-         K3_DENSE_DEV_GB; do
+         K3_DENSE_DEV_GB K3_FDOT K3_KVNEON K3_PF_SHAPE K3_AR_PERSIST; do
   eval "val=\${$v:-}"
   [ -n "$val" ] && COMMON="$COMMON $v=$val"
 done
