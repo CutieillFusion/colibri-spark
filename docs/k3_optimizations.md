@@ -1256,3 +1256,24 @@ decisions, not engineering ones:
 
 Together with `K3_EXPERT_GB=110` those give **4.72 tok/s at ctx 1963** at a
 measured quality that clears the bar.
+
+### Trying to buy the prefill back bit-exactly
+
+Defaulting to `tree` costs 8.2% of prefill. Any reordering flips router
+decisions, so a replacement has to be bit-exact. Two candidates:
+
+- [x] **ushort weight load in the prefill kernel** — the same substitution that
+      helped the decode kernel. **No gain: 7.42 tok/s against 7.57 at np=438**,
+      inside cross-run noise, and verified bit-identical over 26 token-selecting
+      positions. Reverted. The reason it pays in decode and not here is that the
+      decode kernel reads `w` from *global* while the prefill kernel has already
+      staged it into *shared*, where folding two byte loads into one buys
+      nothing. Same edit, opposite value, decided by where the operand lives.
+
+- [ ] **Row-tiled prefill on the `exactR` pattern.** The tile kernel's speed came
+      from x reuse (32x less activation traffic), not from its reordering — the
+      reordering was incidental and is what fails the bar. `k3_dense_i4g_exactR`
+      already shows how to get row reuse bit-exactly: R rows per block, each with
+      its own private 256-lane tree. At R=4 that is 4x less x traffic with the
+      arithmetic untouched. Not implemented; this is the remaining prefill lever
+      and the only one that can be both fast and compliant.

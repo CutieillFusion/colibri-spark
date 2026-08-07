@@ -17,6 +17,7 @@ int  coli_k3_init(int device, int latent, int inter);
 /* Map one expert-slot allocation for zero-copy reads. Call once per slot, with
  * the whole posix_memalign'd region. Returns 0 if the mapping cannot alias the
  * host pointer, in which case the caller must stay on the CPU path. */
+int  coli_k3_set_knob(const char *k, int v);
 int  coli_k3_register(void *p, size_t bytes);
 void coli_k3_unregister(void *p);
 
