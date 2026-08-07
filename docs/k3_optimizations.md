@@ -1184,3 +1184,38 @@ bar asks for.
       measured on token-selecting positions are different requirements. The
       second is the meaningful one and nothing in this project currently clears
       it except bit-exact changes.
+
+### Isolated on the clean harness: NEON passes, tile is what fails
+
+| arm | PCC (all) | PCC (decode) | top-1 | max abs dlogit | |
+|---|---|---|---|---|---|
+| tile prefill only | 0.820075842 | 0.806144972 | **38.5%** | 16.996 | see below |
+| **NEON KV only** | **0.999546682** | **0.999559977** | 100.0% | 0.901 | **PASS** |
+| both (shipping) | 0.992058303 | 0.992240417 | 100.0% | 2.984 | FAIL |
+
+**A limit on the method, first.** The tile-only row is *not* "tile is worse than
+tile+NEON". Its top-1 agreement is 38.5%, meaning the greedy token streams
+diverged, and every position after that divergence compares two different
+continuations. **A decode-logit PCC is only meaningful while top-1 stays 100%.**
+That holds for the NEON-only and combined rows; it does not hold for tile-only,
+whose number should be read as "diverged", not as 0.82.
+
+What survives is still decisive:
+
+- **`K3_KVNEON=1` passes on its own** — 0.999547 on token-selecting positions,
+  top-1 100%, max abs dlogit 0.901. That is the +18% decode / +21% prefill win,
+  and it clears the bar.
+- **`K3_PF_SHAPE=tile` is what breaks it.** Alone it diverges the token stream
+  inside 24 generated tokens; combined it drags the pair to 0.992.
+
+### The configuration that clears the bar
+
+`K3_PF_SHAPE=tree` + `K3_KVNEON=1` measures **0.999547** and keeps the larger
+win. The cost is prefill 8.19 -> 7.57 tok/s (-8.2%); decode is untouched, so the
+headline 5.2 tok/s and the ctx-1963 4.61 both stand.
+
+That is the recommended default if the bar is strict: **the expensive change to
+give up is the prefill GEMM, not the KV vectorisation.**
+
+- [ ] `K3_PF_SHAPE=warp` is also non-exact and unmeasured on the clean harness;
+      it was +2.4% prefill over tree. Worth a capture before settling on tree.
