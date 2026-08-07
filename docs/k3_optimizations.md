@@ -946,3 +946,48 @@ is real for repeated-prompt serving and should not be read as a general +19%.
 It also means **any** numerically-perturbing change is now penalised twice at
 long context: once on its own merits, and again for moving expert selection off
 a perfectly warmed cache. Round 4's FDOT and this both died that way.
+
+---
+
+## Round 11: correcting round 10 — the -18% was my harness
+
+Re-ran BFDOT with each arm **set at process start**, so each warms its own
+expert cache:
+
+| | tok/s | expert hit | load | netmoe | matt |
+|---|---|---|---|---|---|
+| BFDOT=0 | 4.616 | 100.0% | 0.000 | 0.268 | ~3.06 |
+| BFDOT=1 | 4.635, 4.610 | 100.0% | 0.000 | 0.268 | **2.585** |
+
+**e2e +0.15% — a wash, not -18%.** matt really does improve 15.6%, and the MoE
+collapse from round 10 does not happen at all.
+
+Round 10 ran the arms *interleaved*: `cold` and `settle` executed with BFDOT=0,
+warming the cache for that expert selection, and the knob then flipped mid-run.
+The -18% measured a cache warmed for the wrong expert set — my harness, not the
+change.
+
+### The live-knob harness has a domain, and I ignored it
+
+The `ARMS=` mechanism from round 7 is worth 4.8x and it is **only valid for
+bit-exact knobs**. `K3_DENSE_ILP`, `K3_DENSE_RTHRESH` and `K3_AR_PERSIST` change
+no arithmetic, so a cache warmed under one arm is equally warm under the other,
+and interleaving is exactly right. Anything that perturbs numerics moves router
+decisions, and then the shared warm-up belongs to whichever arm ran first.
+
+Rule: **interleave bit-exact knobs; restart per arm for anything that changes
+expert selection.** Round 4's FDOT was measured with restarts, so its verdict is
+unaffected; round 10's BFDOT was not, and is corrected here.
+
+This is the fourth measurement-methodology error in this project, and the second
+in two rounds (microbenchmark built with a different arch, now this). Both had
+the same shape: the measurement apparatus differed from the thing being
+measured.
+
+### Where that leaves BFDOT
+
+A wash. matt -15.6% is real and does not convert, which is consistent with the
+0.48 s saved being inside the noise of a restart-to-restart comparison at this
+scale. Not committed on, not committed off for a bad reason: left off because it
+buys nothing measurable, and it requires a whole-binary `-march=armv9-a+bf16`
+(itself free: 4.616 vs 4.610) to inline at all.
