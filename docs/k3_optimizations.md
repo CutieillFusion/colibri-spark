@@ -1144,3 +1144,43 @@ different head configuration from ranks 1-3. Those comparisons were internally
 consistent and did discriminate correctly, but the capture is only now
 rank-symmetric. Re-running the record on the clean harness is cheap and worth
 doing before any of those numbers is quoted as authoritative.
+
+---
+
+## Round 15: the shipped path does not meet the stated quality bar
+
+Re-ran the shipped configuration against the exact path on the rank-symmetric
+harness, with decode positions included:
+
+| positions | PCC | min/pos | top-1 | max abs dlogit |
+|---|---|---|---|---|
+| prefill chunk-ends | 0.991264992 | 0.981259302 | 100.0% | 2.6664 |
+| decode (24 steps) | 0.992240417 | 0.980158262 | 100.0% | 2.9843 |
+| **all** | **0.992058303** | 0.980158262 | 100.0% | 2.9843 |
+
+**FAIL against the >= 0.999 bar.** The old harness reported 0.999504 for the
+same comparison.
+
+Both numbers are real; they measure different positions. The old set was
+prefill-only and dominated by EARLY positions, where little drift has
+accumulated and the router has had few chances to flip an expert. The new set is
+position 31, position 63 and every decode step — the logits that actually choose
+tokens. `max|dlogit|` of 2.98 is far too large for a reduction reorder and is the
+signature of an expert flip, which is exactly consistent with the free-running
+result already on record: **0/6 byte-identical**.
+
+So the honest position: `K3_PF_SHAPE=tile` (+8.2% prefill) and `K3_KVNEON=1`
+(+18% decode, +21% prefill) are **both shipping by default and together score
+0.992, not the 0.9995 recorded when they were accepted.** Top-1 agreement is
+100% over 24 generated tokens and free-running output is coherent and
+semantically equivalent on all six prompts — but that is a weaker claim than the
+bar asks for.
+
+- [ ] **Re-isolate tile and NEON on the clean harness.** Round 2 isolated them
+      at 0.999902 and 0.999994 on the old instrument; those figures are now
+      suspect for the same reason. If one of the two carries most of the 0.992,
+      the other may be keepable on its own.
+- [ ] **Decide the bar.** 0.999 measured on early prefill positions and 0.999
+      measured on token-selecting positions are different requirements. The
+      second is the meaningful one and nothing in this project currently clears
+      it except bit-exact changes.
