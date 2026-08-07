@@ -991,3 +991,48 @@ A wash. matt -15.6% is real and does not convert, which is consistent with the
 scale. Not committed on, not committed off for a bad reason: left off because it
 buys nothing measurable, and it requires a whole-binary `-march=armv9-a+bf16`
 (itself free: 4.616 vs 4.610) to inline at all.
+
+---
+
+## Round 12: FDOT unblocked by the reclaim; BFDOT fails quality
+
+Round 4 measured the vectorised KDA control dot as a real speedup blocked on
+memory (it OOM-killed the ranks at EGB=88, and trading EGB down for it was
+neutral). The reclaim returned 14.47 GB. Re-tested with memory no longer
+binding, at ctx 1963, **restart per arm** because both knobs perturb numerics:
+
+| config | tok/s | expert hit |
+|---|---|---|
+| baseline | 4.606 | 100.0% |
+| +FDOT | **4.720** (+2.5%) | 100.0% |
+| +FDOT +BFDOT | **4.774** (+3.6%) | 100.0% |
+
+They stack, and the expert-cache penalty seen in round 4 is gone — that penalty
+was memory pressure, not an inherent property. FDOT's per-term effects reproduce
+exactly: ctlwork 2.889 → 2.370 (-18%), kproj 3.586 → 3.112 (-13%).
+
+### Quality: BFDOT fails, FDOT cannot be gated
+
+    FDOT only    e2e PCC 1.000000000   top-1 100.0%   <- VACUOUS, see below
+    FDOT+BFDOT   e2e PCC 0.992643068   top-1  96.9%   FAIL (<0.999)
+
+**BFDOT fails outright** and is dropped. Rounding the absorbed query to bf16
+moves a top-1 token in one of 32 positions.
+
+**FDOT's perfect score is not a pass.** The teacher-forced capture runs
+prefill only (`--ngen 0`), and `kda_control_b1` executes only when `C==1`. The
+change never runs during the measurement — exactly the trap `cmp_logits.py`'s own
+docstring warns about, which I read earlier in this project and walked into
+anyway. Its decode output is coherent across all six prompts and semantically
+equivalent, but **there is no PCC number for it**, because the harness cannot
+produce one for a decode-only change.
+
+So FDOT stays off. Not because it is wrong or slow — +2.5% is real and the
+mechanism is understood — but because the stated bar is PCC >= 0.999 and this
+project has no instrument that can measure it here. Closing that needs a decode
+logit capture (per-step dump during generation), which does not exist yet.
+
+- [ ] **Decode-path logit capture.** Would gate FDOT, and every future
+      decode-only change. The absence of it has now silently blessed one change
+      (a GPU tree-reduction control, noted in `cmp_logits.py`) and nearly
+      blessed this one.
