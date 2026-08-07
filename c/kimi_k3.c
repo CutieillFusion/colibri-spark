@@ -1767,14 +1767,25 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * would silently commit topk*nmoe slots (~26 GB on the 93-layer model)
      * regardless of K3_EXPERT_GB. */
     if(cap<1) cap=1;
-    if(cap>c->n_experts) cap=c->n_experts;
+    /* Clamp to the experts this rank actually OWNS, not to n_experts. Routing
+     * drops everything with e%world!=rank (see moe_forward), so at world=4 only
+     * 896/4 = 224 of the 896 can ever occupy a slot. Clamping to 896 let a
+     * budget above ~106.4 GB allocate slot descriptors that can never fill --
+     * harmless, since expert_read allocates the buffer lazily, but it made the
+     * knob look like it had headroom it does not. The ceiling is the SHARD. */
+    int owned = c->n_experts;
+    { int w = k3_net_world(), r = k3_net_rank();
+      if(w > 1) owned = (c->n_experts + w - 1 - r) / w; }
+    if(cap>owned) cap=owned;
     m->ecache=calloc(c->n_layers,sizeof(LCache));
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse){
         m->ecache[i].cap=cap; m->ecache[i].s=calloc(cap,sizeof(Slot));
         for(int j2=0;j2<cap;j2++) m->ecache[i].s[j2].eid=-1;
     }
-    fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
-            now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
+    fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/%d owned per layer "
+            "(%.1f MB/slot, %.1f GB full) | RSS %.1f GB\n",
+            now_s()-t0,c->n_layers,cap,owned,m->e_slot/1e6,
+            (double)cap*nmoe*m->e_slot/1e9,rss_gb());
     #undef NM
 }
 
