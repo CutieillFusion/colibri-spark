@@ -767,3 +767,61 @@ mean anything.
       lane L reads at stride 64 floats so all lanes hit one bank, and fixing it
       needs `K3_W1_SHSTRIDE`-style padding plus a new store loop — not something
       to land blind on a path that cannot be measured.
+
+---
+
+## Round 8: long context is one term, and that term is at the memory roofline
+
+Profiling the best long-context config (EGB=110 + reclaim, 4.60 tok/s at
+ctx 1963) against the 38-token profile, s/100 decode tokens:
+
+| term | 38 tok | 1963 tok | delta |
+|---|---|---|---|
+| **matt** | 0.735 | **2.935** | **+2.20** |
+| arwork | 2.733 | 3.012 | +0.28 |
+| khead | 0.959 | 1.086 | +0.13 |
+| shared | 3.525 | 3.543 | +0.02 |
+| kproj | 3.179 | 3.173 | -0.01 |
+| ctlwork | 2.716 | 2.674 | -0.04 |
+
+Total decode goes 19.2 -> 21.7 s and **matt accounts for 2.20 of the 2.5**.
+Long context is one term. Everything else is flat over a 52x context increase.
+
+### It is not thread-starved
+
+matt does 119 GMAC per 100 tokens and takes 2.935 s = **40 GMAC/s**, against
+19.86 GMAC/s measured on one X925 core -- apparently 4x of headroom at 8
+threads. Testing that directly, at ctx 1963:
+
+    OMPT=8    4.602  4.589    mean 4.596
+    OMPT=16   4.270  4.311    mean 4.291    -6.6%
+
+More threads is *worse*. The box is 10x Cortex-X925 at 3.9 GHz plus 10x A725 at
+2.808 GHz, so past ~10 threads `schedule(static)` starts handing equal shares to
+cores that are 1.39x slower, and every parallel region waits on the straggler.
+
+### It is at the memory roofline, jointly with the GPU
+
+    matt L traffic   40 GMAC/s x 2 B (bf16)   =  80 GB/s
+    dense GPU path   measured on kproj        = 112 GB/s
+                                                -------
+                                                192 GB/s   of 235 achievable, 82%
+
+That closes the loop on three rounds of evidence. The GPU dense path runs at 112
+of 234.5 GB/s not because of the kernel but because the CPU is on the same
+LPDDR5X; the CPU's biggest consumer is matt; and matt in turn cannot go faster
+because the pair is near the pool's limit. This is also why FDOT's CPU-side win
+showed up as `kproj` falling 12% -- the bandwidth it stopped using went straight
+to the GPU.
+
+### What that leaves
+
+Only **moving fewer bytes** helps now, and matt's bytes are the KV cache.
+`kvq` is bf16; the loader comment already notes the latents are post-rmsnorm
+(`kva_ln`) so their range is normalised for fp8. Halving that 80 GB/s would free
+~40 GB/s for the GPU as well as speeding matt directly -- the only remaining
+change with two-sided payoff.
+
+- [ ] **fp8 KV cache.** Not bit-exact; needs the PCC >= 0.999 gate. Note the
+      existing `kv_enc` already handles Inf/NaN explicitly and rounds to
+      nearest-even, so an fp8 variant must do the same rather than truncate.
