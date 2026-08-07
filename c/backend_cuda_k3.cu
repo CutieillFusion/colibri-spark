@@ -232,7 +232,20 @@ __device__ __forceinline__ float warp_row_dot_w2(const unsigned char *__restrict
     float acc = 0.f;
     /* 16 bytes = TWO groups per load. ng is even for both K3 shapes (112 and
      * 96) and pk is 16-byte aligned, so lane L can take groups 2L, 2L+1 and
-     * halve the load instructions. */
+     * halve the load instructions.
+     *
+     * UNVALIDATED ON THIS DEPLOYMENT. The float4 activation load below is
+     * bit-exact and mechanical, but this whole kernel is dormant here: the
+     * cluster runs the 1-bit store (K3-w1, --bits 1), so k3_w2_* never
+     * executes and no A/B can price it. Committed as an instruction-count
+     * reduction on reasoning alone, which is weaker than everything else in
+     * this file.
+     *
+     * What is NOT addressed: lane L reads xs at stride 64 floats, so every lane
+     * hits the same shared bank -- a 32-way conflict that the float4 load makes
+     * wider while making it 4x rarer. The 1-bit kernel solves this with
+     * K3_W1_SHSTRIDE padding; doing the same here means changing the shared
+     * layout and its store loop, which is not something to land blind. */
     for (int g = lane * 2; g < ng; g += 64) {
         uint4 v = *(const uint4 *)(pk + (g << 3));
         const unsigned int w[4] = { v.x, v.y, v.z, v.w };
@@ -247,11 +260,19 @@ __device__ __forceinline__ float warp_row_dot_w2(const unsigned char *__restrict
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
                     unsigned int c = (u >> (8 * k)) & 0xFFu;
-                    const float *xb = xs + q * 16 + k * 4;
-                    p += xb[0] * w2_val( c        & 3u)
-                       + xb[1] * w2_val((c >> 2)  & 3u)
-                       + xb[2] * w2_val((c >> 4)  & 3u)
-                       + xb[3] * w2_val((c >> 6)  & 3u);
+                    /* One byte codes four consecutive activations, so the four
+                     * scalar reads were always one float4. xs is x + ((g+h)<<5),
+                     * i.e. 128-byte aligned, and q*16 + k*4 is a multiple of
+                     * four floats, so the address is 16-byte aligned. Same
+                     * values, same order, same adds -- bit-exact, one load
+                     * instruction instead of four. This is what the 1-bit
+                     * kernel already does (warp_row_dot_w1 pulls eight float4
+                     * per group). */
+                    float4 xb = *(const float4 *)(xs + q * 16 + k * 4);
+                    p += xb.x * w2_val( c        & 3u)
+                       + xb.y * w2_val((c >> 2)  & 3u)
+                       + xb.z * w2_val((c >> 4)  & 3u)
+                       + xb.w * w2_val((c >> 6)  & 3u);
                 }
             }
             acc += p * mx4_scale_dev(sc[g + h]);

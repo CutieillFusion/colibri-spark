@@ -721,3 +721,49 @@ and costs nothing, not because it is faster.
 That is the real argument for this change: two rounds ago the FDOT A/B flipped
 sign between orderings and cost two extra full A/Bs to diagnose. Interleaved
 passes would have shown it immediately.
+
+### Re-measuring earlier claims with interleaved passes
+
+The new harness exists to catch what single-pass-per-restart comparisons miss.
+Run against the claims closest to the noise floor:
+
+| claim | as committed | interleaved, 4+ passes/arm | verdict |
+|---|---|---|---|
+| `K3_DENSE_ILP` | +1.0% | **+0.04%** | neutral |
+| `K3_AR_PERSIST` | +1.4% | **+0.56%** | real, a third the size |
+| `K3_DENSE_RTHRESH` 4096 vs 0 | (untested since old code) | **+0.13%** | wash |
+
+Two of three inflated. Both original numbers came from one measurement per
+restart with a within-arm spread of ~0.5%, so they were reading drift as signal.
+`AR_PERSIST` survives -- 3 of 4 of its passes beat every control pass -- but at
+0.56%, not 1.4%. The mechanism behind it (arwork fell 3.248 -> 2.733 because a
+per-call thread delayed the collective's *start*) was measured directly and is
+not in doubt; only the end-to-end magnitude was overstated.
+
+RTHRESH being a wash also retires the multi-row short-row kernel as a tuning
+knob: 0, 4096 and 65536 are indistinguishable.
+
+**Absolute numbers still drift between runs** (5.08-5.18 in one sweep, 5.25-5.29
+in the next, same binary and config). Only interleaved within-run comparisons
+mean anything.
+
+## The stated open list, finally closed
+
+- [x] **lm_head sharded + argmax allreduce** — was already implemented
+      (`kimi_k3.c:2499`) before this list was written.
+- [x] **4-wide consecutive fold** — already implemented and the default
+      (`K3_DENSE_I4W=4`); W=8 measured slower.
+- [x] **`K3_DENSE_DEV_GB` vs the 64 MB cap** — neither binds. The cap became
+      2 GB when the 4-wide fold made mirroring pay for lm_head. The real finding
+      was that the harness was passing `DEVGB=0`, disabling mirroring entirely
+      and costing 9.6%.
+- [x] **float4 shared loads for the w2 expert kernel** — implemented, and
+      **unvalidated by construction**: this cluster runs the 1-bit store, so
+      `k3_w2_*` never executes and no A/B can price it. The change is bit-exact
+      (one byte codes four consecutive activations, so the four scalar reads
+      were always one float4; `xs` is 128-byte aligned). Verified only that it
+      compiles under CUDA 13 and leaves the live 1-bit path byte-identical, 6/6.
+      The bank-conflict half of the problem is deliberately **not** addressed:
+      lane L reads at stride 64 floats so all lanes hit one bank, and fixing it
+      needs `K3_W1_SHSTRIDE`-style padding plus a new store loop — not something
+      to land blind on a path that cannot be measured.
