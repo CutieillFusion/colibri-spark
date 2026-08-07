@@ -825,3 +825,43 @@ change with two-sided payoff.
 - [ ] **fp8 KV cache.** Not bit-exact; needs the PCC >= 0.999 gate. Note the
       existing `kv_enc` already handles Inf/NaN explicitly and rounds to
       nearest-even, so an fp8 variant must do the same rather than truncate.
+
+---
+
+## Round 9: the KV width is already optimal, and bf16 is why
+
+Round 8 named fp8/int8 KV as "the only remaining change with two-sided payoff":
+matt is bandwidth-bound on the latent cache, so halving its bytes should speed
+matt *and* hand bandwidth back to the GPU. The extrapolation put it at
+4.94-5.01 tok/s at ctx 1963, i.e. exactly on target.
+
+It is wrong, and the reason is instruction count rather than bytes.
+
+| cache | bytes/el | matt (s/100 tok) | decode cost |
+|---|---|---|---|
+| int8 + per-token scale | 1 | **4.157** | `vmovl_s8` → `vmovl_s16` → `vcvtq_f32_s32` = 3 instr / 4 elems |
+| **bf16 (shipped)** | 2 | **2.935** | `vshll_n_u16(v,16)` + free reinterpret = **1 instr / 4 elems** |
+| fp32 (probe) | 4 | **7.272** | direct load = 0 instr, but 2x the bytes |
+
+int8 halves the bytes and is 42% SLOWER. fp32 removes the decode entirely and is
+148% slower. **bf16 sits at the minimum of both curves** — it is the only width
+here whose decode is a single instruction, because bf16→f32 is exactly a shift.
+
+That also kills fp8 without needing to build it: an E4M3 bit layout costs ~10
+NEON ops per four elements (mask, shift, bias the exponent, re-assemble, then
+patch zero/NaN), an order more than bf16 and worse than the int8 that already
+lost.
+
+So matt is not purely bandwidth-bound as round 8 concluded from the fp32 probe
+alone. It sits where bytes and decode ops both bind, and the current format is
+at that optimum. The probe was real — doubling bytes did cost 2.48x — but one
+point in one direction does not locate a minimum, and int8 was the control that
+should have been run before drawing the conclusion.
+
+**The KV-width avenue is closed.** Long context stays at 4.60 tok/s, matt stays
+the single term that grows with context, and nothing in the cache format is left
+to give.
+
+The int8 path is kept behind `-DK3_KV_INT8` (with the per-token scale, the
+`ldot_`/`laxpy_` helpers and the head-batched path all converted) so the
+measurement can be repeated rather than re-derived.

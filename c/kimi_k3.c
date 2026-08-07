@@ -182,6 +182,66 @@ static inline void kvaxpy_(float *acc, const kvq *L, float s, int n){
 }
 #endif
 
+/* ---------- int8 latent cache ---------------------------------------------
+ * matt is bandwidth-bound on the KV cache, measured rather than assumed: the
+ * K3_KV_FP32 probe doubled the element width and matt went 2.935 -> 7.272
+ * s/100 tokens at ctx 1963, a 2.48x cost for 2x the bytes, while kproj did not
+ * move. Super-linear, so a cache-residency cliff sits between the 2.06 MB/layer
+ * that bf16 needs and the 4.1 MB that fp32 needs.
+ *
+ * Halving again puts L at 1.03 MB/layer. int8 with a per-token scale is the
+ * right shape for it: the latents are post-rmsnorm (kva_ln) so a row's dynamic
+ * range is already normalised, the scale folds outside both inner loops (score
+ * multiplies it once per t, context folds it into sc[t]), and the decode is a
+ * widen-and-convert -- the same NEON shape quant.h already uses for int8
+ * weights -- rather than the ~10 ops per four elements an fp8 bit-layout would
+ * cost. fp8 would have halved the bytes and lost the compute headroom doing it.
+ *
+ * R (qk_rope, 64 of 576 elements) stays bf16: it is 11% of the bytes and its
+ * NoPE values are cached raw, without the rmsnorm that makes L well-scaled.
+ *
+ * Build with -DK3_KV_INT8. Not bit-exact -- gets the PCC gate. */
+#ifdef K3_KV_INT8
+typedef int8_t lq;
+#define LSC(m,li,t) ((m)->Lsc[li][t])
+#if defined(__ARM_NEON)
+static inline float ldot_(const float *q, const lq *L, int n){
+    float32x4_t a0=vdupq_n_f32(0), a1=vdupq_n_f32(0);
+    int i=0;
+    for(;i+7<n;i+=8){
+        int16x8_t w=vmovl_s8(vld1_s8(L+i));
+        a0=vfmaq_f32(a0, vld1q_f32(q+i),   vcvtq_f32_s32(vmovl_s16(vget_low_s16(w))));
+        a1=vfmaq_f32(a1, vld1q_f32(q+i+4), vcvtq_f32_s32(vmovl_s16(vget_high_s16(w))));
+    }
+    float v=vaddvq_f32(a0)+vaddvq_f32(a1);
+    for(;i<n;i++) v+=q[i]*(float)L[i];
+    return v;
+}
+static inline void laxpy_(float *acc, const lq *L, float s, int n){
+    float32x4_t sv=vdupq_n_f32(s);
+    int i=0;
+    for(;i+7<n;i+=8){
+        int16x8_t w=vmovl_s8(vld1_s8(L+i));
+        vst1q_f32(acc+i,   vfmaq_f32(vld1q_f32(acc+i),   sv,
+                  vcvtq_f32_s32(vmovl_s16(vget_low_s16(w)))));
+        vst1q_f32(acc+i+4, vfmaq_f32(vld1q_f32(acc+i+4), sv,
+                  vcvtq_f32_s32(vmovl_s16(vget_high_s16(w)))));
+    }
+    for(;i<n;i++) acc[i]+=s*(float)L[i];
+}
+#else
+static inline float ldot_(const float *q, const lq *L, int n){
+    float v=0; for(int i=0;i<n;i++) v+=q[i]*(float)L[i]; return v; }
+static inline void laxpy_(float *acc, const lq *L, float s, int n){
+    for(int i=0;i<n;i++) acc[i]+=s*(float)L[i]; }
+#endif
+#else
+typedef kvq lq;
+#define LSC(m,li,t) 1.0f
+#define ldot_  kvdot_
+#define laxpy_ kvaxpy_
+#endif
+
 /* Plain fp32 dot. The KDA control path stores fa/fb/bp unquantised and reduces
  * them with `for(i) v+=x[i]*w[i]`, which gcc cannot vectorise: FP addition is
  * not associative and this build does not pass -ffast-math. Measured on one
@@ -343,7 +403,10 @@ typedef struct {
     float **cwq, **cwk, **cwv;    /* conv windows [proj*conv_k], oldest first */
     int8_t cwh[128];              /* rotating write head into those windows */
     /* MLA cache */
-    kvq **Lc, **Rc; int max_t;
+    lq **Lc; kvq **Rc; int max_t;
+#ifdef K3_KV_INT8
+    float **Lsc;               /* per-token scale for the int8 latent rows */
+#endif
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
@@ -1951,11 +2014,19 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
     for(int t=0;t<C;t++){                            /* append the whole chunk to the
                                                       * cache first: token t's scores
                                                       * only read rows 0..pos0+t */
-        kvq *Lrow=m->Lc[li]+(int64_t)(pos0+t)*kvl, *Rrow=m->Rc[li]+(int64_t)(pos0+t)*qr;
+        lq *Lrow=m->Lc[li]+(int64_t)(pos0+t)*kvl; kvq *Rrow=m->Rc[li]+(int64_t)(pos0+t)*qr;
         const float *cv=ckv+(int64_t)t*(kvl+qr);
         float lt[4096];                              /* kvl <= 4096, enforced at cfg load */
         rmsnorm_(lt,cv,a->kva_ln,kvl,c->eps);
+#ifdef K3_KV_INT8
+        { float mx=0; for(int i=0;i<kvl;i++){ float v=fabsf(lt[i]); if(v>mx) mx=v; }
+          float sc_=mx>0.f?mx/127.f:1.f, inv=mx>0.f?127.f/mx:0.f;
+          m->Lsc[li][pos0+t]=sc_;
+          for(int i=0;i<kvl;i++){ int r=(int)lrintf(lt[i]*inv);
+                                  Lrow[i]=(int8_t)(r>127?127:r<-127?-127:r); } }
+#else
         for(int i=0;i<kvl;i++) Lrow[i]=kv_enc(lt[i]);
+#endif
         for(int i=0;i<qr;i++)  Rrow[i]=kv_enc(cv[kvl+i]);  /* NoPE: cached raw, no rotation */
     }
     m->t_mcache+=now_s()-mt0; mt0=now_s();
@@ -2026,10 +2097,12 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
             }
             #pragma omp parallel for schedule(static)
             for(int t=0;t<nt;t++){
-                const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
+                const lq  *Lt=m->Lc[li]+(int64_t)t*kvl;
+                const kvq *Rt=m->Rc[li]+(int64_t)t*qr;
+                float lsc=LSC(m,li,t);
                 for(int hh=0;hh<Hl;hh++){
                     const float *qrp=qvt+(int64_t)(mh0+hh)*qh+c->qk_nope;
-                    scm[(int64_t)hh*nt+t]=(kvdot_(qab+(int64_t)hh*kvl,Lt,kvl)
+                    scm[(int64_t)hh*nt+t]=(ldot_(qab+(int64_t)hh*kvl,Lt,kvl)*lsc
                                           +kvdot_(qrp,Rt,qr))*c->attn_scale;
                 }
             }
@@ -2042,9 +2115,10 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
                 int per=(((kvl+nth-1)/nth)+7)&~7;      /* keep slices 8-aligned */
                 int i0=tid*per, i1=i0+per>kvl?kvl:i0+per;
                 if(i0<kvl) for(int t=0;t<nt;t++){
-                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl;
+                    const lq *Lt=m->Lc[li]+(int64_t)t*kvl;
+                    float lsc=LSC(m,li,t);
                     for(int hh=0;hh<Hl;hh++)
-                        kvaxpy_(cla+(int64_t)hh*kvl+i0,Lt+i0,scm[(int64_t)hh*nt+t],i1-i0);
+                        laxpy_(cla+(int64_t)hh*kvl+i0,Lt+i0,scm[(int64_t)hh*nt+t]*lsc,i1-i0);
                 }
             }
             #pragma omp parallel for schedule(static)
@@ -2073,13 +2147,15 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
              * arm measures what it measured before this change. */
             if(g_kvneon){
                 for(int t=0;t<nt;t++){
-                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
-                    sc[t]=(kvdot_(qabs,Lt,kvl)+kvdot_(qrp,Rt,qr))*c->attn_scale;
+                    const lq *Lt=m->Lc[li]+(int64_t)t*kvl;
+                    const kvq *Rt=m->Rc[li]+(int64_t)t*qr;
+                    sc[t]=(ldot_(qabs,Lt,kvl)*LSC(m,li,t)+kvdot_(qrp,Rt,qr))*c->attn_scale;
                 }
             } else {
                 for(int t=0;t<nt;t++){
-                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl, *Rt=m->Rc[li]+(int64_t)t*qr;
-                    float s2=0; for(int i=0;i<kvl;i++) s2+=qabs[i]*kv_dec(Lt[i]);
+                    const lq *Lt=m->Lc[li]+(int64_t)t*kvl;
+                    const kvq *Rt=m->Rc[li]+(int64_t)t*qr;
+                    float s2=ldot_(qabs,Lt,kvl)*LSC(m,li,t);
                     for(int i=0;i<qr;i++) s2+=qrp[i]*kv_dec(Rt[i]);
                     sc[t]=s2*c->attn_scale;
                 }
@@ -2087,11 +2163,12 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
             softmax_(sc,nt);
             float clat[4096]; memset(clat,0,kvl*sizeof(float));
             if(g_kvneon){
-                for(int t=0;t<nt;t++) kvaxpy_(clat,m->Lc[li]+(int64_t)t*kvl,sc[t],kvl);
+                for(int t=0;t<nt;t++)
+                    laxpy_(clat,m->Lc[li]+(int64_t)t*kvl,sc[t]*LSC(m,li,t),kvl);
             } else {
                 for(int t=0;t<nt;t++){
-                    const kvq *Lt=m->Lc[li]+(int64_t)t*kvl; float s2=sc[t];
-                    for(int i=0;i<kvl;i++) clat[i]+=s2*kv_dec(Lt[i]);
+                    const lq *Lt=m->Lc[li]+(int64_t)t*kvl;
+                    laxpy_(clat,Lt,sc[t]*LSC(m,li,t),kvl);
                 }
             }
             if(nt>512) free(sc);
@@ -2796,18 +2873,25 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
 
 static void kv_alloc(Model *m, int max_t){
     Cfg *c=&m->c; m->max_t=max_t;
-    m->Lc=calloc(c->n_layers,sizeof(kvq*));
+    m->Lc=calloc(c->n_layers,sizeof(lq*));
     m->Rc=calloc(c->n_layers,sizeof(kvq*));
+#ifdef K3_KV_INT8
+    m->Lsc=calloc(c->n_layers,sizeof(float*));
+#endif
     int nc=0;
     for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda){
-        m->Lc[i]=malloc((size_t)max_t*c->kv_lora*sizeof(kvq));
+        m->Lc[i]=malloc((size_t)max_t*c->kv_lora*sizeof(lq));
         m->Rc[i]=malloc((size_t)max_t*c->qk_rope*sizeof(kvq));
         if(!m->Lc[i]||!m->Rc[i]){ fprintf(stderr,"OOM kv cache\n"); exit(1); }
+#ifdef K3_KV_INT8
+        m->Lsc[i]=malloc((size_t)max_t*sizeof(float));
+        if(!m->Lsc[i]){ fprintf(stderr,"OOM kv scale\n"); exit(1); }
+#endif
         nc++;
     }
     fprintf(stderr,"[K3] kv cache %d/%d layers x %d tok x %d el x %zub = %.2f GB\n",
-            nc,c->n_layers,max_t,c->kv_lora+c->qk_rope,sizeof(kvq),
-            (double)nc*max_t*(c->kv_lora+c->qk_rope)*sizeof(kvq)/1073741824.0);
+            nc,c->n_layers,max_t,c->kv_lora+c->qk_rope,sizeof(lq),
+            (double)nc*max_t*((double)c->kv_lora*sizeof(lq)+(double)c->qk_rope*sizeof(kvq))/1073741824.0);
 }
 
 typedef struct { float p; int id; } SampleProb;
@@ -3000,10 +3084,18 @@ static int serve_read_req(ServeReq *q, const char *active){
         if(sscanf(line,"%*s %*s %63s",val)!=1){ printf("ERROR SET needs a value\n"); fflush(stdout); return 0; }
         setenv(id,val,1);
         int live = 1;
-        if(!strcmp(id,"K3_KVNEON"))      g_kvneon=atoi(val);
+        if(!strcmp(id,"K3_KVNEON"))          g_kvneon=atoi(val);
         else if(!strcmp(id,"K3_MATT_BATCH")) g_mattb=atoi(val);
+        else if(!strcmp(id,"K3_FDOT"))       g_fdot=atoi(val);
         else if(!strcmp(id,"K3_CHUNK")||!strcmp(id,"K3_MAXT")) ;      /* re-read per request */
+#ifdef COLI_CUDA
+        else if(!strcmp(id,"K3_AR_PERSIST")) g_ar_persist=atoi(val);
+        else if(!strcmp(id,"K3_PF_SHAPE"))
+            live = coli_k3_set_knob(id, !strcmp(val,"tree")?0:!strcmp(val,"warp")?1:2);
+        else live = coli_k3_set_knob(id, atoi(val));   /* backend knobs, 0 if unknown */
+#else
         else live = 0;
+#endif
         printf("SETOK %s=%s live=%d\n",id,val,live); fflush(stdout);
         return 0;
     }
