@@ -1094,3 +1094,53 @@ keying on it).
 - [ ] **Set `K3_LOGITS` on every rank in the capture harness**, or decouple the
       shard predicate from it. Blocks the decode gate, which blocks FDOT's
       +2.5%, and retroactively cleans up the PCC record.
+
+---
+
+## Round 14: the decode gate works, and FDOT passes it
+
+Fixing the asymmetry was one line: set `K3_LOGITS` on **all four ranks** in the
+capture harness, so every rank takes the same branch of the lm_head shard
+predicate. The deadlock is gone and the capture produces exactly what was
+designed — 26 positions for a 64-token prompt with `NGEN=24`: two prefill
+chunk-ends plus every decode step.
+
+### FDOT, gated on the path it actually runs on
+
+| positions | PCC | min/pos | top-1 | max abs dlogit |
+|---|---|---|---|---|
+| prefill only | 1.000000000 | 1.000000000 | 100.0% | **0.0000** |
+| **decode only** | 1.000000000 | 0.999999999 | 100.0% | **0.0011** |
+
+**PASS.** The prefill row is the proof the instrument works: FDOT changes
+*nothing* there (it is gated on `C==1`) and 0.0011 in decode. The old
+prefill-only harness saw the first row and reported a perfect score for a change
+it never executed.
+
+Free-running output is coherent across all six prompts. Short prompt holds at
+5.203 tok/s against a 5.17-5.27 baseline band — no regression.
+
+    ctx 1963   4.606 -> 4.720   +2.5%   expert hit 100.0% both arms
+    ctlwork    2.889 -> 2.370   -18%
+    kproj      3.586 -> 3.112   -13%
+
+### Still default-off, and why
+
+FDOT is now validated on speed *and* quality. It stays off because it needs
+memory headroom that is itself opt-in: at EGB=88 **without** the reclaim it
+OOM-killed all four ranks at ctx 1963. The validated recipe is
+`K3_FREE_HOST=1` + `K3_EXPERT_GB<=110` + `K3_FDOT=1`. Turning it on by default
+would make long-context serving crash-prone for anyone not also running the
+reclaim, and the reclaim has its own opt-in reason (a missed host reader is a
+SIGSEGV rather than silent garbage).
+
+That is a deployment decision rather than an engineering one, and it is the
+user's to make.
+
+### What the fix retroactively cleans up
+
+Every teacher-forced PCC in this document was measured with rank 0 in a
+different head configuration from ranks 1-3. Those comparisons were internally
+consistent and did discriminate correctly, but the capture is only now
+rank-symmetric. Re-running the record on the clean harness is cheap and worth
+doing before any of those numbers is quoted as authoritative.
