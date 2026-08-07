@@ -907,3 +907,42 @@ the thing it predicts.
 Left off (`K3_BFDOT=1`), gated on `HWCAP2_BF16` at startup because the target
 attribute emits BFDOT regardless of the base arch and a host without it would
 SIGILL rather than fall back.
+
+### Global `-march=armv9-a+bf16`: the arch change is free, BFDOT still loses
+
+Tested it. The build accepts it on spark1 (not on the local host — spark1's
+toolchain is authoritative), the deployed binary contains BFDOT, and it inlines.
+
+**The arch change costs nothing.** BFDOT=0 on the armv9 build measures 4.616
+tok/s against 4.610 on the `-march=native` build — so dropping native tuning and
+`+i8mm` is not the concern I flagged.
+
+**BFDOT itself now speeds up what it touches** — matt 2.967 → 2.576, −13% —
+and still loses 18% end to end. The profile says why:
+
+| term | BFDOT=0 | BFDOT=1 | delta |
+|---|---|---|---|
+| **matt** | 2.967 | 2.576 | **−0.391** |
+| arwork | 2.760 | 6.030 | +3.270 |
+| netmoe | 0.270 | 3.535 | +3.265 |
+| expert | 1.339 | 2.462 | +1.123 |
+| load | 0.000 | 1.085 | +1.085 |
+
+Expert hit rate goes 100.0% → 99.8%. Rounding the absorbed query to bf16 changes
+attention scores, which changes the residual stream, which changes **which
+experts the router picks** — the identical mechanism that blocked the vectorised
+control dot in round 4. A different expert set misses a cache tuned to the old
+one, streaming appears, and ranks then arrive at the collective at different
+times, which is the +3.3 s in `arwork`/`netmoe`.
+
+### A caveat this exposes on the EGB=110 result
+
+The +19% from EGB=110 depends on a **100.0%** expert hit rate, and the cliff off
+it is steep: a 0.2 percentage-point drop cost 1.085 s of streaming and 3.3 s of
+collective skew. The harness runs the same prompt for cold, settle and every
+measured pass, which is the most cache-favourable schedule possible. That number
+is real for repeated-prompt serving and should not be read as a general +19%.
+
+It also means **any** numerically-perturbing change is now penalised twice at
+long context: once on its own merits, and again for moving expert selection off
+a perfectly warmed cache. Round 4's FDOT and this both died that way.
