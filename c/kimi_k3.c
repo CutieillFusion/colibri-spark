@@ -69,6 +69,7 @@
 #endif
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/auxv.h>
 #include <stdatomic.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -146,6 +147,7 @@ static inline float kv_dec(kvq h)  { union{uint32_t u;float f;}b; b.u=(uint32_t)
  * and it gets the PCC gate. kvaxpy_ is elementwise: each acc[i] sees the same
  * adds in the same order, so that one IS bit-exact. */
 static int g_kvneon = 1;                      /* K3_KVNEON=0 restores the scalar loops */
+static int g_bfdot  = 0;    /* K3_BFDOT=1; requires HWCAP2_BF16, checked at startup */
 static int g_fdot   = 0;                      /* K3_FDOT=1: faster, but see the note below */
 static int g_mattb  = 0;                      /* head-batched MLA: correct but slower, see below */
 #if defined(__ARM_NEON) && !defined(K3_KV_FP32)
@@ -179,6 +181,48 @@ static inline float kvdot_(const float *q, const kvq *L, int n){
 }
 static inline void kvaxpy_(float *acc, const kvq *L, float s, int n){
     for(int i=0;i<n;i++) acc[i]+=s*kv_dec(L[i]);
+}
+#endif
+
+/* ---------- BFDOT score path ----------------------------------------------
+ * The widen+fma helper above already costs only one instruction per four
+ * elements, which is why bf16 beat both int8 and fp32 on the width sweep. BFDOT
+ * removes even that: it consumes bf16 operands straight into f32 accumulators,
+ * eight elements per instruction with no widening at all. One X925 core,
+ * nt=2013, kvl=512, 24 heads:
+ *     widen+fma   1.27 ms/pass   19.51 GMAC/s
+ *     BFDOT       0.66 ms/pass   37.23 GMAC/s   1.9x
+ *
+ * It applies to the SCORE loop only. Both operands must be bf16, so the
+ * absorbed query is rounded once per head (512 elements, against nt*512 MACs --
+ * negligible) and that rounding is the quality cost: score PCC 0.999998949
+ * against the shipped path. The CONTEXT loop is an axpy against an f32 softmax
+ * weight, where BFMLALB would interleave its even/odd results and need
+ * de-interleaving to land in clat -- not obviously a win, left alone.
+ *
+ * -mcpu=native does NOT imply +bf16 on gcc 13 even though /proc/cpuinfo lists
+ * it, so vbfdotq_f32 fails to inline with "target specific option mismatch".
+ * A function-level target attribute enables it for this one function and leaves
+ * -mcpu=native tuning (and colibri.c's i8mm SMMLA kernels) untouched. That also
+ * means no inlining, so this is a real call -- fine against a 512-element loop.
+ *
+ * Gated on HWCAP2_BF16 at startup: the attribute makes the compiler emit BFDOT
+ * regardless of the base arch, so a host without it would SIGILL. */
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(K3_KV_FP32)
+#define K3_HAVE_BFDOT 1
+__attribute__((target("+bf16")))
+static float bfdot_(const kvq *qb, const kvq *L, int n){
+    float32x4_t a0=vdupq_n_f32(0), a1=vdupq_n_f32(0);
+    int i=0;
+    for(;i+15<n;i+=16){
+        a0=vbfdotq_f32(a0, vreinterpretq_bf16_u16(vld1q_u16(qb+i)),
+                           vreinterpretq_bf16_u16(vld1q_u16(L+i)));
+        a1=vbfdotq_f32(a1, vreinterpretq_bf16_u16(vld1q_u16(qb+i+8)),
+                           vreinterpretq_bf16_u16(vld1q_u16(L+i+8)));
+    }
+    float s=vaddvq_f32(a0)+vaddvq_f32(a1);
+    for(;i<n;i++) s+=kv_dec(qb[i])*kv_dec(L[i]);
+    return s;
 }
 #endif
 
@@ -2145,6 +2189,17 @@ static void mla_forward(Model *m, Layer *l, int li, const float *x, int pos0, in
             float scbuf[512]; float *sc = (nt<=512) ? scbuf : falloc(nt);
             /* Branch once per head, never inside the reduction, so the scalar
              * arm measures what it measured before this change. */
+#ifdef K3_HAVE_BFDOT
+            if(g_bfdot){
+                kvq qb[4096];
+                for(int i=0;i<kvl;i++) qb[i]=kv_enc(qabs[i]);   /* once per head */
+                for(int t=0;t<nt;t++){
+                    const lq *Lt=m->Lc[li]+(int64_t)t*kvl;
+                    const kvq *Rt=m->Rc[li]+(int64_t)t*qr;
+                    sc[t]=(bfdot_(qb,Lt,kvl)*LSC(m,li,t)+kvdot_(qrp,Rt,qr))*c->attn_scale;
+                }
+            } else
+#endif
             if(g_kvneon){
                 for(int t=0;t<nt;t++){
                     const lq *Lt=m->Lc[li]+(int64_t)t*kvl;
@@ -3087,6 +3142,9 @@ static int serve_read_req(ServeReq *q, const char *active){
         if(!strcmp(id,"K3_KVNEON"))          g_kvneon=atoi(val);
         else if(!strcmp(id,"K3_MATT_BATCH")) g_mattb=atoi(val);
         else if(!strcmp(id,"K3_FDOT"))       g_fdot=atoi(val);
+#ifdef K3_HAVE_BFDOT
+        else if(!strcmp(id,"K3_BFDOT"))      g_bfdot=atoi(val)&&(getauxval(AT_HWCAP2)&(1UL<<14));
+#endif
         else if(!strcmp(id,"K3_CHUNK")||!strcmp(id,"K3_MAXT")) ;      /* re-read per request */
 #ifdef COLI_CUDA
         else if(!strcmp(id,"K3_AR_PERSIST")) g_ar_persist=atoi(val);
@@ -3368,6 +3426,18 @@ int main(int argc, char **argv){
     float temp=getenv("COLI_TEMP")?(float)atof(getenv("COLI_TEMP")):0.f;
     if(getenv("K3_KVNEON")) g_kvneon=atoi(getenv("K3_KVNEON"));
     if(getenv("K3_FDOT")) g_fdot=atoi(getenv("K3_FDOT"));
+#ifdef K3_HAVE_BFDOT
+    if(getenv("K3_BFDOT")&&atoi(getenv("K3_BFDOT"))){
+        /* the target attribute emits BFDOT regardless of the base arch, so a
+         * host without the feature would SIGILL rather than fall back */
+#ifdef HWCAP2_BF16
+        if(getauxval(AT_HWCAP2)&HWCAP2_BF16) g_bfdot=1;
+#else
+        if(getauxval(AT_HWCAP2)&(1UL<<14)) g_bfdot=1;   /* HWCAP2_BF16 */
+#endif
+        if(!g_bfdot) fprintf(stderr,"[K3] K3_BFDOT ignored: CPU lacks BF16\n");
+    }
+#endif
     if(getenv("K3_MATT_BATCH")) g_mattb=atoi(getenv("K3_MATT_BATCH"));
     int nlayers=getenv("K3_LAYERS")?atoi(getenv("K3_LAYERS")):0;
     Model m;

@@ -865,3 +865,45 @@ to give.
 The int8 path is kept behind `-DK3_KV_INT8` (with the per-token scale, the
 `ldot_`/`laxpy_` helpers and the head-batched path all converted) so the
 measurement can be repeated rather than re-derived.
+
+---
+
+## Round 10: BFDOT is 1.9x in a microbenchmark and -25% in the engine
+
+These cores advertise `bf16` and `svebf16`, so `BFDOT` is available: it consumes
+bf16 operands straight into f32 accumulators, eight elements per instruction,
+with no widening at all. Against the shipped widen+fma on one X925 core
+(nt=2013, kvl=512, 24 heads):
+
+    widen+fma   1.27 ms/pass   19.51 GMAC/s
+    BFDOT       0.66 ms/pass   37.23 GMAC/s    1.9x
+
+Score PCC 0.999998949 against the shipped path (both operands must be bf16, so
+the absorbed query is rounded once per head).
+
+In the engine, interleaved at ctx 1963: **4.610 -> 3.467 tok/s, -25%.**
+
+`-mcpu=native` does not imply `+bf16` on gcc 13 even though `/proc/cpuinfo`
+lists it — `vbfdotq_f32` fails to inline with "target specific option mismatch".
+Only `-march=armv9-a+bf16` compiles it. The microbenchmark built its whole file
+that way, so `bfdot_` **inlined**. The engine instead carries a function-level
+`__attribute__((target("+bf16")))`, which keeps `-mcpu=native` for everything
+else but makes the function **un-inlinable** — turning 116 M row-dots per 100
+decode tokens into real calls across a target boundary.
+
+**The 1.9x was real and unattainable as implemented.** A microbenchmark that
+compiles differently from the code it stands in measures a different program.
+This is the third time this project has been caught by measuring the wrong
+thing (nsys wall-clock vs kernel instances; ncu replay swamping a 1% change;
+now inlining), and the pattern is the same: the probe has to share the build of
+the thing it predicts.
+
+- [ ] **Global `-march=armv9-a+bf16`.** Would let BFDOT inline and is the only
+      way to collect the 1.9%. Untested, and not obviously a win: it drops
+      `-mcpu=native` scheduling for the X925 and the `+i8mm` SMMLA path
+      `colibri.c` relies on. That is a whole-binary change to buy one loop, and
+      it needs its own A/B rather than an assumption.
+
+Left off (`K3_BFDOT=1`), gated on `HWCAP2_BF16` at startup because the target
+attribute emits BFDOT regardless of the base arch and a host without it would
+SIGILL rather than fall back.
