@@ -46,6 +46,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
+from .dense_method import KimiK3DenseLinearMethod, bits_for_prefix
 from .kernels import GROUP, situ_and_mul, w1_gemv, w1_grouped_gemm
 
 DEFAULT_AMPLITUDE = 1.69
@@ -68,16 +69,21 @@ GEMV_MAX_TOKENS = 32
 
 @register_quantization_config("k3_w1")
 class KimiK3OneBitConfig(QuantizationConfig):
-    """1-bit sign-only experts with inherited UE8M0 group-32 scales.
+    """Two unrelated quantizations under one config, because K3 needs both.
 
-    Only the routed experts are quantized. That matches the source
-    checkpoint's own `ignore` list, which exempts self_attn, shared_experts,
-    the dense mlp gate/up/down, lm_head and the vision tower -- so every
-    LinearBase here is deliberately unquantized rather than unhandled.
+    Routed experts: 1-bit sign-only with UE8M0 group-32 scales inherited from
+    the checkpoint (kernels.py).
+
+    Everything else: int4-g64 with f32 scales, or int8 per row for the MLA
+    projections and lm_head (dense_kernels.py). The checkpoint's `ignore` list
+    exempts these from its own MXFP4, so they arrive bf16 -- 114.4 GB across
+    the model, which does not fit next to 106.4 GB of experts on a 121 GB
+    node. They are quantized after loading rather than left alone.
     """
 
     def __init__(self, amplitude: float = DEFAULT_AMPLITUDE,
-                 group_size: int = GROUP) -> None:
+                 group_size: int = GROUP, dense_bits: int = 4,
+                 mla_bits: int = 8, head_bits: int = 8) -> None:
         super().__init__()
         if group_size != GROUP:
             raise ValueError(
@@ -86,9 +92,19 @@ class KimiK3OneBitConfig(QuantizationConfig):
             )
         self.amplitude = float(amplitude)
         self.group_size = group_size
+        # Dense weights are a different quantization entirely -- signed int4 on
+        # group-64 with f32 scales, or int8 per row. Defaults mirror the
+        # engine's K3_BITS / K3_MLA_BITS / K3_HEAD_BITS. 16 disables it, which
+        # is only viable if the non-expert set fits in bf16 (it does not, at
+        # 114.4 GB across the model).
+        self.dense_bits = int(dense_bits)
+        self.mla_bits = int(mla_bits)
+        self.head_bits = int(head_bits)
 
     def __repr__(self) -> str:
-        return f"KimiK3OneBitConfig(amplitude={self.amplitude})"
+        return (f"KimiK3OneBitConfig(amplitude={self.amplitude}, "
+                f"dense_bits={self.dense_bits}, mla_bits={self.mla_bits}, "
+                f"head_bits={self.head_bits})")
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -112,6 +128,9 @@ class KimiK3OneBitConfig(QuantizationConfig):
         return cls(
             amplitude=config.get("amplitude", DEFAULT_AMPLITUDE),
             group_size=config.get("group_size", GROUP),
+            dense_bits=config.get("dense_bits", 4),
+            mla_bits=config.get("mla_bits", 8),
+            head_bits=config.get("head_bits", 8),
         )
 
     def get_quant_method(
@@ -120,7 +139,15 @@ class KimiK3OneBitConfig(QuantizationConfig):
         if isinstance(layer, RoutedExperts):
             return KimiK3OneBitMoEMethod(self, layer.moe_config)
         if isinstance(layer, LinearBase):
-            return UnquantizedLinearMethod()
+            # The vision tower is small (0.9 GB) and not what this is for;
+            # leaving it in bf16 keeps it out of the numerics story.
+            if "vision" in prefix or "mm_projector" in prefix:
+                return UnquantizedLinearMethod()
+            bits = bits_for_prefix(prefix, self.dense_bits, self.mla_bits,
+                                   self.head_bits)
+            if bits >= 16:
+                return UnquantizedLinearMethod()
+            return KimiK3DenseLinearMethod(bits)
         return None
 
 
