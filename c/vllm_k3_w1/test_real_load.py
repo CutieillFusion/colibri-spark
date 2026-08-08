@@ -25,7 +25,7 @@ sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
 LAYERS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 EXPERTS = int(sys.argv[2]) if len(sys.argv) > 2 else 8
-SRC = "/nas/models/moonshotai/Kimi-K3"
+SRC = os.environ.get("K3_SRC", "/nas/models/moonshotai/Kimi-K3")
 FAIL = []
 
 

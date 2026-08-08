@@ -29,6 +29,7 @@ class K3W1Store:
         self.hidden = hidden          # latent dim, 3584
         self.inter = inter            # moe intermediate, 3072
         self.experts_per_rank = experts_per_rank
+        self._fh = None
 
         self.e_w1p = inter * (hidden // 8)
         self.e_w1s = inter * (hidden // 32)
@@ -67,11 +68,17 @@ class K3W1Store:
                 f"slot {idx} (layer {moe_layer}, expert {expert_local}) outside "
                 f"the {self.n_slots}-slot store"
             )
-        with open(self.path, "rb") as f:
-            f.seek(idx * self.slot)
-            raw = f.read(self.slot)
-        if len(raw) != self.slot:
-            raise IOError(f"short read at slot {idx}: {len(raw)} != {self.slot}")
+        # One handle for the whole load: a full rank reads 92 x 224 = 20,608
+        # slots, and reopening per slot turns that into 20,608 opens.
+        if self._fh is None:
+            self._fh = open(self.path, "rb", buffering=0)
+        self._fh.seek(idx * self.slot)
+        # Into a writable buffer, so the numpy views below are writable and
+        # torch.from_numpy needs no extra copy of each 4.92 MiB slot.
+        raw = bytearray(self.slot)
+        got = self._fh.readinto(raw)
+        if got != self.slot:
+            raise IOError(f"short read at slot {idx}: {got} != {self.slot}")
         buf = np.frombuffer(raw, dtype=np.uint8)
         o = self._offsets()
         H, I = self.hidden, self.inter
@@ -100,9 +107,9 @@ class K3W1Store:
             s = self.read_slot(moe_layer, e)
             w13p = layer.w13_qweight[slot_i]
             w13s = layer.w13_scales[slot_i]
-            w13p[:I].copy_(torch.from_numpy(s["w1p"].copy()))
-            w13p[I:].copy_(torch.from_numpy(s["w3p"].copy()))
-            w13s[:I].copy_(torch.from_numpy(s["w1s"].copy()))
-            w13s[I:].copy_(torch.from_numpy(s["w3s"].copy()))
-            layer.w2_qweight[slot_i].copy_(torch.from_numpy(s["w2p"].copy()))
-            layer.w2_scales[slot_i].copy_(torch.from_numpy(s["w2s"].copy()))
+            w13p[:I].copy_(torch.from_numpy(s["w1p"]))
+            w13p[I:].copy_(torch.from_numpy(s["w3p"]))
+            w13s[:I].copy_(torch.from_numpy(s["w1s"]))
+            w13s[I:].copy_(torch.from_numpy(s["w3s"]))
+            layer.w2_qweight[slot_i].copy_(torch.from_numpy(s["w2p"]))
+            layer.w2_scales[slot_i].copy_(torch.from_numpy(s["w2s"]))

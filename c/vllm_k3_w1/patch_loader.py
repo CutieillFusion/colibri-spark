@@ -133,12 +133,12 @@ def fill_layer(filler: _Filler, layer, moe_ordinal: int):
     for slot, g in enumerate(ids):
         s = st.read_slot(moe_ordinal, filler.local_to_store_index(g))
         w13p, w13s = layer.w13_qweight[slot], layer.w13_scales[slot]
-        w13p[:inter].copy_(torch.from_numpy(s["w1p"].copy()))
-        w13p[inter:].copy_(torch.from_numpy(s["w3p"].copy()))
-        w13s[:inter].copy_(torch.from_numpy(s["w1s"].copy()))
-        w13s[inter:].copy_(torch.from_numpy(s["w3s"].copy()))
-        layer.w2_qweight[slot].copy_(torch.from_numpy(s["w2p"].copy()))
-        layer.w2_scales[slot].copy_(torch.from_numpy(s["w2s"].copy()))
+        w13p[:inter].copy_(torch.from_numpy(s["w1p"]))
+        w13p[inter:].copy_(torch.from_numpy(s["w3p"]))
+        w13s[:inter].copy_(torch.from_numpy(s["w1s"]))
+        w13s[inter:].copy_(torch.from_numpy(s["w3s"]))
+        layer.w2_qweight[slot].copy_(torch.from_numpy(s["w2p"]))
+        layer.w2_scales[slot].copy_(torch.from_numpy(s["w2s"]))
     filler.filled += len(ids)
 
 
