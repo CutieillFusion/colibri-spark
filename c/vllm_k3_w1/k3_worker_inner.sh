@@ -6,7 +6,17 @@ set -uo pipefail
 # vLLM loads general plugins inside the engine-core and Ray worker processes
 # (v1/engine/core.py:117, models/registry.py:1506) where our PYTHONPATH import
 # never ran. No compilation -- this is pure Python.
+# Only remove the image's own vLLM if it actually shadows /work. On some
+# nodes dist-packages started winning after `pip install -e` (ImportError:
+# cannot import name 'ApplyMoEActivationConfig'); on others the partial tree
+# there is load-bearing and removing it breaks platform detection.
+python3 -c "import vllm,sys; sys.exit(0 if vllm.__file__.startswith('/work') else 1)" 2>/dev/null || {
+  echo "[setup] dist-packages vllm shadows /work; removing it"
+  rm -rf /usr/local/lib/python3.12/dist-packages/vllm \
+         /usr/local/lib/python3.12/dist-packages/vllm-*.dist-info 2>/dev/null
+}
 pip install -e /k3w1/vllm_k3_w1 --no-deps -q 2>&1 | tail -2
+python3 -c "import vllm; assert vllm.__file__.startswith('/work'), vllm.__file__; print('vllm', vllm.__version__, 'from /work')" || exit 1
 python3 -c "import vllm_k3_w1; print('k3_w1 importable')" || exit 1
 # Wait for the head's GCS before joining. `ray start` gives up after 60 s,
 # and the head now runs a pip install before `ray start --head`, so a fixed

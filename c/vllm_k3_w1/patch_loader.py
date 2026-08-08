@@ -78,6 +78,15 @@ class _Filler:
         return global_e // self.s_world
 
 
+def _stage_local_store() -> bool:
+    """True when the store holds only this PP stage's layers.
+
+    Set by the launcher for the repacked TP=2 x PP=2 stores. A TP=4 store is
+    whole-model and indexes layers absolutely.
+    """
+    return os.environ.get("K3_W1_STAGE_LOCAL", "0") == "1"
+
+
 def _rank_world() -> tuple[int, int]:
     """(rank, world) of the group the expert shard follows.
 
@@ -137,7 +146,35 @@ def quantize_dense_now(model) -> int:
                 not hasattr(mod, "k3_qweight"):
             qm.process_weights_after_loading(mod)
             n += 1
+    _drop_checkpoint_cache()
     return n
+
+
+def _drop_checkpoint_cache():
+    """Evict the mmapped safetensors from page cache once dense is quantized.
+
+    The checkpoint is 113.5 GB and vLLM maps it; those pages stay resident and
+    compete with the 106.4 GB of experts allocated immediately afterwards on a
+    121 GB box. They are not needed again -- every dense tensor has already
+    been read and quantized. Without this the node thrashes to the point of
+    dropping ssh.
+    """
+    import glob
+    d = os.environ.get("K3_MODEL_DIR") or ""
+    if not d:
+        return
+    freed = 0
+    for p in glob.glob(os.path.join(d, "*.safetensors")):
+        try:
+            fd = os.open(p, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                freed += os.path.getsize(p)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    logger.info("k3_w1: dropped %.1f GB of checkpoint page cache", freed / 1e9)
 
 
 def materialize_experts(layer):
@@ -273,17 +310,27 @@ def apply():
         logger.info("k3_w1: quantized %d dense layers before expert fill", nq)
 
         filler = _Filler()
-        n = 0
+        # Collect first, so the PP-stage layer offset is known before any read.
+        # A TP=4 store holds all 92 MoE layers and ordinals are absolute; a
+        # TP=2 x PP=2 store holds only this stage's 46, so slot 0 is this
+        # stage's first MoE layer, not the model's. Taking the offset from the
+        # layers actually present makes both layouts work without a flag.
+        mods = []
         for name, mod in self.named_modules():
             if not hasattr(mod, "w13_qweight"):
                 continue
             m = re.search(r"layers\.(\d+)\.", name)
             if not m:
                 continue
-            # Store slots are indexed by MoE-layer ordinal, which counts only
-            # sparse layers. first_k_dense_replace dense layers come first.
-            ordinal = int(m.group(1)) - _first_dense(self)
-            fill_layer(filler, mod, ordinal)
+            mods.append((int(m.group(1)) - _first_dense(self), mod))
+        if not mods:
+            raise RuntimeError("no MoE layers were filled -- is k3_w1 active?")
+        base = min(o for o, _ in mods) if _stage_local_store() else 0
+        if base:
+            logger.info("k3_w1: PP stage starts at MoE ordinal %d", base)
+        n = 0
+        for ordinal, mod in mods:
+            fill_layer(filler, mod, ordinal - base)
             n += 1
         logger.info("k3_w1: filled %d MoE layers, %d expert slots from %s",
                     n, filler.filled, filler.dir)

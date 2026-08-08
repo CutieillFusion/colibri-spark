@@ -28,11 +28,18 @@ if [ "${1:-}" = stop ]; then
   echo "[$(hostname)] stopped"; exit 0
 fi
 
+# TP=2 x PP=2. The PP stage a node serves is FIXED by which repacked store it
+# holds (that store contains only that stage's 46 MoE layers); the TP rank
+# within the stage is not, since expert ownership only has to be a bijection
+# (patch_loader.apply_expert_map_shard). spark1/spark2 hold stage 0,
+# spark3/spark4 stage 1 -- matching the rank order Ray was observed to assign.
 case "$(hostname)" in
-  spark1) RANK=0 ;; spark2) RANK=1 ;; spark3) RANK=2 ;; spark4) RANK=3 ;;
+  spark1) STAGE=0; TPR=0 ;; spark2) STAGE=0; TPR=1 ;;
+  spark3) STAGE=1; TPR=0 ;; spark4) STAGE=1; TPR=1 ;;
   *) echo "unknown host $(hostname)"; exit 1 ;;
 esac
-STORE=/home/norquistdylan/k3data/K3-w1-r$RANK
+RANK=$((STAGE * 2 + TPR))
+STORE=/home/norquistdylan/k3data/K3-w1-pp${STAGE}t${TPR}
 [ -f "$STORE/experts.w2" ] || { echo "no store at $STORE"; exit 1; }
 MYIP=$(ip -o -4 addr show enP7s7 | grep -oE '192\.168\.0\.[0-9]+' | head -1)
 
@@ -43,7 +50,7 @@ COMMON="--network host --gpus all --privileged --shm-size 16g -v /nas:/nas -v /t
 # PYTHONPATH carries both the vLLM build and our plugin; importing
 # vllm_k3_w1 is what registers k3_w1 and installs the loader patches, so it
 # has to happen inside every worker process, not just the driver.
-ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7 -e NCCL_IB_GID_INDEX=3 -e RAY_memory_monitor_refresh_ms=0 -e K3_W1_DIR=/k3store -e K3_W1_SHARD=$RANK/4 -e VLLM_PLUGINS=k3_w1 -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false -e K3_ONE_GPU_PER_NODE=1 -e K3_BITS=${K3_BITS:-4} -e K3_MLA_BITS=${K3_MLA_BITS:-8} -e K3_HEAD_BITS=${K3_HEAD_BITS:-8} -e K3_HIER_AR=${K3_HIER_AR:-0} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
+ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7 -e NCCL_IB_GID_INDEX=3 -e RAY_memory_monitor_refresh_ms=0 -e K3_W1_DIR=/k3store -e K3_W1_SHARD=$TPR/2 -e K3_W1_STAGE_LOCAL=1 -e VLLM_PP_LAYER_PARTITION=47,46 -e VLLM_PLUGINS=k3_w1 -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false -e K3_MODEL_DIR=$MODEL -e K3_ONE_GPU_PER_NODE=1 -e K3_BITS=${K3_BITS:-4} -e K3_MLA_BITS=${K3_MLA_BITS:-8} -e K3_HEAD_BITS=${K3_HEAD_BITS:-8} -e K3_HIER_AR=${K3_HIER_AR:-0} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
 
 sg docker -c "docker rm -f $NAME 2>/dev/null" >/dev/null 2>&1
 
