@@ -178,6 +178,39 @@ def fill_layer(filler: _Filler, layer, moe_ordinal: int):
     filler.filled += len(ids)
 
 
+def apply_expert_map_shard():
+    """Own the experts this node's store actually holds, not the ones its rank
+    implies.
+
+    Ray decides which host gets which rank, and it does not follow hostname
+    order -- observed rank 2 on spark4 and rank 3 on spark3, while the stores
+    mounted there are shard 3 and shard 2. Every expert would then be loaded
+    from the wrong slot, silently.
+
+    Rather than fight the assignment, permute the ownership: build this rank's
+    expert_map from the shard its local store holds (K3_W1_SHARD). That stays
+    correct because expert ownership only has to be a bijection -- each expert
+    still has exactly one owner, and routing follows expert_map rather than
+    rank arithmetic. Without K3_W1_SHARD this is a no-op.
+    """
+    sh = os.environ.get("K3_W1_SHARD", "")
+    if not sh:
+        return
+    s_rank, s_world = (int(x) for x in sh.split("/"))
+    import vllm.model_executor.layers.fused_moe.expert_map_manager as emm
+
+    orig = emm.determine_expert_map
+
+    def patched(ep_size, ep_rank, *a, **kw):
+        if ep_size == s_world and ep_rank != s_rank:
+            logger.info("k3_w1: rank %d owns shard %d (local store), not %d",
+                        ep_rank, s_rank, ep_rank)
+            ep_rank = s_rank
+        return orig(ep_size, ep_rank, *a, **kw)
+
+    emm.determine_expert_map = patched
+
+
 def apply_placement():
     """Keep round-robin expert placement, which is what the store is packed for.
 
@@ -217,6 +250,7 @@ def apply():
     if _applied:
         return True
     apply_placement()
+    apply_expert_map_shard()
     import vllm.models.kimi_k3.nvidia.model as k3
 
     cls = k3.KimiK3ForConditionalGeneration

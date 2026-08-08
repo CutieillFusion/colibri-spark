@@ -36,25 +36,18 @@ STORE=/home/norquistdylan/k3data/K3-w1-r$RANK
 [ -f "$STORE/experts.w2" ] || { echo "no store at $STORE"; exit 1; }
 MYIP=$(ip -o -4 addr show enP7s7 | grep -oE '192\.168\.0\.[0-9]+' | head -1)
 
-COMMON="--network host --gpus all --privileged --ipc=host --shm-size 8g
-  -v /nas:/nas -v /tmp/vllm-main:/work -v /tmp/k3w1:/k3w1
-  -v /home/norquistdylan/k3data:/k3data:ro -v $STORE:/k3store:ro
-  -v /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
+# One line, deliberately: this string is handed to `sg docker -c`, which
+# feeds it to sh -- embedded newlines become separate commands.
+COMMON="--network host --gpus all --privileged --shm-size 16g -v /nas:/nas -v /tmp/vllm-main:/work -v /tmp/k3w1:/k3w1 -v /home/norquistdylan/k3data:/k3data:ro -v $STORE:/k3store:ro -v /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
 
 # PYTHONPATH carries both the vLLM build and our plugin; importing
 # vllm_k3_w1 is what registers k3_w1 and installs the loader patches, so it
 # has to happen inside every worker process, not just the driver.
-ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP
-  -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7
-  -e NCCL_IB_DISABLE=1 -e RAY_memory_monitor_refresh_ms=0
-  -e K3_W1_DIR=/k3store -e VLLM_PLUGINS=k3_w1
-  -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false"
+ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7 -e NCCL_IB_GID_INDEX=3 -e RAY_memory_monitor_refresh_ms=0 -e K3_W1_DIR=/k3store -e K3_W1_SHARD=$RANK/4 -e VLLM_PLUGINS=k3_w1 -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false -e K3_HIER_AR=${K3_HIER_AR:-0} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
 
 sg docker -c "docker rm -f $NAME 2>/dev/null" >/dev/null 2>&1
 
-ENV="$ENV -e HEAD_IP=$HEAD_IP -e MYIP=$MYIP -e K3_MODEL=$MODEL
-  -e K3_MAXLEN=${K3_MAXLEN:-8192} -e K3_MNBT=${K3_MNBT:-2048}
-  -e K3_UTIL=${K3_UTIL:-0.95}"
+ENV="$ENV -e HEAD_IP=$HEAD_IP -e MYIP=$MYIP -e K3_MODEL=$MODEL -e K3_MAXLEN=${K3_MAXLEN:-8192} -e K3_MNBT=${K3_MNBT:-2048} -e K3_UTIL=${K3_UTIL:-0.95}"
 
 if [ "$(hostname)" = spark1 ]; then
   echo "[head spark1] ray head + K3 TP=4 serve, store=$STORE, model=$MODEL"

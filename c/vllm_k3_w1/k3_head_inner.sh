@@ -9,7 +9,12 @@ HEAD_IP=${HEAD_IP:-192.168.0.159}
 MODEL=${K3_MODEL:-/k3data/K3-dense}
 
 echo "[head] importing plugin"
-python3 -c "import vllm_k3_w1; print('k3_w1 registered')" || exit 1
+# Installed, not just importable: VLLM_PLUGINS resolves an entry point, and
+# vLLM loads general plugins inside the engine-core and Ray worker processes
+# (v1/engine/core.py:117, models/registry.py:1506) where our PYTHONPATH import
+# never ran. No compilation -- this is pure Python.
+pip install -e /k3w1/vllm_k3_w1 --no-deps -q 2>&1 | tail -2
+python3 -c "import vllm_k3_w1; print('k3_w1 importable')" || exit 1
 
 ray start --head --node-ip-address="$HEAD_IP" --port=6379 --num-gpus=1 \
   --disable-usage-stats --object-store-memory 1000000000 || exit 1
