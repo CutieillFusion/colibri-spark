@@ -103,7 +103,9 @@ def _rank_world() -> tuple[int, int]:
 def _global_ids_for(layer) -> list[int]:
     """Global expert ids this rank owns, in local-slot order."""
     emap = getattr(layer, "expert_map", None)
-    n_local = layer.w13_qweight.shape[0]
+    shapes = getattr(layer, "k3_expert_shapes", None)
+    n_local = (shapes["w13_qweight"][0] if shapes
+               else layer.w13_qweight.shape[0])
     if emap is None:
         return list(range(n_local))
     ids = [-1] * n_local
@@ -116,8 +118,42 @@ def _global_ids_for(layer) -> list[int]:
     return ids
 
 
+def quantize_dense_now(model) -> int:
+    """Run the dense post-load hooks early, before experts are materialized.
+
+    Ordering is the whole point. vLLM's sequence is create_weights for every
+    parameter, then load, then process_weights_after_loading. Left alone that
+    means 38 GB of bf16 dense is still resident when the 106.4 GB of experts
+    appear -- 144 GB against ~122. Quantizing dense here drops it to 13 GB
+    first, so the peak is 119.4 GB instead. vLLM's own later call is a no-op
+    because the bf16 weight is already gone.
+    """
+    from .dense_method import KimiK3DenseLinearMethod
+
+    n = 0
+    for _, mod in model.named_modules():
+        qm = getattr(mod, "quant_method", None)
+        if isinstance(qm, KimiK3DenseLinearMethod) and \
+                not hasattr(mod, "k3_qweight"):
+            qm.process_weights_after_loading(mod)
+            n += 1
+    return n
+
+
+def materialize_experts(layer):
+    """Allocate the expert parameters deferred by create_weights."""
+    shapes = getattr(layer, "k3_expert_shapes", None)
+    if not shapes:
+        return
+    for name, shape in shapes.items():
+        p = getattr(layer, name)
+        if tuple(p.shape) != tuple(shape):
+            p.data = torch.empty(shape, dtype=torch.uint8, device=p.data.device)
+
+
 def fill_layer(filler: _Filler, layer, moe_ordinal: int):
     """Populate one RoutedExperts layer from the store."""
+    materialize_experts(layer)
     E, w13_rows, hb = layer.w13_qweight.shape
     hidden = hb * 8
     inter = w13_rows // 2
@@ -198,6 +234,9 @@ def apply():
 
         loaded = orig(self, keep(weights))
         logger.info("k3_w1: skipped %d MXFP4 expert tensors", skipped[0])
+
+        nq = quantize_dense_now(self)
+        logger.info("k3_w1: quantized %d dense layers before expert fill", nq)
 
         filler = _Filler()
         n = 0

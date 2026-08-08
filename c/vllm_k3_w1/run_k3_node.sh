@@ -52,39 +52,17 @@ ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP
 
 sg docker -c "docker rm -f $NAME 2>/dev/null" >/dev/null 2>&1
 
+ENV="$ENV -e HEAD_IP=$HEAD_IP -e MYIP=$MYIP -e K3_MODEL=$MODEL
+  -e K3_MAXLEN=${K3_MAXLEN:-8192} -e K3_MNBT=${K3_MNBT:-2048}
+  -e K3_UTIL=${K3_UTIL:-0.95}"
+
 if [ "$(hostname)" = spark1 ]; then
-  echo "[head spark1] ray head + K3 TP=4 serve, store=$STORE"
-  sg docker -c "docker run -d --name $NAME $COMMON $ENV --entrypoint bash $IMG -c '
-    set -e
-    python3 -c \"import vllm_k3_w1\" || exit 1
-    ray start --head --node-ip-address=$HEAD_IP --port=6379 --num-gpus=1 \
-      --disable-usage-stats --object-store-memory 1000000000
-    while [ \$(ray status 2>/dev/null | grep -c \"1.0/1.0 GPU\\|GPU\") -lt 1 ]; do sleep 2; done
-    echo WAITING_FOR_WORKERS
-    for i in \$(seq 120); do
-      n=\$(python3 -c \"import ray;ray.init(address=\\\"auto\\\");print(len(ray.nodes()))\" 2>/dev/null || echo 0)
-      [ \"\$n\" -ge 4 ] && break; sleep 5
-    done
-    echo RAY_NODES=\$n
-    exec python3 -m vllm.entrypoints.openai.api_server \
-      --model $MODEL --served-model-name kimi-k3 \
-      --quantization k3_w1 --trust-remote-code \
-      --tensor-parallel-size 4 --enable-expert-parallel \
-      --expert-placement-strategy round_robin \
-      --distributed-executor-backend ray \
-      --max-model-len ${K3_MAXLEN:-8192} \
-      --max-num-seqs 1 --max-num-batched-tokens ${K3_MNBT:-2048} \
-      --limit-mm-per-prompt '"'"'{"image":0,"video":0}'"'"' \
-      --gpu-memory-utilization ${K3_UTIL:-0.97} \
-      --enforce-eager \
-      --host 0.0.0.0 --port 8000
-  '"
+  echo "[head spark1] ray head + K3 TP=4 serve, store=$STORE, model=$MODEL"
+  INNER=/k3w1/vllm_k3_w1/k3_head_inner.sh
 else
   echo "[worker $(hostname)] joining $HEAD_IP as $MYIP, store=$STORE"
-  sg docker -c "docker run -d --name $NAME $COMMON $ENV --entrypoint bash $IMG -c '
-    python3 -c \"import vllm_k3_w1\" || exit 1
-    exec ray start --address=$HEAD_IP:6379 --node-ip-address=$MYIP \
-      --num-gpus=1 --object-store-memory 1000000000 --block
-  '"
+  INNER=/k3w1/vllm_k3_w1/k3_worker_inner.sh
 fi
-echo "[$(hostname)] container $NAME started"
+
+sg docker -c "docker run -d --name $NAME $COMMON $ENV --entrypoint bash $IMG $INNER"
+echo "[$(hostname)] container $NAME started ($INNER)"

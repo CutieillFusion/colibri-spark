@@ -49,6 +49,16 @@ from vllm.model_executor.utils import set_weight_attrs
 from .dense_method import KimiK3DenseLinearMethod, bits_for_prefix
 from .kernels import GROUP, situ_and_mul, w1_gemv, w1_grouped_gemm
 
+def _defer_experts() -> bool:
+    """Whether to allocate expert parameters empty and fill them later.
+
+    On by default; K3_W1_EAGER_EXPERTS=1 restores the ordinary behaviour for
+    a single-layer test where the peak does not matter.
+    """
+    import os
+    return os.environ.get("K3_W1_EAGER_EXPERTS", "0") != "1"
+
+
 DEFAULT_AMPLITUDE = 1.69
 BLOCK_M = 16
 
@@ -180,42 +190,44 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
             )
         w13_rows = self.moe.w13_num_shards * intermediate_size_per_partition
 
+        # Allocated EMPTY and materialized later, by patch_loader, once the
+        # dense weights have been quantized. vLLM allocates every parameter
+        # before loading anything, so holding the real 106.4 GB of experts
+        # here would sit alongside 38 GB of not-yet-quantized bf16 dense --
+        # 144 GB against ~122 available. Deferring costs nothing: the store is
+        # read after load_weights either way.
+        layer.k3_expert_shapes = {
+            "w13_qweight": (num_experts, w13_rows, hidden_size // 8),
+            "w2_qweight": (num_experts, hidden_size,
+                           intermediate_size_per_partition // 8),
+            "w13_scales": (num_experts, w13_rows, hidden_size // GROUP),
+            "w2_scales": (num_experts, hidden_size,
+                          intermediate_size_per_partition // GROUP),
+        }
+        defer = _defer_experts()
+
+        def _mk(shape):
+            return torch.nn.Parameter(
+                torch.empty(0 if defer else shape, dtype=torch.uint8),
+                requires_grad=False)
+
         # Packed sign bits: 8 weights per byte, input-index order, LSB first.
-        w13_qweight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_rows, hidden_size // 8, dtype=torch.uint8),
-            requires_grad=False,
-        )
+        w13_qweight = _mk(layer.k3_expert_shapes["w13_qweight"])
         layer.register_parameter("w13_qweight", w13_qweight)
         set_weight_attrs(w13_qweight, extra_weight_attrs)
 
-        w2_qweight = torch.nn.Parameter(
-            torch.empty(
-                num_experts, hidden_size,
-                intermediate_size_per_partition // 8, dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
+        w2_qweight = _mk(layer.k3_expert_shapes["w2_qweight"])
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
 
         # UE8M0 exponents, kept as raw bytes rather than materialized floats:
         # one byte per 32 inputs is 1/4 the memory of an fp16 scale and the
         # kernel does the exp2 anyway.
-        w13_scales = torch.nn.Parameter(
-            torch.empty(num_experts, w13_rows, hidden_size // GROUP,
-                        dtype=torch.uint8),
-            requires_grad=False,
-        )
+        w13_scales = _mk(layer.k3_expert_shapes["w13_scales"])
         layer.register_parameter("w13_scales", w13_scales)
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
-        w2_scales = torch.nn.Parameter(
-            torch.empty(
-                num_experts, hidden_size,
-                intermediate_size_per_partition // GROUP, dtype=torch.uint8,
-            ),
-            requires_grad=False,
-        )
+        w2_scales = _mk(layer.k3_expert_shapes["w2_scales"])
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
 

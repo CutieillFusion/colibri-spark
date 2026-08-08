@@ -91,6 +91,12 @@ class KimiK3DenseLinearMethod(LinearMethodBase):
         layer.k3_group_size = self.group_size
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Idempotent: patch_loader runs this early, before the expert
+        # parameters are materialized, and vLLM then calls it again for every
+        # module. The second call must not try to requantize the zero-element
+        # placeholder left behind by the first.
+        if hasattr(layer, "k3_qweight"):
+            return
         w = layer.weight.data
         bits = self.bits
         # int4-g64 needs I%64==0; the engine falls back to int8 rather than
