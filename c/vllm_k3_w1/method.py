@@ -245,14 +245,14 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         shared_experts=None,
         shared_experts_input=None,
     ) -> torch.Tensor:
-        routed = self._forward_routed(layer, x, topk_weights, topk_ids)
-        if shared_experts is None:
-            return routed
-        # The runner only passes shared_experts here when the method claims it
-        # can overlap them internally, which we do not; handle it anyway so a
-        # future runner change does not silently drop the shared output.
-        shared_in = shared_experts_input if shared_experts_input is not None else x
-        return shared_experts(shared_in), routed
+        # Routed output only, never a (shared, routed) tuple. MoERunner
+        # ._apply_quant_method already runs the shared experts around this call
+        # -- SharedExpertsOrder.NO_OVERLAP before, MULTI_STREAM_OVERLAPPED
+        # after -- and reads _shared_experts.output itself
+        # (runner/moe_runner.py:587-623). The shared_experts argument is here
+        # only so a modular kernel can overlap them internally; running them
+        # here as well would double-apply them.
+        return self._forward_routed(layer, x, topk_weights, topk_ids)
 
     def _forward_routed(self, layer, x, topk_weights, topk_ids) -> torch.Tensor:
         T, H = x.shape
@@ -287,7 +287,8 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         act = layer.activation
         if act == MoEActivation.SITU and self.moe.activation_situ_beta is not None:
             h = torch.empty((T * top_k, I), dtype=x.dtype, device=x.device)
-            apply_moe_activation(act, h, inter, config=self._act_config())
+            apply_moe_activation(act, h, inter,
+                                 activation_config=self._act_config())
         else:
             h = situ_and_mul(
                 inter, self.moe.activation_situ_beta or 1.0,

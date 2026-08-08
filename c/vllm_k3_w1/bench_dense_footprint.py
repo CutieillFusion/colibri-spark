@@ -96,7 +96,19 @@ def main():
             O = O // TP
         elif s == "row":
             I = I // TP
-        bits = bits_for_prefix(name.replace(".weight", ""), 4, 8, 8)
+        # VERIFIED by building the model (test_model_build.py): vLLM
+        # constructs the latent projections and the router gate with
+        # quant_config=None (model.py:562,579), so get_quant_method is never
+        # consulted for them and they stay bf16 no matter what we register.
+        # Counting them as quantized understated the footprint by ~7.7 GB.
+        # The router gate keeps quant_config=None and stays bf16, which is
+        # what we want anyway -- it is the routing decision. The latent
+        # projections are reclaimed by patch_latent (verified 8/8 in
+        # test_model_build.py), so they quantize like anything else.
+        if re.search(r"block_sparse_moe\.gate", name):
+            bits = 16
+        else:
+            bits = bits_for_prefix(name.replace(".weight", ""), 4, 8, 8)
         plan.append((name, O, I, bits))
 
     bf16_b = sum(O * I * 2 for _, O, I, _ in plan)
@@ -137,8 +149,11 @@ def main():
     q = []
     for i, (_, O, I, bits) in enumerate(plan):
         w = bufs[i]
-        b = bits if not (bits == 4 and I % 64) else 8
-        q.append(quantize_i4g(w, 64) if b == 4 else quantize_i8(w))
+        if bits >= 16:
+            q.append((w.clone(), torch.empty(0, device=w.device)))  # stays bf16
+        else:
+            b = bits if not (bits == 4 and I % 64) else 8
+            q.append(quantize_i4g(w, 64) if b == 4 else quantize_i8(w))
         bufs[i] = None
         del w
         if i % 200 == 0:

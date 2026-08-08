@@ -104,9 +104,17 @@ class KimiK3DenseLinearMethod(LinearMethodBase):
         layer.register_buffer("k3_qweight", q)
         layer.register_buffer("k3_scales", s)
         layer.k3_bits = bits
-        # Drop the bf16 copy; this is the entire point of the method.
+        # Drop the bf16 copy -- the entire point of the method -- but leave a
+        # zero-element parameter behind rather than None. MLA reconstructs its
+        # absorbed matrices from kv_b_proj via get_and_maybe_dequant_weights
+        # (mla.py:362), whose generic path reads `weight.device` before
+        # calling quant_method.apply(layer, eye) to recover the dequantized
+        # weight. apply() handles that fine; only the `.device` probe needs a
+        # real tensor to look at.
         del layer.weight
-        layer.weight = None
+        layer.register_parameter("weight", torch.nn.Parameter(
+            torch.empty(0, dtype=w.dtype, device=w.device),
+            requires_grad=False))
 
     def apply(
         self,
