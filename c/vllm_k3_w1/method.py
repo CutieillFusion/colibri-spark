@@ -20,6 +20,7 @@ field so a store packed with a different `a` stays self-describing.
 
 from typing import Any
 
+import os
 import torch
 
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -47,6 +48,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 
 from .dense_method import KimiK3DenseLinearMethod, bits_for_prefix
+from .embed_method import KimiK3EmbeddingMethod
 from .kernels import GROUP, situ_and_mul, w1_gemv, w1_grouped_gemm
 
 def _defer_experts() -> bool:
@@ -154,6 +156,16 @@ class KimiK3OneBitConfig(QuantizationConfig):
     ) -> "QuantizeMethodBase | None":
         if isinstance(layer, RoutedExperts):
             return KimiK3OneBitMoEMethod(self, layer.moe_config)
+        # ParallelLMHead extends VocabParallelEmbedding, not LinearBase, so
+        # this has to come first -- otherwise both fall through to
+        # UnquantizedEmbeddingMethod and stay bf16 (~2.3 GB per PP stage).
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            VocabParallelEmbedding,
+        )
+        if isinstance(layer, VocabParallelEmbedding):
+            if os.environ.get("K3_QUANT_EMBED", "1") == "1":
+                return KimiK3EmbeddingMethod()
+            return None
         if isinstance(layer, LinearBase):
             # The vision tower is small (0.9 GB) and not what this is for;
             # leaving it in bf16 keeps it out of the numerics story.
@@ -163,7 +175,12 @@ class KimiK3OneBitConfig(QuantizationConfig):
                                    self.head_bits)
             if bits >= 16:
                 return UnquantizedLinearMethod()
-            return KimiK3DenseLinearMethod(bits)
+            # Group size is tunable because it is the broadest weight lever
+            # left: g128 is 4.25 bits/weight against g64's 4.5, ~0.5 GB per
+            # rank, and it applies to every int4 tensor at once.
+            import os as _o
+            return KimiK3DenseLinearMethod(
+                bits, int(_o.environ.get("K3_GROUP", "64")))
         return None
 
 

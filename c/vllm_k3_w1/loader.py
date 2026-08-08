@@ -31,6 +31,7 @@ class K3W1Store:
         self.experts_per_rank = experts_per_rank
         self._fh = None
         self._fadv = hasattr(os, "posix_fadvise")
+        self._buf = None
 
         self.e_w1p = inter * (hidden // 8)
         self.e_w1s = inter * (hidden // 32)
@@ -74,9 +75,14 @@ class K3W1Store:
         if self._fh is None:
             self._fh = open(self.path, "rb", buffering=0)
         self._fh.seek(idx * self.slot)
-        # Into a writable buffer, so the numpy views below are writable and
-        # torch.from_numpy needs no extra copy of each 4.92 MiB slot.
-        raw = bytearray(self.slot)
+        # One buffer reused for every slot. A rank reads 20,608 of them, and a
+        # fresh 4.92 MiB bytearray each time is 101 GB of allocation churn that
+        # the allocator holds onto rather than returning -- which is what
+        # pushes the node over during expert fill. Callers must consume the
+        # returned views before the next read_slot, which fill_layer does.
+        if self._buf is None:
+            self._buf = bytearray(self.slot)
+        raw = self._buf
         got = self._fh.readinto(raw)
         if got != self.slot:
             raise IOError(f"short read at slot {idx}: {got} != {self.slot}")

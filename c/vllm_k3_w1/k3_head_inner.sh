@@ -27,7 +27,7 @@ python3 -c "import vllm; assert vllm.__file__.startswith('/work'), vllm.__file__
 python3 -c "import vllm_k3_w1; print('k3_w1 importable')" || exit 1
 
 ray start --head --node-ip-address="$HEAD_IP" --port=6379 --num-gpus=1 \
-  --disable-usage-stats --object-store-memory 200000000 || exit 1
+  --disable-usage-stats --object-store-memory 200000000 --include-dashboard=false || exit 1
 
 echo "[head] waiting for 4 ray nodes"
 for i in $(seq 180); do

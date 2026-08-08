@@ -127,6 +127,24 @@ def _global_ids_for(layer) -> list[int]:
     return ids
 
 
+def mem_avail_gb() -> float:
+    """What the kernel says it can still hand out. RSS is useless on unified
+    memory -- bench_unified.py measured it reporting 0.6 GB while 19 GB was
+    really consumed."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024 / 1e9
+    except OSError:
+        pass
+    return -1.0
+
+
+def phase(tag: str):
+    logger.info("k3_w1: [mem] %-28s MemAvailable %.1f GB", tag, mem_avail_gb())
+
+
 def quantize_dense_now(model) -> int:
     """Run the dense post-load hooks early, before experts are materialized.
 
@@ -303,10 +321,14 @@ def apply():
                     continue
                 yield name, w
 
+        phase("start of load_weights")
         loaded = orig(self, keep(weights))
         logger.info("k3_w1: skipped %d MXFP4 expert tensors", skipped[0])
+        phase("dense loaded (bf16)")
 
         nq = quantize_dense_now(self)
+        torch.cuda.empty_cache()
+        phase("dense quantized")
         logger.info("k3_w1: quantized %d dense layers before expert fill", nq)
 
         filler = _Filler()
@@ -328,10 +350,17 @@ def apply():
         base = min(o for o, _ in mods) if _stage_local_store() else 0
         if base:
             logger.info("k3_w1: PP stage starts at MoE ordinal %d", base)
+        phase("before expert fill")
         n = 0
         for ordinal, mod in mods:
             fill_layer(filler, mod, ordinal - base)
             n += 1
+            # Hand freed blocks back rather than letting the caching allocator
+            # sit on them; across 46 layers that is the difference between
+            # fitting and not.
+            torch.cuda.empty_cache()
+            if n % 8 == 0 or n == len(mods):
+                phase(f"experts {n}/{len(mods)} layers")
         logger.info("k3_w1: filled %d MoE layers, %d expert slots from %s",
                     n, filler.filled, filler.dir)
         if n == 0:
