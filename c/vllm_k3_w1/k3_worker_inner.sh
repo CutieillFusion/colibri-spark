@@ -18,4 +18,4 @@ done
 echo "[worker] GCS reachable, joining"
 exec ray start --address="${HEAD_IP:-192.168.0.159}:6379" \
   --node-ip-address="$MYIP" --num-gpus=1 \
-  --object-store-memory 1000000000 --block
+  --object-store-memory 200000000 --block

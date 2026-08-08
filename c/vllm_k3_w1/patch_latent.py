@@ -27,11 +27,18 @@ stops using ReplicatedLinear, `verify()` reports that rather than silently
 reverting to bf16.
 """
 
+import os
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
 TARGETS = ("routed_expert_down_proj", "routed_expert_up_proj")
+# The MoE router is built the same way (quant_config=None) and is replicated on
+# every rank: 1.18 GB of the checkpoint, 1.18 GB per node. Included only when
+# K3_QUANT_GATE=1, because this is the routing decision -- int8 per row is a
+# safe 2x, int4 would not be.
+GATE = "block_sparse_moe.gate"
 _applied = False
 
 
@@ -47,7 +54,9 @@ def apply():
     class _MaybeQuantReplicatedLinear(base):
         def __init__(self, *args, **kwargs):
             prefix = kwargs.get("prefix", "")
-            if prefix.endswith(TARGETS) and kwargs.get("quant_config") is None:
+            want = prefix.endswith(TARGETS) or (
+                os.environ.get("K3_QUANT_GATE") == "1" and prefix.endswith(GATE))
+            if want and kwargs.get("quant_config") is None:
                 from vllm.config import get_current_vllm_config
 
                 cfg = get_current_vllm_config()

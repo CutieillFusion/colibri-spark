@@ -30,6 +30,7 @@ class K3W1Store:
         self.inter = inter            # moe intermediate, 3072
         self.experts_per_rank = experts_per_rank
         self._fh = None
+        self._fadv = hasattr(os, "posix_fadvise")
 
         self.e_w1p = inter * (hidden // 8)
         self.e_w1s = inter * (hidden // 32)
@@ -79,6 +80,18 @@ class K3W1Store:
         got = self._fh.readinto(raw)
         if got != self.slot:
             raise IOError(f"short read at slot {idx}: {got} != {self.slot}")
+        # Drop this slot from the page cache. A rank streams 106 GB through
+        # here, and every byte of it would otherwise become cache competing
+        # with the 119 GB of weights on a 121 GB box -- which is enough to
+        # push the node into thrashing during load. The engine avoids the same
+        # problem by opening the store O_DIRECT (kimi_k3.c:1447). Each slot is
+        # read exactly once, so there is nothing to lose by evicting it.
+        if self._fadv:
+            try:
+                os.posix_fadvise(self._fh.fileno(), idx * self.slot, self.slot,
+                                 os.POSIX_FADV_DONTNEED)
+            except OSError:
+                self._fadv = False
         buf = np.frombuffer(raw, dtype=np.uint8)
         o = self._offsets()
         H, I = self.hidden, self.inter

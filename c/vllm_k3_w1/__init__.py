@@ -4,7 +4,7 @@ Importing this package registers the `k3_w1` quantization method, after which
 vLLM accepts `--quantization k3_w1` for KimiK3ForConditionalGeneration.
 """
 
-from . import patch_hier_ar, patch_latent, patch_loader
+from . import patch_hier_ar, patch_latent, patch_loader, patch_shm
 from .dense_method import KimiK3DenseLinearMethod
 from .method import KimiK3OneBitConfig, KimiK3OneBitMoEMethod
 from .loader import K3W1Store
@@ -21,6 +21,7 @@ if _os.environ.get("K3_W1_DIR"):
     patch_loader.apply()
 
 # Off unless K3_HIER_AR=1; see patch_hier_ar for the measurements.
+patch_shm.apply()
 patch_hier_ar.apply()
 
 def register():
@@ -34,4 +35,4 @@ def register():
 
 
 __all__ = ["register", "KimiK3OneBitConfig", "KimiK3OneBitMoEMethod",
-           "KimiK3DenseLinearMethod", "K3W1Store", "patch_latent", "patch_loader", "patch_hier_ar"]
+           "KimiK3DenseLinearMethod", "K3W1Store", "patch_latent", "patch_loader", "patch_hier_ar", "patch_shm"]

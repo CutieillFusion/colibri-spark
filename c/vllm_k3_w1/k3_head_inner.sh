@@ -17,7 +17,7 @@ pip install -e /k3w1/vllm_k3_w1 --no-deps -q 2>&1 | tail -2
 python3 -c "import vllm_k3_w1; print('k3_w1 importable')" || exit 1
 
 ray start --head --node-ip-address="$HEAD_IP" --port=6379 --num-gpus=1 \
-  --disable-usage-stats --object-store-memory 1000000000 || exit 1
+  --disable-usage-stats --object-store-memory 200000000 || exit 1
 
 echo "[head] waiting for 4 ray nodes"
 for i in $(seq 180); do
@@ -43,4 +43,5 @@ exec python3 -m vllm.entrypoints.openai.api_server \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --gpu-memory-utilization "${K3_UTIL:-0.95}" \
   --enforce-eager \
+  --disable-custom-all-reduce \
   --host 0.0.0.0 --port 8000

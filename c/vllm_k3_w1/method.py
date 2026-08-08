@@ -135,12 +135,18 @@ class KimiK3OneBitConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "KimiK3OneBitConfig":
+        # --quantization k3_w1 hands us an empty dict, so the env is the only
+        # way to tune this from a launch script. Names mirror the engine's.
+        import os
+        def _e(k, d):
+            return int(os.environ.get(k, config.get(k.lower().replace("k3_", ""), d)))
         return cls(
-            amplitude=config.get("amplitude", DEFAULT_AMPLITUDE),
+            amplitude=float(os.environ.get(
+                "K3_W1_A", config.get("amplitude", DEFAULT_AMPLITUDE))),
             group_size=config.get("group_size", GROUP),
-            dense_bits=config.get("dense_bits", 4),
-            mla_bits=config.get("mla_bits", 8),
-            head_bits=config.get("head_bits", 8),
+            dense_bits=_e("K3_BITS", 4),
+            mla_bits=_e("K3_MLA_BITS", 8),
+            head_bits=_e("K3_HEAD_BITS", 8),
         )
 
     def get_quant_method(

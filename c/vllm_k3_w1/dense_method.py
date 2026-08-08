@@ -41,12 +41,17 @@ MLA_PROJ = re.compile(
     r"fused_qkv_a_proj)$"
 )
 HEAD_PROJ = re.compile(r"(^|\.)lm_head$")
+# The MoE router gets int8, never int4: it picks 16 of 896 experts, and a
+# coarse router changes which experts run rather than how well they run.
+GATE_PROJ = re.compile(r"block_sparse_moe\.gate$")
 
 
 def bits_for_prefix(prefix: str, dense_bits: int, mla_bits: int,
                     head_bits: int) -> int:
     if HEAD_PROJ.search(prefix):
         return head_bits
+    if GATE_PROJ.search(prefix):
+        return 8
     if MLA_PROJ.search(prefix):
         return mla_bits
     return dense_bits
