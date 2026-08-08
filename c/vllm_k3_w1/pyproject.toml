@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-k3-w1"
+version = "0.1.0"
+description = "Kimi-K3 1-bit expert + int4 dense quantization for vLLM"
+requires-python = ">=3.10"
+
+# vLLM calls general plugins from v1/engine/core.py:117 and
+# model_executor/models/registry.py:1506, i.e. inside every engine-core and
+# Ray worker process -- which is exactly where the k3_w1 registration and the
+# loader patches have to happen. Importing the module in the driver alone is
+# not enough once the executor is ray.
+[project.entry-points."vllm.general_plugins"]
+k3_w1 = "vllm_k3_w1:register"
+
+[tool.setuptools]
+packages = ["vllm_k3_w1"]
+package-dir = {vllm_k3_w1 = "."}
