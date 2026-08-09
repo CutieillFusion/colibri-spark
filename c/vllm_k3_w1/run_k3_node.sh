@@ -50,7 +50,7 @@ COMMON="--network host --gpus all --privileged --shm-size 16g -v /nas:/nas -v /t
 # PYTHONPATH carries both the vLLM build and our plugin; importing
 # vllm_k3_w1 is what registers k3_w1 and installs the loader patches, so it
 # has to happen inside every worker process, not just the driver.
-ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7 -e NCCL_IB_GID_INDEX=3 -e RAY_memory_monitor_refresh_ms=0 -e K3_W1_DIR=/k3store -e K3_W1_SHARD=$TPR/2 -e K3_W1_STAGE_LOCAL=1 -e VLLM_PP_LAYER_PARTITION=47,46 -e VLLM_PLUGINS=k3_w1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false -e K3_MODEL_DIR=$MODEL -e K3_ONE_GPU_PER_NODE=1 -e K3_BITS=${K3_BITS:-4} -e K3_GROUP=${K3_GROUP:-64} -e K3_MLA_BITS=${K3_MLA_BITS:-8} -e K3_HEAD_BITS=${K3_HEAD_BITS:-8} -e K3_HIER_AR=${K3_HIER_AR:-0} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
+ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7 -e NCCL_IB_GID_INDEX=3 -e RAY_memory_monitor_refresh_ms=0 -e RAY_gcs_rpc_server_reconnect_timeout_s=900 -e RAY_health_check_timeout_ms=120000 -e RAY_health_check_period_ms=30000 -e RAY_health_check_failure_threshold=20 -e RAY_raylet_heartbeat_timeout_milliseconds=120000 -e K3_W1_DIR=/k3store -e K3_W1_SHARD=$TPR/2 -e K3_W1_STAGE_LOCAL=1 -e VLLM_PP_LAYER_PARTITION=47,46 -e VLLM_PLUGINS=k3_w1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false -e K3_MODEL_DIR=$MODEL -e K3_ONE_GPU_PER_NODE=1 -e K3_BITS=${K3_BITS:-4} -e K3_GROUP=${K3_GROUP:-64} -e K3_MLA_BITS=${K3_MLA_BITS:-8} -e K3_HEAD_BITS=${K3_HEAD_BITS:-8} -e K3_HIER_AR=${K3_HIER_AR:-0} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
 
 sg docker -c "docker rm -f $NAME 2>/dev/null" >/dev/null 2>&1
 
@@ -61,7 +61,7 @@ sg docker -c "docker rm -f $NAME 2>/dev/null" >/dev/null 2>&1
 # needs.
 sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
 
-ENV="$ENV -e HEAD_IP=$HEAD_IP -e MYIP=$MYIP -e K3_MODEL=$MODEL -e K3_MAXLEN=${K3_MAXLEN:-8192} -e K3_MNBT=${K3_MNBT:-2048} -e K3_UTIL=${K3_UTIL:-0.95}"
+ENV="$ENV -e HEAD_IP=$HEAD_IP -e MYIP=$MYIP -e K3_MODEL=$MODEL -e K3_MAXLEN=${K3_MAXLEN:-8192} -e K3_MNBT=${K3_MNBT:-2048} -e K3_UTIL=${K3_UTIL:-0.95} -e K3_KV_BYTES=${K3_KV_BYTES:-}"
 
 if [ "$(hostname)" = spark1 ]; then
   echo "[head spark1] ray head + K3 TP=4 serve, store=$STORE, model=$MODEL"

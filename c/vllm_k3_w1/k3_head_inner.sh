@@ -53,6 +53,7 @@ exec python3 -m vllm.entrypoints.openai.api_server \
   --max-num-seqs 1 --max-num-batched-tokens "${K3_MNBT:-2048}" \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --gpu-memory-utilization "${K3_UTIL:-0.95}" \
+  ${K3_KV_BYTES:+--kv-cache-memory "$K3_KV_BYTES"} \
   --enforce-eager \
   --disable-custom-all-reduce \
   --host 0.0.0.0 --port 8000
