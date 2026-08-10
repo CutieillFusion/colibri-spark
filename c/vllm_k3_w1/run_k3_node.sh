@@ -45,12 +45,17 @@ MYIP=$(ip -o -4 addr show enP7s7 | grep -oE '192\.168\.0\.[0-9]+' | head -1)
 
 # One line, deliberately: this string is handed to `sg docker -c`, which
 # feeds it to sh -- embedded newlines become separate commands.
-COMMON="--network host --gpus all --privileged --shm-size 16g -v /nas:/nas -v /tmp/vllm-main:/work -v /tmp/k3w1:/k3w1 -v /home/norquistdylan/k3data:/k3data:ro -v $STORE:/k3store:ro -v /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
+# --memory caps the container via cgroup so a runaway load is killed INSIDE
+# it rather than starving the host. Without it spark1 wedges during expert
+# fill -- the kernel still answers ICMP but sshd cannot complete a handshake,
+# which has cost several reboots. 115g of 121 leaves the OS room to stay
+# reachable; --memory-swap equal to it disables container swap.
+COMMON="--memory=${K3_MEM_LIMIT:-115g} --memory-swap=${K3_MEM_LIMIT:-115g} --network host --gpus all --privileged --shm-size 16g -v /nas:/nas -v ${K3_WORK:-/home/norquistdylan/k3vllm}:/work -v ${K3_PLUGIN:-/home/norquistdylan/k3w1}:/k3w1 -v /home/norquistdylan/k3data:/k3data:ro -v $STORE:/k3store:ro -v /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1"
 
 # PYTHONPATH carries both the vLLM build and our plugin; importing
 # vllm_k3_w1 is what registers k3_w1 and installs the loader patches, so it
 # has to happen inside every worker process, not just the driver.
-ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7 -e NCCL_IB_GID_INDEX=3 -e RAY_memory_monitor_refresh_ms=0 -e RAY_gcs_rpc_server_reconnect_timeout_s=900 -e RAY_health_check_timeout_ms=120000 -e RAY_health_check_period_ms=30000 -e RAY_health_check_failure_threshold=20 -e RAY_raylet_heartbeat_timeout_milliseconds=120000 -e K3_W1_DIR=/k3store -e K3_W1_SHARD=$TPR/2 -e K3_W1_STAGE_LOCAL=1 -e VLLM_PP_LAYER_PARTITION=47,46 -e VLLM_PLUGINS=k3_w1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false -e K3_MODEL_DIR=$MODEL -e K3_ONE_GPU_PER_NODE=1 -e K3_BITS=${K3_BITS:-4} -e K3_GROUP=${K3_GROUP:-64} -e K3_MLA_BITS=${K3_MLA_BITS:-8} -e K3_HEAD_BITS=${K3_HEAD_BITS:-8} -e K3_HIER_AR=${K3_HIER_AR:-0} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
+ENV="-e PYTHONPATH=/work:/k3w1 -e VLLM_HOST_IP=$MYIP -e MASTER_ADDR=$HEAD_IP -e GLOO_SOCKET_IFNAME=enP7s7 -e NCCL_SOCKET_IFNAME=enP7s7 -e NCCL_IB_GID_INDEX=3 -e RAY_memory_monitor_refresh_ms=0 -e RAY_gcs_rpc_server_reconnect_timeout_s=900 -e RAY_health_check_timeout_ms=120000 -e RAY_health_check_period_ms=30000 -e RAY_health_check_failure_threshold=20 -e RAY_raylet_heartbeat_timeout_milliseconds=120000 -e K3_W1_DIR=/k3store -e K3_W1_SHARD=$TPR/2 -e K3_W1_STAGE_LOCAL=1 -e VLLM_PP_LAYER_PARTITION=47,46 -e VLLM_PLUGINS=k3_w1 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e PYTHONDONTWRITEBYTECODE=1 -e TOKENIZERS_PARALLELISM=false -e K3_MODEL_DIR=$MODEL -e K3_QUANT_EMBED=${K3_QUANT_EMBED:-1} -e K3_ONE_GPU_PER_NODE=1 -e K3_BITS=${K3_BITS:-4} -e K3_GROUP=${K3_GROUP:-64} -e K3_MLA_BITS=${K3_MLA_BITS:-8} -e K3_HEAD_BITS=${K3_HEAD_BITS:-8} -e K3_HIER_AR=${K3_HIER_AR:-0} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}"
 
 sg docker -c "docker rm -f $NAME 2>/dev/null" >/dev/null 2>&1
 
