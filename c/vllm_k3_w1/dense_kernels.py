@@ -237,9 +237,18 @@ def quantize_i4g(w: torch.Tensor, group_size: int = I4_GROUP):
 
 def quantize_i8(w: torch.Tensor):
     """[O, I] float -> ([O, I] int8, [O] f32). kimi_k3.c:1306-1314."""
-    s = (w.float().abs().amax(dim=1) / 127.0).clamp_min(1e-20)
-    q = torch.round(w.float() / s.unsqueeze(1)).clamp_(-127, 127).to(torch.int8)
-    return q.contiguous(), s.contiguous()
+    O, I = w.shape
+    q = torch.empty(O, I, dtype=torch.int8, device=w.device)
+    s = torch.empty(O, dtype=torch.float32, device=w.device)
+    step = max(1, min(O, (1 << 24) // max(1, I)))
+    for r0 in range(0, O, step):
+        r1 = min(O, r0 + step)
+        f = w[r0:r1].float()
+        sc = (f.abs().amax(dim=1) / 127.0).clamp_min(1e-20)
+        q[r0:r1] = torch.round(f / sc.unsqueeze(1)).clamp_(-127, 127).to(torch.int8)
+        s[r0:r1] = sc
+        del f, sc
+    return q, s
 
 
 def dequant_reference(qweight, scales, bits, group_size=I4_GROUP):

@@ -184,6 +184,42 @@ class KimiK3OneBitConfig(QuantizationConfig):
         return None
 
 
+def _stream_missing(layer, topk_ids):
+    """Fault non-resident experts into scratch slots; return the expert map.
+
+    Returns layer.expert_map untouched when everything is resident, so the
+    fully-resident path costs one attribute check. Otherwise a routed expert
+    whose local slot is past the resident boundary is read from the store into
+    a scratch slot and the returned map points at it -- the kernels index by
+    whatever the map says, so nothing downstream changes.
+    """
+    n_res = getattr(layer, "k3_resident", None)
+    emap = getattr(layer, "expert_map", None)
+    if n_res is None or emap is None or n_res >= layer.k3_num_experts:
+        return emap
+    loc = emap[topk_ids.reshape(-1).long()]
+    missed = torch.unique(loc[loc >= n_res])
+    if missed.numel() == 0:
+        return emap
+    store, ordinal = layer.k3_store, layer.k3_moe_ordinal
+    emap = emap.clone()
+    inter = layer.w13_qweight.shape[1] // 2
+    n_str = layer.k3_stream_slots
+    globals_ = topk_ids.reshape(-1).long()
+    for j, L in enumerate(missed.tolist()[:n_str]):
+        dst = n_res + j
+        s = store.read_slot(ordinal, L)
+        layer.w13_qweight[dst][:inter].copy_(torch.from_numpy(s["w1p"]))
+        layer.w13_qweight[dst][inter:].copy_(torch.from_numpy(s["w3p"]))
+        layer.w13_scales[dst][:inter].copy_(torch.from_numpy(s["w1s"]))
+        layer.w13_scales[dst][inter:].copy_(torch.from_numpy(s["w3s"]))
+        layer.w2_qweight[dst].copy_(torch.from_numpy(s["w2p"]))
+        layer.w2_scales[dst].copy_(torch.from_numpy(s["w2s"]))
+        # Point every global id that mapped to L at the scratch slot instead.
+        emap[globals_[loc == L]] = dst
+    return emap
+
+
 class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
     """Sign-bit expert GEMMs, dequantized inside a Triton grouped GEMM.
 
@@ -219,12 +255,27 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         # here would sit alongside 38 GB of not-yet-quantized bf16 dense --
         # 144 GB against ~122 available. Deferring costs nothing: the store is
         # read after load_weights either way.
+        # Tail streaming. K3_RESIDENT_EXPERTS caps how many of this rank's
+        # experts stay in memory; the rest are read from experts.w2 on demand
+        # into K3_STREAM_SLOTS scratch slots appended after the resident ones.
+        # The shortfall that blocks this cluster is ~2.4 GB of 106.4, so a ~2%
+        # tail covers it, and the engine's own measured curve says that costs
+        # little: 83% coverage still gave a 99.0% hit rate.
+        import os as _os
+        n_res = int(_os.environ.get("K3_RESIDENT_EXPERTS", "0")) or num_experts
+        n_res = max(1, min(num_experts, n_res))
+        n_str = 0 if n_res >= num_experts else \
+            max(1, int(_os.environ.get("K3_STREAM_SLOTS", "16")))
+        layer.k3_resident = n_res
+        layer.k3_stream_slots = n_str
+        layer.k3_num_experts = num_experts
+        slots = n_res + n_str
         layer.k3_expert_shapes = {
-            "w13_qweight": (num_experts, w13_rows, hidden_size // 8),
-            "w2_qweight": (num_experts, hidden_size,
+            "w13_qweight": (slots, w13_rows, hidden_size // 8),
+            "w2_qweight": (slots, hidden_size,
                            intermediate_size_per_partition // 8),
-            "w13_scales": (num_experts, w13_rows, hidden_size // GROUP),
-            "w2_scales": (num_experts, hidden_size,
+            "w13_scales": (slots, w13_rows, hidden_size // GROUP),
+            "w2_scales": (slots, hidden_size,
                           intermediate_size_per_partition // GROUP),
         }
         defer = _defer_experts()
@@ -255,6 +306,9 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_scales, extra_weight_attrs)
 
         layer.k3_amplitude = self.quant_config.amplitude
+        from .patch_loader import trace
+        trace(f"[create_weights] moe experts={num_experts} "
+              f"deferred={defer} hidden={hidden_size}")
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts):
         # No modular kernel, so no FusedMoEQuantConfig to hand one.
@@ -294,16 +348,17 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         top_k = topk_ids.shape[1]
         I = layer.w13_qweight.shape[1] // self.moe.w13_num_shards
         use_gemv = T <= GEMV_MAX_TOKENS
+        emap = _stream_missing(layer, topk_ids)
 
         if use_gemv:
             # No block-sorting pass at all: each (token, slot) program reads
             # its expert straight out of topk_ids.
             def gemm(a, packed, scale, out, tk, mul):
                 w1_gemv(a, packed, scale, topk_ids, topk_weights,
-                        layer.expert_map, out, tk, layer.k3_amplitude, mul)
+                        emap, out, tk, layer.k3_amplitude, mul)
         else:
             sorted_ids, expert_ids, npad = moe_align_block_size(
-                topk_ids, BLOCK_M, layer.global_num_experts, layer.expert_map
+                topk_ids, BLOCK_M, layer.global_num_experts, emap
             )
 
             def gemm(a, packed, scale, out, tk, mul):

@@ -112,9 +112,13 @@ def _rank_world() -> tuple[int, int]:
 def _global_ids_for(layer) -> list[int]:
     """Global expert ids this rank owns, in local-slot order."""
     emap = getattr(layer, "expert_map", None)
-    shapes = getattr(layer, "k3_expert_shapes", None)
-    n_local = (shapes["w13_qweight"][0] if shapes
-               else layer.w13_qweight.shape[0])
+    # The number this rank OWNS, not the parameter's first dim -- with tail
+    # streaming the tensor is resident+scratch, which is a different number.
+    n_local = getattr(layer, "k3_num_experts", None)
+    if n_local is None:
+        shapes = getattr(layer, "k3_expert_shapes", None)
+        n_local = (shapes["w13_qweight"][0] if shapes
+                   else layer.w13_qweight.shape[0])
     if emap is None:
         return list(range(n_local))
     ids = [-1] * n_local
@@ -143,6 +147,7 @@ def mem_avail_gb() -> float:
 
 def phase(tag: str):
     logger.info("k3_w1: [mem] %-28s MemAvailable %.1f GB", tag, mem_avail_gb())
+    trace(f"[phase] {tag}")
 
 
 def quantize_dense_now(model) -> int:
@@ -164,6 +169,12 @@ def quantize_dense_now(model) -> int:
                 not hasattr(mod, "k3_qweight"):
             qm.process_weights_after_loading(mod)
             n += 1
+            # Hand freed bf16 blocks back as we go; over 46 layers the
+            # caching allocator otherwise holds all of them.
+            if n % 16 == 0:
+                torch.cuda.empty_cache()
+                phase(f"dense quantized {n}")
+    torch.cuda.empty_cache()
     _drop_checkpoint_cache()
     return n
 
@@ -206,6 +217,30 @@ def materialize_experts(layer):
             p.data = torch.empty(shape, dtype=torch.uint8, device=p.data.device)
 
 
+_TRACE = {"fh": None}
+
+
+def trace(msg: str):
+    """Append to a host-visible file, flushed immediately.
+
+    Not via the logging module: vLLM reconfigures logging after our plugin
+    imports and drops added handlers (the earlier FileHandler produced an
+    empty directory and nothing else). And the process is SIGKILLed mid-fill,
+    so anything buffered is lost -- flush() on every line is the point, since
+    the last line before the kill is exactly the one that matters.
+    """
+    try:
+        if _TRACE["fh"] is None:
+            import socket
+            os.makedirs("/k3w1/logs", exist_ok=True)
+            _TRACE["fh"] = open(f"/k3w1/logs/fill-{socket.gethostname()}.log",
+                                "a", buffering=1)
+        _TRACE["fh"].write(f"{msg}  MemAvailable={mem_avail_gb():.1f} GB\n")
+        _TRACE["fh"].flush()
+    except OSError:
+        pass
+
+
 def fill_layer(filler: _Filler, layer, moe_ordinal: int):
     """Populate one RoutedExperts layer from the store."""
     materialize_experts(layer)
@@ -221,7 +256,19 @@ def fill_layer(filler: _Filler, layer, moe_ordinal: int):
                       else g_experts)
 
     ids = _global_ids_for(layer)
+    # Tail streaming: load only the resident prefix. The rest are faulted in
+    # per forward by _stream_missing, which needs the store handle and this
+    # layer's ordinal, so stash both.
+    n_res = getattr(layer, "k3_resident", len(ids))
+    layer.k3_store = st
+    layer.k3_moe_ordinal = moe_ordinal
+    if n_res < len(ids):
+        ids = ids[:n_res]
+    trace(f"layer {moe_ordinal:3d} start ({len(ids)} resident of "
+          f"{getattr(layer, 'k3_num_experts', len(ids))})")
     for slot, g in enumerate(ids):
+        if slot and slot % 64 == 0:
+            trace(f"layer {moe_ordinal:3d} expert {slot:4d}")
         s = st.read_slot(moe_ordinal, filler.local_to_store_index(g))
         w13p, w13s = layer.w13_qweight[slot], layer.w13_scales[slot]
         w13p[:inter].copy_(torch.from_numpy(s["w1p"]))
