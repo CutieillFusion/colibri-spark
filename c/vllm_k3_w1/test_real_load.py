@@ -71,7 +71,7 @@ def main():
 
     import vllm_k3_w1  # noqa: F401
     from vllm import LLM, SamplingParams
-    from vllm_k3_w1.loader import K3W1Store
+    from vllm_k3_w1.loader import K3W1Store, pack_scale_nibbles
 
     d = make_tiny(os.path.join(tempfile.gettempdir(), "k3-real"))
     print(f"tiny K3: {LAYERS} layers, {EXPERTS} experts, real weights\n")
@@ -99,13 +99,14 @@ def main():
         ordinal = li - 1                      # first_k_dense_replace = 1
         for slot in (0, min(3, EXPERTS - 1)):
             s = store.read_slot(ordinal, slot)
-            I = mod.w13_qweight.shape[1] // 2
-            got_w1 = mod.w13_qweight[slot][:I].cpu().numpy()
-            got_w3 = mod.w13_qweight[slot][I:].cpu().numpy()
+            inter = mod.w13_qweight.shape[1] // 2
+            got_w1 = mod.w13_qweight[slot][:inter].cpu().numpy()
+            got_w3 = mod.w13_qweight[slot][inter:].cpu().numpy()
             got_w2 = mod.w2_qweight[slot].cpu().numpy()
             got_s1 = mod.w13_scales[slot][:I].cpu().numpy()
             ok = ((got_w1 == s["w1p"]).all() and (got_w3 == s["w3p"]).all()
-                  and (got_w2 == s["w2p"]).all() and (got_s1 == s["w1s"]).all())
+                  and (got_w2 == s["w2p"]).all()
+                  and (got_s1 == pack_scale_nibbles(s["w1s"])).all())
             eq(f"layer {li} expert {slot} bytes match store", ok)
             checked += 1
     eq("checked at least one slot", checked > 0, f"{checked} slots")

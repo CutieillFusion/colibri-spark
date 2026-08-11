@@ -6,8 +6,8 @@ Format, matching c/backend_cuda_k3.cu:435-545 exactly:
     W[o, i] = a * 2^(scale[o, i//32] - 127) * (bit[o, i] ? +1 : -1)
 
 One sign bit per weight, LSB-first within each byte, in input-index order; one
-UE8M0 scale byte per group of 32 inputs; and a single global amplitude `a` that
-lives outside the checkpoint (our engine reads it from K3_W1_A, default 1.69).
+UE8M0 exponent per group of 32 inputs, stored in memory as a four-bit offset
+from 109; and a single global amplitude `a` that lives outside the checkpoint.
 `a` folds into the group scale, so it is applied once per row rather than per
 weight -- the same trick the CUDA kernel uses.
 
@@ -20,8 +20,10 @@ import torch
 import triton
 import triton.language as tl
 
+from .loader import SCALE_NIBBLE_BASE
+
 # Group size is fixed by the checkpoint: config.json declares group_size 32 and
-# scale_dtype uint8, and the 1-bit store inherits those scales byte-identically.
+# scale_dtype uint8. The loader losslessly packs the observed 109..124 range.
 GROUP = 32
 UE8M0_BIAS = 127
 
@@ -50,14 +52,16 @@ def _unpack_signs(packed_ptr, row_off, k_off, stride_o, BLOCK_O: tl.constexpr,
 @triton.jit
 def _load_scales(scale_ptr, row_off, k_off, stride_o, BLOCK_O: tl.constexpr,
                  BLOCK_K: tl.constexpr):
-    """UE8M0 bytes -> [BLOCK_O, BLOCK_K] float multipliers, expanded x32."""
+    """Packed UE8M0 nibbles -> float multipliers, expanded x32."""
     # Literal 32/127 rather than the module globals: Triton folds a literal
     # into a constexpr but not a captured Python global, and tl.arange /
     # broadcast_to both require constexpr extents.
     ng: tl.constexpr = BLOCK_K // 32
-    g_cols = tl.arange(0, ng)
-    ptrs = scale_ptr + row_off[:, None] * stride_o + (k_off // 32 + g_cols)[None, :]
-    e = tl.load(ptrs).to(tl.int32)
+    g_cols = k_off // 32 + tl.arange(0, ng)
+    ptrs = scale_ptr + row_off[:, None] * stride_o + (g_cols // 2)[None, :]
+    byte = tl.load(ptrs).to(tl.uint8)
+    e = ((byte >> ((g_cols & 1) * 4)[None, :]) & 15).to(tl.int32)
+    e += 109
     s = tl.exp2((e - 127).to(tl.float32))                 # [BO, ng]
     s = tl.broadcast_to(s[:, :, None], (BLOCK_O, ng, 32))
     return tl.reshape(s, (BLOCK_O, BLOCK_K))
@@ -299,13 +303,17 @@ def dequant_reference(packed: torch.Tensor, scale: torch.Tensor,
                       amplitude: float) -> torch.Tensor:
     """Slow, obviously-correct dequant. The kernels are checked against this.
 
-    packed [E, N, K/8] uint8, scale [E, N, K/32] uint8 -> [E, N, K] float32.
+    packed [E, N, K/8], scale [E, N, K/64] -> [E, N, K] float32.
     """
     E, N, kb = packed.shape
     K = kb * 8
     bits = ((packed.unsqueeze(-1) >> torch.arange(8, device=packed.device,
                                                   dtype=torch.uint8)) & 1)
     sign = bits.reshape(E, N, K).float() * 2.0 - 1.0
-    s = torch.exp2((scale.int() - UE8M0_BIAS).float())
+    lo = scale & 15
+    hi = scale >> 4
+    exponent = torch.stack((lo, hi), dim=-1).reshape(*scale.shape[:-1], -1)
+    exponent = exponent[..., : K // GROUP].int() + SCALE_NIBBLE_BASE
+    s = torch.exp2((exponent - UE8M0_BIAS).float())
     s = s.repeat_interleave(GROUP, dim=-1)
     return sign * s * amplitude

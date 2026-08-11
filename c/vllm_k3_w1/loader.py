@@ -22,6 +22,36 @@ import os
 import numpy as np
 import torch
 
+SCALE_NIBBLE_BASE = 109
+
+
+def pack_scale_nibbles(scale: np.ndarray) -> np.ndarray:
+    """Pack two UE8M0 exponents per byte without changing their values."""
+    if scale.shape[-1] % 2:
+        raise ValueError(
+            f"scale group dimension must be even, got {scale.shape[-1]}"
+        )
+    delta = scale.astype(np.int16) - SCALE_NIBBLE_BASE
+    lo = int(delta.min())
+    hi = int(delta.max())
+    if lo < 0 or hi > 15:
+        raise ValueError(
+            f"UE8M0 exponent outside lossless nibble range "
+            f"[{SCALE_NIBBLE_BASE}, {SCALE_NIBBLE_BASE + 15}]: "
+            f"got [{lo + SCALE_NIBBLE_BASE}, {hi + SCALE_NIBBLE_BASE}]"
+        )
+    return (delta[..., 0::2] | (delta[..., 1::2] << 4)).astype(np.uint8)
+
+
+def pack_slot_scales(slot: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Return a slot with its three scale tensors packed for the kernels."""
+    return {
+        **slot,
+        "w1s": pack_scale_nibbles(slot["w1s"]),
+        "w2s": pack_scale_nibbles(slot["w2s"]),
+        "w3s": pack_scale_nibbles(slot["w3s"]),
+    }
+
 
 class K3W1Store:
     def __init__(self, path: str, hidden: int, inter: int, experts_per_rank: int):
@@ -100,14 +130,14 @@ class K3W1Store:
                 self._fadv = False
         buf = np.frombuffer(raw, dtype=np.uint8)
         o = self._offsets()
-        H, I = self.hidden, self.inter
+        hidden, inter = self.hidden, self.inter
         return {
-            "w1p": buf[o[0]:o[1]].reshape(I, H // 8),
-            "w1s": buf[o[1]:o[2]].reshape(I, H // 32),
-            "w2p": buf[o[2]:o[3]].reshape(H, I // 8),
-            "w2s": buf[o[3]:o[4]].reshape(H, I // 32),
-            "w3p": buf[o[4]:o[5]].reshape(I, H // 8),
-            "w3s": buf[o[5]:].reshape(I, H // 32),
+            "w1p": buf[o[0]:o[1]].reshape(inter, hidden // 8),
+            "w1s": buf[o[1]:o[2]].reshape(inter, hidden // 32),
+            "w2p": buf[o[2]:o[3]].reshape(hidden, inter // 8),
+            "w2s": buf[o[3]:o[4]].reshape(hidden, inter // 32),
+            "w3p": buf[o[4]:o[5]].reshape(inter, hidden // 8),
+            "w3s": buf[o[5]:].reshape(inter, hidden // 32),
         }
 
     def fill_layer(self, layer, moe_layer: int, expert_ids: list[int] | None = None):
@@ -121,14 +151,14 @@ class K3W1Store:
         if len(ids) != n:
             raise ValueError(f"{len(ids)} expert ids for {n} local expert slots")
 
-        I = self.inter
+        inter = self.inter
         for slot_i, e in enumerate(ids):
-            s = self.read_slot(moe_layer, e)
+            s = pack_slot_scales(self.read_slot(moe_layer, e))
             w13p = layer.w13_qweight[slot_i]
             w13s = layer.w13_scales[slot_i]
-            w13p[:I].copy_(torch.from_numpy(s["w1p"]))
-            w13p[I:].copy_(torch.from_numpy(s["w3p"]))
-            w13s[:I].copy_(torch.from_numpy(s["w1s"]))
-            w13s[I:].copy_(torch.from_numpy(s["w3s"]))
+            w13p[:inter].copy_(torch.from_numpy(s["w1p"]))
+            w13p[inter:].copy_(torch.from_numpy(s["w3p"]))
+            w13s[:inter].copy_(torch.from_numpy(s["w1s"]))
+            w13s[inter:].copy_(torch.from_numpy(s["w3s"]))
             layer.w2_qweight[slot_i].copy_(torch.from_numpy(s["w2p"]))
             layer.w2_scales[slot_i].copy_(torch.from_numpy(s["w2s"]))

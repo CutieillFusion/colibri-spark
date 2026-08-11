@@ -7,10 +7,9 @@ needed -- import this module before constructing the engine and pass
 
 Why this exists: K3's checkpoint ships MXFP4 experts at 17,547,264 B each,
 which is 362 GB/node for our 224-expert shard against 121 GB of unified
-memory. The 1-bit store is 5,160,960 B/expert = 106 GB, the only format that
-is fully RAM-resident on a DGX Spark. Everything else about the model already
-runs on sm_121 (KDA decode and the MLA kv-cache fusions are compiled for
-12.0f; AttnRes falls back to Triton).
+memory. The raw 1-bit store is 5,160,960 B/expert; lossless nibble-packing of
+its 109..124 scale exponents makes the resident form 4,644,864 B/expert, or
+95.7 GB per rank. Everything else about the model already runs on sm_121.
 
 Format is exactly what c/backend_cuda_k3.cu runs -- see kernels.py. The one
 piece that is not in the checkpoint is the global amplitude `a`, which our
@@ -18,9 +17,10 @@ engine reads from K3_W1_A (default 1.69); it is carried here as a config
 field so a store packed with a different `a` stays self-describing.
 """
 
+import os
+import time
 from typing import Any
 
-import os
 import torch
 
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -50,6 +50,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from .dense_method import KimiK3DenseLinearMethod, bits_for_prefix
 from .embed_method import KimiK3EmbeddingMethod
 from .kernels import GROUP, situ_and_mul, w1_gemv, w1_grouped_gemm
+from .loader import pack_slot_scales
+
 
 def _defer_experts() -> bool:
     """Whether to allocate expert parameters empty and fill them later.
@@ -58,6 +60,7 @@ def _defer_experts() -> bool:
     a single-layer test where the peak does not matter.
     """
     import os
+
     return os.environ.get("K3_W1_EAGER_EXPERTS", "0") != "1"
 
 
@@ -89,13 +92,18 @@ class KimiK3OneBitConfig(QuantizationConfig):
     Everything else: int4-g64 with f32 scales, or int8 per row for the MLA
     projections and lm_head (dense_kernels.py). The checkpoint's `ignore` list
     exempts these from its own MXFP4, so they arrive bf16 -- 114.4 GB across
-    the model, which does not fit next to 106.4 GB of experts on a 121 GB
+    the model, which does not fit next to 95.7 GB of packed experts on a 121 GB
     node. They are quantized after loading rather than left alone.
     """
 
-    def __init__(self, amplitude: float = DEFAULT_AMPLITUDE,
-                 group_size: int = GROUP, dense_bits: int = 4,
-                 mla_bits: int = 8, head_bits: int = 8) -> None:
+    def __init__(
+        self,
+        amplitude: float = DEFAULT_AMPLITUDE,
+        group_size: int = GROUP,
+        dense_bits: int = 4,
+        mla_bits: int = 8,
+        head_bits: int = 8,
+    ) -> None:
         super().__init__()
         if group_size != GROUP:
             raise ValueError(
@@ -114,9 +122,11 @@ class KimiK3OneBitConfig(QuantizationConfig):
         self.head_bits = int(head_bits)
 
     def __repr__(self) -> str:
-        return (f"KimiK3OneBitConfig(amplitude={self.amplitude}, "
-                f"dense_bits={self.dense_bits}, mla_bits={self.mla_bits}, "
-                f"head_bits={self.head_bits})")
+        return (
+            f"KimiK3OneBitConfig(amplitude={self.amplitude}, "
+            f"dense_bits={self.dense_bits}, mla_bits={self.mla_bits}, "
+            f"head_bits={self.head_bits})"
+        )
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -140,11 +150,14 @@ class KimiK3OneBitConfig(QuantizationConfig):
         # --quantization k3_w1 hands us an empty dict, so the env is the only
         # way to tune this from a launch script. Names mirror the engine's.
         import os
+
         def _e(k, d):
             return int(os.environ.get(k, config.get(k.lower().replace("k3_", ""), d)))
+
         return cls(
-            amplitude=float(os.environ.get(
-                "K3_W1_A", config.get("amplitude", DEFAULT_AMPLITUDE))),
+            amplitude=float(
+                os.environ.get("K3_W1_A", config.get("amplitude", DEFAULT_AMPLITUDE))
+            ),
             group_size=config.get("group_size", GROUP),
             dense_bits=_e("K3_BITS", 4),
             mla_bits=_e("K3_MLA_BITS", 8),
@@ -162,6 +175,7 @@ class KimiK3OneBitConfig(QuantizationConfig):
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             VocabParallelEmbedding,
         )
+
         if isinstance(layer, VocabParallelEmbedding):
             if os.environ.get("K3_QUANT_EMBED", "1") == "1":
                 return KimiK3EmbeddingMethod()
@@ -171,53 +185,83 @@ class KimiK3OneBitConfig(QuantizationConfig):
             # leaving it in bf16 keeps it out of the numerics story.
             if "vision" in prefix or "mm_projector" in prefix:
                 return UnquantizedLinearMethod()
-            bits = bits_for_prefix(prefix, self.dense_bits, self.mla_bits,
-                                   self.head_bits)
+            bits = bits_for_prefix(
+                prefix, self.dense_bits, self.mla_bits, self.head_bits
+            )
             if bits >= 16:
                 return UnquantizedLinearMethod()
             # Group size is tunable because it is the broadest weight lever
             # left: g128 is 4.25 bits/weight against g64's 4.5, ~0.5 GB per
             # rank, and it applies to every int4 tensor at once.
             import os as _o
-            return KimiK3DenseLinearMethod(
-                bits, int(_o.environ.get("K3_GROUP", "64")))
+
+            return KimiK3DenseLinearMethod(bits, int(_o.environ.get("K3_GROUP", "64")))
         return None
 
 
-def _stream_missing(layer, topk_ids):
-    """Fault non-resident experts into scratch slots; return the expert map.
-
-    Returns layer.expert_map untouched when everything is resident, so the
-    fully-resident path costs one attribute check. Otherwise a routed expert
-    whose local slot is past the resident boundary is read from the store into
-    a scratch slot and the returned map points at it -- the kernels index by
-    whatever the map says, so nothing downstream changes.
-    """
+def _local_stream_misses(layer, topk_ids):
     n_res = getattr(layer, "k3_resident", None)
     emap = getattr(layer, "expert_map", None)
     if n_res is None or emap is None or n_res >= layer.k3_num_experts:
-        return emap
+        return torch.empty(0, dtype=torch.long, device=topk_ids.device)
     loc = emap[topk_ids.reshape(-1).long()]
-    missed = torch.unique(loc[loc >= n_res])
-    if missed.numel() == 0:
-        return emap
-    store, ordinal = layer.k3_store, layer.k3_moe_ordinal
-    emap = emap.clone()
-    inter = layer.w13_qweight.shape[1] // 2
+    return torch.unique(loc[loc >= n_res])
+
+
+def _load_stream_slots(layer, local_slots, active_only=False):
+    """Load local expert slots and build the map for one execution pass."""
+    n_res = layer.k3_resident
     n_str = layer.k3_stream_slots
-    globals_ = topk_ids.reshape(-1).long()
-    for j, L in enumerate(missed.tolist()[:n_str]):
+    if len(local_slots) > n_str:
+        raise RuntimeError(
+            f"k3_w1 needs {len(local_slots)} streamed experts for one MoE "
+            f"pass, but only {n_str} scratch slots are configured"
+        )
+    store, ordinal = layer.k3_store, layer.k3_moe_ordinal
+    base_map = layer.expert_map
+    emap = torch.full_like(base_map, -1) if active_only else base_map.clone()
+    inter = layer.w13_qweight.shape[1] // 2
+    started = time.perf_counter()
+    for j, local_slot in enumerate(local_slots):
         dst = n_res + j
-        s = store.read_slot(ordinal, L)
+        s = pack_slot_scales(store.read_slot(ordinal, local_slot))
         layer.w13_qweight[dst][:inter].copy_(torch.from_numpy(s["w1p"]))
         layer.w13_qweight[dst][inter:].copy_(torch.from_numpy(s["w3p"]))
         layer.w13_scales[dst][:inter].copy_(torch.from_numpy(s["w1s"]))
         layer.w13_scales[dst][inter:].copy_(torch.from_numpy(s["w3s"]))
         layer.w2_qweight[dst].copy_(torch.from_numpy(s["w2p"]))
         layer.w2_scales[dst].copy_(torch.from_numpy(s["w2s"]))
-        # Point every global id that mapped to L at the scratch slot instead.
-        emap[globals_[loc == L]] = dst
+        emap[base_map == local_slot] = dst
+    elapsed = time.perf_counter() - started
+    previous = getattr(layer, "k3_stream_loads", 0)
+    layer.k3_stream_loads = previous + len(local_slots)
+    layer.k3_stream_seconds = getattr(layer, "k3_stream_seconds", 0.0) + elapsed
+    if previous == 0 or previous // 256 != layer.k3_stream_loads // 256:
+        slot_bytes = sum(
+            tensor[0].numel()
+            for tensor in (
+                layer.w13_qweight,
+                layer.w13_scales,
+                layer.w2_qweight,
+                layer.w2_scales,
+            )
+        )
+        from .patch_loader import trace
+
+        trace(
+            f"[stream] layer={ordinal} loads={layer.k3_stream_loads} "
+            f"bytes={layer.k3_stream_loads * slot_bytes} "
+            f"seconds={layer.k3_stream_seconds:.3f}"
+        )
     return emap
+
+
+def _stream_missing(layer, topk_ids):
+    """Load all misses for a single-pass routed-expert execution."""
+    missed = _local_stream_misses(layer, topk_ids)
+    if missed.numel() == 0:
+        return getattr(layer, "expert_map", None)
+    return _load_stream_slots(layer, missed.tolist())
 
 
 class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
@@ -251,39 +295,45 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
 
         # Allocated EMPTY and materialized later, by patch_loader, once the
         # dense weights have been quantized. vLLM allocates every parameter
-        # before loading anything, so holding the real 106.4 GB of experts
+        # before loading anything, so holding the real 95.7 GB of experts
         # here would sit alongside 38 GB of not-yet-quantized bf16 dense --
         # 144 GB against ~122 available. Deferring costs nothing: the store is
         # read after load_weights either way.
         # Tail streaming. K3_RESIDENT_EXPERTS caps how many of this rank's
         # experts stay in memory; the rest are read from experts.w2 on demand
         # into K3_STREAM_SLOTS scratch slots appended after the resident ones.
-        # The shortfall that blocks this cluster is ~2.4 GB of 106.4, so a ~2%
-        # tail covers it, and the engine's own measured curve says that costs
-        # little: 83% coverage still gave a 99.0% hit rate.
+        # Below full residency, the tail is read on demand into stream slots.
+        # Full residency fits because scales are packed losslessly in memory.
         import os as _os
+
         n_res = int(_os.environ.get("K3_RESIDENT_EXPERTS", "0")) or num_experts
         n_res = max(1, min(num_experts, n_res))
-        n_str = 0 if n_res >= num_experts else \
-            max(1, int(_os.environ.get("K3_STREAM_SLOTS", "16")))
+        n_str = (
+            0
+            if n_res >= num_experts
+            else max(1, int(_os.environ.get("K3_STREAM_SLOTS", "16")))
+        )
         layer.k3_resident = n_res
         layer.k3_stream_slots = n_str
         layer.k3_num_experts = num_experts
         slots = n_res + n_str
         layer.k3_expert_shapes = {
             "w13_qweight": (slots, w13_rows, hidden_size // 8),
-            "w2_qweight": (slots, hidden_size,
-                           intermediate_size_per_partition // 8),
-            "w13_scales": (slots, w13_rows, hidden_size // GROUP),
-            "w2_scales": (slots, hidden_size,
-                          intermediate_size_per_partition // GROUP),
+            "w2_qweight": (slots, hidden_size, intermediate_size_per_partition // 8),
+            "w13_scales": (slots, w13_rows, hidden_size // (2 * GROUP)),
+            "w2_scales": (
+                slots,
+                hidden_size,
+                intermediate_size_per_partition // (2 * GROUP),
+            ),
         }
         defer = _defer_experts()
 
         def _mk(shape):
             return torch.nn.Parameter(
                 torch.empty(0 if defer else shape, dtype=torch.uint8),
-                requires_grad=False)
+                requires_grad=False,
+            )
 
         # Packed sign bits: 8 weights per byte, input-index order, LSB first.
         w13_qweight = _mk(layer.k3_expert_shapes["w13_qweight"])
@@ -294,9 +344,9 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
 
-        # UE8M0 exponents, kept as raw bytes rather than materialized floats:
-        # one byte per 32 inputs is 1/4 the memory of an fp16 scale and the
-        # kernel does the exp2 anyway.
+        # The stores use one UE8M0 byte per 32 inputs, but every real exponent
+        # is in 109..124. Keep two lossless four-bit offsets per byte; the
+        # kernel restores the base before exp2.
         w13_scales = _mk(layer.k3_expert_shapes["w13_scales"])
         layer.register_parameter("w13_scales", w13_scales)
         set_weight_attrs(w13_scales, extra_weight_attrs)
@@ -307,8 +357,11 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
 
         layer.k3_amplitude = self.quant_config.amplitude
         from .patch_loader import trace
-        trace(f"[create_weights] moe experts={num_experts} "
-              f"deferred={defer} hidden={hidden_size}")
+
+        trace(
+            f"[create_weights] moe experts={num_experts} "
+            f"deferred={defer} hidden={hidden_size}"
+        )
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts):
         # No modular kernel, so no FusedMoEQuantConfig to hand one.
@@ -344,27 +397,121 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
         return self._forward_routed(layer, x, topk_weights, topk_ids)
 
     def _forward_routed(self, layer, x, topk_weights, topk_ids) -> torch.Tensor:
+        token_chunk = max(0, int(os.environ.get("K3_MOE_TOKEN_CHUNK", "0")))
+        fully_resident = layer.k3_resident >= layer.k3_num_experts
+        if fully_resident and token_chunk and x.shape[0] > token_chunk:
+            # Bound the T*top_k MoE temporaries without shrinking vLLM's
+            # attention prefill chunk. Restrict this to full residency: token-
+            # outer chunking with a streamed tail would reread that tail once
+            # per chunk instead of once per layer invocation.
+            output = torch.empty_like(x)
+            for start in range(0, x.shape[0], token_chunk):
+                end = min(start + token_chunk, x.shape[0])
+                output[start:end].copy_(
+                    self._forward_routed(
+                        layer,
+                        x[start:end],
+                        topk_weights[start:end],
+                        topk_ids[start:end],
+                    )
+                )
+            return output
+
+        missed = _local_stream_misses(layer, topk_ids)
+        n_str = getattr(layer, "k3_stream_slots", 0)
+        if missed.numel() <= n_str:
+            emap = _stream_missing(layer, topk_ids)
+            return self._forward_routed_chunk(layer, x, topk_weights, topk_ids, emap)
+
+        base_map = layer.expert_map
+        resident_map = base_map.clone()
+        resident_map[resident_map >= layer.k3_resident] = -1
+        local_slots = base_map[topk_ids.long()]
+        has_resident = torch.any(
+            (local_slots >= 0) & (local_slots < layer.k3_resident)
+        ).item()
+        if has_resident:
+            output_pairs = self._forward_routed_chunk(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                resident_map,
+                reduce=False,
+            )
+        else:
+            output_pairs = torch.zeros(
+                (x.shape[0], topk_ids.shape[1], x.shape[1]),
+                dtype=x.dtype,
+                device=x.device,
+            )
+
+        missed_slots = missed.tolist()
+        for start in range(0, len(missed_slots), n_str):
+            active_map = _load_stream_slots(
+                layer, missed_slots[start : start + n_str], active_only=True
+            )
+            self._forward_routed_chunk(
+                layer,
+                x,
+                topk_weights,
+                topk_ids,
+                active_map,
+                reduce=False,
+                pairs_out=output_pairs,
+            )
+        return output_pairs.sum(dim=1)
+
+    def _forward_routed_chunk(
+        self,
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        emap,
+        reduce=True,
+        pairs_out=None,
+    ) -> torch.Tensor:
         T, H = x.shape
         top_k = topk_ids.shape[1]
-        I = layer.w13_qweight.shape[1] // self.moe.w13_num_shards
+        intermediate_size = layer.w13_qweight.shape[1] // self.moe.w13_num_shards
         use_gemv = T <= GEMV_MAX_TOKENS
-        emap = _stream_missing(layer, topk_ids)
-
         if use_gemv:
             # No block-sorting pass at all: each (token, slot) program reads
             # its expert straight out of topk_ids.
             def gemm(a, packed, scale, out, tk, mul):
-                w1_gemv(a, packed, scale, topk_ids, topk_weights,
-                        emap, out, tk, layer.k3_amplitude, mul)
+                w1_gemv(
+                    a,
+                    packed,
+                    scale,
+                    topk_ids,
+                    topk_weights,
+                    emap,
+                    out,
+                    tk,
+                    layer.k3_amplitude,
+                    mul,
+                )
         else:
             sorted_ids, expert_ids, npad = moe_align_block_size(
                 topk_ids, BLOCK_M, layer.global_num_experts, emap
             )
 
             def gemm(a, packed, scale, out, tk, mul):
-                w1_grouped_gemm(a, packed, scale, sorted_ids, expert_ids, npad,
-                                topk_weights, out, tk, layer.k3_amplitude, mul,
-                                block_m=BLOCK_M)
+                w1_grouped_gemm(
+                    a,
+                    packed,
+                    scale,
+                    sorted_ids,
+                    expert_ids,
+                    npad,
+                    topk_weights,
+                    out,
+                    tk,
+                    layer.k3_amplitude,
+                    mul,
+                    block_m=BLOCK_M,
+                )
 
         # gate/up, then SITU, then down. The routing weight is applied on the
         # down GEMM (not the up) so it multiplies the post-activation value,
@@ -376,17 +523,37 @@ class KimiK3OneBitMoEMethod(FusedMoEMethodBase):
 
         act = layer.activation
         if act == MoEActivation.SITU and self.moe.activation_situ_beta is not None:
-            h = torch.empty((T * top_k, I), dtype=x.dtype, device=x.device)
-            apply_moe_activation(act, h, inter,
-                                 activation_config=self._act_config())
+            h = torch.empty(
+                (T * top_k, intermediate_size), dtype=x.dtype, device=x.device
+            )
+            apply_moe_activation(act, h, inter, activation_config=self._act_config())
         else:
             h = situ_and_mul(
-                inter, self.moe.activation_situ_beta or 1.0,
+                inter,
+                self.moe.activation_situ_beta or 1.0,
                 self.moe.activation_situ_linear_beta,
             )
+        # At the deployment prefill size, `inter` is 1.50 GiB. It is dead
+        # once SITU has produced `h`; releasing it here lets the CUDA allocator
+        # reuse that block for the down projection instead of keeping all three
+        # MoE temporaries live together.
+        del inter
 
         # top_k=1 on the down GEMM: `h` already has one row per (token, slot),
         # so the row index is the pair index rather than the token index.
-        down = torch.zeros((T * top_k, H), dtype=x.dtype, device=x.device)
+        if pairs_out is None:
+            down = torch.zeros((T * top_k, H), dtype=x.dtype, device=x.device)
+        else:
+            if pairs_out.shape != (T, top_k, H):
+                raise ValueError(
+                    f"pairs_out has shape {tuple(pairs_out.shape)}, expected "
+                    f"{(T, top_k, H)}"
+                )
+            # Resident and streamed maps cover disjoint pair positions. The
+            # destination starts at zero, so each pass can write its positions
+            # in place without a second full pair tensor or a BF16 add.
+            down = pairs_out.view(T * top_k, H)
         gemm(h, layer.w2_qweight, layer.w2_scales, down, 1, True)
-        return down.view(T, top_k, H).sum(dim=1)
+        del h
+        pairs = down.view(T, top_k, H)
+        return pairs.sum(dim=1) if reduce else pairs

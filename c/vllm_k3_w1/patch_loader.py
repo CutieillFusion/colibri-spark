@@ -23,7 +23,7 @@ import torch
 
 from vllm.logger import init_logger
 
-from .loader import K3W1Store
+from .loader import K3W1Store, pack_slot_scales
 
 logger = init_logger(__name__)
 
@@ -155,9 +155,9 @@ def quantize_dense_now(model) -> int:
 
     Ordering is the whole point. vLLM's sequence is create_weights for every
     parameter, then load, then process_weights_after_loading. Left alone that
-    means 38 GB of bf16 dense is still resident when the 106.4 GB of experts
-    appear -- 144 GB against ~122. Quantizing dense here drops it to 13 GB
-    first, so the peak is 119.4 GB instead. vLLM's own later call is a no-op
+    means 38 GB of bf16 dense is still resident when the 95.7 GB of packed
+    experts appear. Quantizing dense here drops it to 13 GB first. vLLM's own
+    later call is a no-op
     because the bf16 weight is already gone.
     """
     from .dense_method import KimiK3DenseLinearMethod
@@ -183,7 +183,7 @@ def _drop_checkpoint_cache():
     """Evict the mmapped safetensors from page cache once dense is quantized.
 
     The checkpoint is 113.5 GB and vLLM maps it; those pages stay resident and
-    compete with the 106.4 GB of experts allocated immediately afterwards on a
+    compete with the 95.7 GB of experts allocated immediately afterwards on a
     121 GB box. They are not needed again -- every dense tensor has already
     been read and quantized. Without this the node thrashes to the point of
     dropping ssh.
@@ -232,9 +232,10 @@ def trace(msg: str):
     try:
         if _TRACE["fh"] is None:
             import socket
-            os.makedirs("/k3w1/logs", exist_ok=True)
-            _TRACE["fh"] = open(f"/k3w1/logs/fill-{socket.gethostname()}.log",
-                                "a", buffering=1)
+            d = os.environ.get("K3_LOG_DIR", "/k3w1/logs")
+            os.makedirs(d, exist_ok=True)
+            path = f"{d}/fill-{socket.gethostname()}-{os.getpid()}.log"
+            _TRACE["fh"] = open(path, "a", buffering=1)
         _TRACE["fh"].write(f"{msg}  MemAvailable={mem_avail_gb():.1f} GB\n")
         _TRACE["fh"].flush()
     except OSError:
@@ -269,7 +270,9 @@ def fill_layer(filler: _Filler, layer, moe_ordinal: int):
     for slot, g in enumerate(ids):
         if slot and slot % 64 == 0:
             trace(f"layer {moe_ordinal:3d} expert {slot:4d}")
-        s = st.read_slot(moe_ordinal, filler.local_to_store_index(g))
+        s = pack_slot_scales(
+            st.read_slot(moe_ordinal, filler.local_to_store_index(g))
+        )
         w13p, w13s = layer.w13_qweight[slot], layer.w13_scales[slot]
         w13p[:inter].copy_(torch.from_numpy(s["w1p"]))
         w13p[inter:].copy_(torch.from_numpy(s["w3p"]))

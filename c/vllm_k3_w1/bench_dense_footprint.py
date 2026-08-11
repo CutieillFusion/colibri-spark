@@ -170,11 +170,11 @@ def main():
           f"(tensor bytes {qb / 1e9:.1f} GB)")
     print(f"    transient peak       {base - peak:7.1f} GB")
 
-    exp = 224 * 92 * 5160960 / 1e9
+    exp = 224 * 92 * 4644864 / 1e9
     dense = base - after_q
-    print(f"\nper-node budget")
+    print("\nper-node budget")
     print(f"  dense (measured)       {dense:7.1f} GB")
-    print(f"  experts 1-bit, 224x92  {exp:7.1f} GB")
+    print(f"  experts 1-bit packed    {exp:7.1f} GB")
     print(f"  {'-' * 32}")
     print(f"  weights total          {dense + exp:7.1f} GB")
     print(f"  MemAvailable (idle)    {base:7.1f} GB")

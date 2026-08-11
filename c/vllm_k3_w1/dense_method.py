@@ -6,7 +6,7 @@ experts, but the checkpoint's `ignore` list exempts self_attn, shared_experts,
 the dense MLP and lm_head from quantization entirely, so those arrive as bf16
 -- 114.4 GB across the model, roughly 38 GB per node at TP=4 once attention
 and shared experts shard and the latent projections replicate. Against 121 GB
-of unified memory with 106.4 GB of experts already resident, that does not
+of unified memory with 95.7 GB of packed experts already resident, that does not
 fit. Our own engine avoids it by quantizing at load time (kimi_k3.c:23), and
 this is the same thing inside vLLM.
 
