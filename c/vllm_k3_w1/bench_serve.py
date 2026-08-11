@@ -1,40 +1,81 @@
 #!/usr/bin/env python3
-"""Prefill and decode timing for the K3 vLLM server, B=1, across contexts.
-
-Separates the two phases the way they actually cost: TTFT is prefill (plus one
-decode step), and the mean inter-token gap after that is decode. Streaming, so
-the split is measured rather than inferred from a total.
-
-Dependency-free on purpose -- this runs inside the serving container.
-
-Usage:
-    python3 bench_serve.py [--host H] [--port P] [--ctx 128,512,2048,8192]
-                           [--gen 32] [--reps 2]
-"""
+"""Exact-token prefill and decode timing for the K3 vLLM server."""
 
 import argparse
+import csv
 import json
+import math
 import statistics
 import time
 import urllib.request
+from pathlib import Path
+
+BASE_TEXT = (
+    "The history of computing is a history of abstraction. Each layer hides "
+    "the one beneath it, and every leak in that abstraction becomes a bug "
+    "someone must eventually understand. Databases index records so queries "
+    "remain predictable as the stored collection grows. "
+)
+
+
+def post_json(host, port, path, body, timeout=1800):
+    data = json.dumps(body).encode()
+    request = urllib.request.Request(
+        f"http://{host}:{port}{path}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def base_tokens(host, port, model):
+    response = post_json(
+        host,
+        port,
+        "/tokenize",
+        {
+            "model": model,
+            "prompt": BASE_TEXT,
+            "add_special_tokens": False,
+        },
+    )
+    tokens = response["tokens"]
+    if not tokens:
+        raise RuntimeError("tokenizer returned no tokens for benchmark text")
+    return tokens
+
+
+def exact_prompt(tokens, target):
+    return (tokens * math.ceil(target / len(tokens)))[:target]
 
 
 def post_stream(host, port, prompt, max_tokens, model="kimi-k3"):
-    """Returns (ttft, [inter-token gaps], text, n_tokens)."""
-    body = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "stream": True,
-    }).encode()
-    req = urllib.request.Request(
-        f"http://{host}:{port}/v1/completions", data=body,
-        headers={"Content-Type": "application/json"})
-    t0 = time.perf_counter()
-    ttft, prev, gaps, out = None, None, [], []
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        for raw in r:
+    body = json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "seed": 0,
+            "ignore_eos": True,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    ).encode()
+    request = urllib.request.Request(
+        f"http://{host}:{port}/v1/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    started = time.perf_counter()
+    ttft = None
+    previous = None
+    gaps = []
+    output = []
+    usage = {}
+    with urllib.request.urlopen(request, timeout=86400 * 30) as response:
+        for raw in response:
             line = raw.decode().strip()
             if not line.startswith("data:"):
                 continue
@@ -42,62 +83,121 @@ def post_stream(host, port, prompt, max_tokens, model="kimi-k3"):
             if payload == "[DONE]":
                 break
             try:
-                d = json.loads(payload)
+                event = json.loads(payload)
             except json.JSONDecodeError:
                 continue
-            tok = d["choices"][0].get("text", "")
-            if tok == "":
+            if event.get("usage"):
+                usage = event["usage"]
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            text = choices[0].get("text", "")
+            if not text:
                 continue
             now = time.perf_counter()
             if ttft is None:
-                ttft = now - t0
-            else:
-                gaps.append(now - prev)
-            prev = now
-            out.append(tok)
-    return ttft, gaps, "".join(out), len(out)
+                ttft = now - started
+            elif previous is not None:
+                gaps.append(now - previous)
+            previous = now
+            output.append(text)
+    elapsed = time.perf_counter() - started
+    return {
+        "ttft_s": ttft,
+        "elapsed_s": elapsed,
+        "gaps_s": gaps,
+        "text": "".join(output),
+        "usage": usage,
+    }
 
 
-def make_prompt(tok_target):
-    """Roughly `tok_target` tokens of ordinary prose, deterministic."""
-    base = ("The history of computing is a history of abstraction. Each layer "
-            "hides the one beneath it, and every leak in that abstraction "
-            "becomes a bug someone must eventually understand. ")
-    # ~40 tokens per repetition; overshoot slightly and let the server truncate
-    # nothing -- we report the server's own prompt token count.
-    return "Summarize the following.\n\n" + base * max(1, tok_target // 38)
+def write_results(path, rows):
+    if not path:
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(rows, indent=2) + "\n")
+    csv_path = target.with_suffix(".csv")
+    fields = [
+        "requested_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "rep",
+        "ttft_s",
+        "prefill_tok_s",
+        "decode_ms_tok",
+        "decode_tok_s",
+        "elapsed_s",
+        "text_prefix",
+    ]
+    with csv_path.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows({key: row.get(key) for key in fields} for row in rows)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--ctx", default="128,512,2048,8192")
-    ap.add_argument("--gen", type=int, default=32)
-    ap.add_argument("--reps", type=int, default=2)
-    ap.add_argument("--model", default="kimi-k3")
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--ctx",
+        default="128,512,2048,8192,32768,131072,524288,1048544",
+    )
+    parser.add_argument("--gen", type=int, default=32)
+    parser.add_argument("--reps", type=int, default=2)
+    parser.add_argument("--long-reps", type=int, default=1)
+    parser.add_argument("--long-threshold", type=int, default=524288)
+    parser.add_argument("--model", default="kimi-k3")
+    parser.add_argument("--output", default="")
+    args = parser.parse_args()
 
-    print(f"{'ctx':>7} {'rep':>4} {'TTFT s':>9} {'prefill tok/s':>14} "
-          f"{'decode ms/tok':>14} {'decode tok/s':>13}")
-    rows = {}
-    for ctx in [int(x) for x in a.ctx.split(",")]:
-        p = make_prompt(ctx)
-        for rep in range(a.reps):
-            ttft, gaps, text, n = post_stream(a.host, a.port, p, a.gen, a.model)
+    seed_tokens = base_tokens(args.host, args.port, args.model)
+    rows = []
+    print(
+        f"{'ctx':>8} {'rep':>4} {'TTFT s':>10} {'prefill tok/s':>14} "
+        f"{'decode ms/tok':>14} {'decode tok/s':>13}"
+    )
+    for context in [int(value) for value in args.ctx.split(",")]:
+        repetitions = args.long_reps if context >= args.long_threshold else args.reps
+        prompt = exact_prompt(seed_tokens, context)
+        for rep in range(repetitions):
+            result = post_stream(args.host, args.port, prompt, args.gen, args.model)
+            ttft = result["ttft_s"]
             if ttft is None:
-                print(f"{ctx:>7} {rep:>4}   no tokens returned")
-                continue
-            dec = statistics.median(gaps) if gaps else float("nan")
-            print(f"{ctx:>7} {rep:>4} {ttft:>9.3f} {ctx / ttft:>14.1f} "
-                  f"{dec * 1e3:>14.1f} {1 / dec if gaps else 0:>13.2f}")
-            # First rep warms caches; report the last.
-            rows[ctx] = (ttft, dec, text, n)
-    print("\nsummary (last rep per context)")
-    print(f"{'ctx':>7} {'TTFT s':>9} {'decode tok/s':>13}   first 60 chars")
-    for ctx, (ttft, dec, text, n) in sorted(rows.items()):
-        print(f"{ctx:>7} {ttft:>9.3f} {1 / dec if dec == dec else 0:>13.2f}   "
-              f"{text[:60]!r}")
+                raise RuntimeError(f"no tokens returned for context {context}")
+            usage = result["usage"]
+            prompt_tokens = int(usage.get("prompt_tokens", context))
+            completion_tokens = int(
+                usage.get("completion_tokens", len(result["gaps_s"]) + 1)
+            )
+            if prompt_tokens != context:
+                raise RuntimeError(
+                    f"requested {context} prompt tokens, server used {prompt_tokens}"
+                )
+            gaps = result["gaps_s"]
+            decode = statistics.median(gaps) if gaps else float("nan")
+            row = {
+                "requested_tokens": context,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "rep": rep,
+                "ttft_s": ttft,
+                "prefill_tok_s": prompt_tokens / ttft,
+                "decode_ms_tok": decode * 1000,
+                "decode_tok_s": 1 / decode if gaps else 0,
+                "elapsed_s": result["elapsed_s"],
+                "text_prefix": result["text"][:80],
+            }
+            rows.append(row)
+            write_results(args.output, rows)
+            print(
+                f"{context:>8} {rep:>4} {ttft:>10.3f} "
+                f"{row['prefill_tok_s']:>14.2f} "
+                f"{row['decode_ms_tok']:>14.2f} "
+                f"{row['decode_tok_s']:>13.3f}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
