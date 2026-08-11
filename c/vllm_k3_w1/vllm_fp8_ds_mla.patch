@@ -1,0 +1,323 @@
+From e46a1de1e79f4a2b7888118daaaf779c2ca299c3 Mon Sep 17 00:00:00 2001
+From: Dylan Norquist <norquistdylan@gmail.com>
+Date: Tue, 11 Aug 2026 18:11:13 -0500
+Subject: [PATCH] mla: decode fp8_ds_mla cache with Triton
+
+Teach the dense Triton MLA backend to allocate and decode Kimi-K3's 656-byte block-scaled cache while preserving BF16 RoPE values. Cover the packed cache geometry and decode numerics.
+
+Co-authored-by: OpenAI Codex <codex@openai.com>
+Signed-off-by: Dylan Norquist <norquistdylan@gmail.com>
+---
+ .../attention/test_triton_decode_attention.py | 103 ++++++++++++++++++
+ vllm/v1/attention/backends/mla/triton_mla.py  |  19 +++-
+ .../attention/ops/triton_decode_attention.py  |  54 +++++++--
+ 3 files changed, 163 insertions(+), 13 deletions(-)
+
+diff --git a/tests/kernels/attention/test_triton_decode_attention.py b/tests/kernels/attention/test_triton_decode_attention.py
+index b4b17d9b5..04d662ed0 100644
+--- a/tests/kernels/attention/test_triton_decode_attention.py
++++ b/tests/kernels/attention/test_triton_decode_attention.py
+@@ -6,11 +6,21 @@ import torch
+ 
+ from vllm.platforms import current_platform
+ from vllm.utils.math_utils import cdiv
++from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
+ from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+ 
+ DEVICE_TYPE = current_platform.device_type
+ 
+ 
++def test_triton_mla_fp8_ds_mla_cache_shape():
++    """The packed layout must expose all 656 bytes to the model runner."""
++    assert TritonMLABackend.get_kv_cache_shape(2, 16, 1, 576, "fp8_ds_mla") == (
++        2,
++        16,
++        656,
++    )
++
++
+ @pytest.mark.parametrize("B", [3, 5])
+ @pytest.mark.parametrize("L", [1027, 1025])
+ @pytest.mark.parametrize("H_Q", [32])
+@@ -233,6 +243,99 @@ def test_decode_attention_fp8(B, L, H_Q, H_KV, D_QK, D_V, CACHE_SIZE, PAGE_SIZE)
+     torch.testing.assert_close(o_ref, o_fp8, atol=5e-1, rtol=1e-2)
+ 
+ 
++@pytest.mark.skipif(not current_platform.is_cuda(), reason="fp8_ds_mla requires CUDA")
++def test_decode_attention_fp8_ds_mla():
++    """Packed per-tile scales and BF16 RoPE must match a dequantized cache."""
++    torch.manual_seed(0)
++    batch_size = 2
++    num_heads = 16
++    seq_len = 31
++    page_size = 16
++    num_pages = 4
++    num_kv_splits = 2
++
++    latent = torch.randn(
++        num_pages,
++        page_size,
++        1,
++        512,
++        dtype=torch.bfloat16,
++        device=DEVICE_TYPE,
++    )
++    rope = torch.randn(
++        num_pages,
++        page_size,
++        1,
++        64,
++        dtype=torch.bfloat16,
++        device=DEVICE_TYPE,
++    )
++    latent_tiles = latent.float().reshape(num_pages, page_size, 1, 4, 128)
++    scales = (latent_tiles.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
++    latent_fp8 = (latent_tiles / scales[..., None]).to(torch.float8_e4m3fn)
++
++    packed = torch.empty(
++        num_pages, page_size, 1, 656, dtype=torch.uint8, device=DEVICE_TYPE
++    )
++    packed[..., :512].copy_(latent_fp8.reshape_as(latent).view(torch.uint8))
++    packed[..., 512:528].view(torch.float32).copy_(scales)
++    packed[..., 528:656].view(torch.bfloat16).copy_(rope)
++
++    latent_dequant = (latent_fp8.float() * scales[..., None]).reshape_as(latent)
++    cache_ref = torch.cat((latent_dequant.to(torch.bfloat16), rope), dim=-1)
++    query = torch.randn(
++        batch_size,
++        num_heads,
++        576,
++        dtype=torch.bfloat16,
++        device=DEVICE_TYPE,
++    )
++    block_table = torch.tensor([[0, 1], [2, 3]], device=DEVICE_TYPE)
++    seq_lens = torch.full((batch_size,), seq_len, device=DEVICE_TYPE)
++
++    def run(k_buffer, v_buffer, *, fp8_ds_mla=False):
++        output = torch.zeros(
++            batch_size,
++            num_heads,
++            512,
++            dtype=torch.bfloat16,
++            device=DEVICE_TYPE,
++        )
++        lse = torch.zeros(
++            batch_size, num_heads, dtype=torch.bfloat16, device=DEVICE_TYPE
++        )
++        workspace = torch.empty(
++            batch_size,
++            num_heads,
++            num_kv_splits,
++            513,
++            dtype=torch.float32,
++            device=DEVICE_TYPE,
++        )
++        decode_attention_fwd(
++            query,
++            k_buffer,
++            v_buffer,
++            output,
++            lse,
++            block_table,
++            seq_lens,
++            workspace,
++            num_kv_splits,
++            1.0 / (576**0.5),
++            page_size,
++            is_mla=True,
++            fp8_ds_mla=fp8_ds_mla,
++        )
++        return output, lse
++
++    output_ref, lse_ref = run(cache_ref, cache_ref[..., :512])
++    output_packed, lse_packed = run(packed, packed[..., :512], fp8_ds_mla=True)
++
++    torch.testing.assert_close(output_packed, output_ref, atol=2e-2, rtol=1e-2)
++    torch.testing.assert_close(lse_packed, lse_ref, atol=2e-2, rtol=1e-2)
++
++
+ @pytest.mark.parametrize(
+     "H_Q,H_KV,D_QK,D_V,is_mla",
+     [
+diff --git a/vllm/v1/attention/backends/mla/triton_mla.py b/vllm/v1/attention/backends/mla/triton_mla.py
+index e55076700..e34dfd2d2 100644
+--- a/vllm/v1/attention/backends/mla/triton_mla.py
++++ b/vllm/v1/attention/backends/mla/triton_mla.py
+@@ -105,6 +105,7 @@ class TritonMLABackend(MLACommonBackend):
+         "bfloat16",
+         "fp8",
+         "fp8_e4m3",
++        "fp8_ds_mla",
+     ]
+ 
+     @classmethod
+@@ -115,6 +116,18 @@ class TritonMLABackend(MLACommonBackend):
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+         return [MultipleOf(16)]
+ 
++    @staticmethod
++    def get_kv_cache_shape(
++        num_blocks: int,
++        block_size: int,
++        num_kv_heads: int,
++        head_size: int,
++        cache_dtype_str: str = "auto",
++    ) -> tuple[int, ...]:
++        if cache_dtype_str == "fp8_ds_mla":
++            return (num_blocks, block_size, 656)
++        return (num_blocks, block_size, head_size)
++
+     @classmethod
+     def supports_block_size(cls, block_size: int | None) -> bool:
+         if block_size is None:
+@@ -283,7 +296,10 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
+                 logits_shape, dtype=torch.float32, device=q.device
+             )
+ 
+-        # Add a head dim of 1
++        use_fp8_ds_mla = self.kv_cache_dtype == "fp8_ds_mla"
++
++        # Add a head dim of 1. The packed fp8_ds_mla row stores 512 FP8
++        # latent bytes, four float32 scales, then 64 BF16 RoPE values.
+         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
+         kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
+         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
+@@ -317,6 +333,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
+             k_scale=layer._k_scale,
+             v_scale=layer._k_scale,
+             is_mla=True,
++            fp8_ds_mla=use_fp8_ds_mla,
+         )
+ 
+         return o, lse
+diff --git a/vllm/v1/attention/ops/triton_decode_attention.py b/vllm/v1/attention/ops/triton_decode_attention.py
+index 6aec1db2e..156689416 100644
+--- a/vllm/v1/attention/ops/triton_decode_attention.py
++++ b/vllm/v1/attention/ops/triton_decode_attention.py
+@@ -311,6 +311,7 @@ def _fwd_grouped_kernel_stage1(
+     Lk: tl.constexpr,
+     Lv: tl.constexpr,
+     IS_MLA: tl.constexpr = False,
++    FP8_DS_MLA: tl.constexpr = False,
+ ):
+     cur_batch = tl.program_id(0)
+     cur_head_id = tl.program_id(1)
+@@ -339,7 +340,8 @@ def _fwd_grouped_kernel_stage1(
+ 
+     if BLOCK_DPE > 0:
+         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+-        mask_dpe = offs_dpe < Lk
++        dpe_limit: tl.constexpr = BLOCK_DMODEL + BLOCK_DPE if FP8_DS_MLA else Lk
++        mask_dpe = offs_dpe < dpe_limit
+         off_qpe = (
+             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
+         )
+@@ -389,19 +391,40 @@ def _fwd_grouped_kernel_stage1(
+                 cache_modifier=".cg",
+             )
+ 
+-            if k.dtype.is_fp8():
++            if FP8_DS_MLA:
++                scale_idx = tl.arange(0, 4)
++                scale_ptr = K_Buffer + kv_off_k[None, :] + 512 + scale_idx[:, None] * 4
++                scale_bits = tl.load(scale_ptr).to(tl.uint32)
++                scale_bits |= tl.load(scale_ptr + 1).to(tl.uint32) << 8
++                scale_bits |= tl.load(scale_ptr + 2).to(tl.uint32) << 16
++                scale_bits |= tl.load(scale_ptr + 3).to(tl.uint32) << 24
++                tile_scale = scale_bits.to(tl.float32, bitcast=True)
++                k = k.to(tl.float8e4nv, bitcast=True).to(tl.float32)
++                k = tl.reshape(k, (4, 128, BLOCK_N))
++                k = tl.reshape(k * tile_scale[:, None, :], (512, BLOCK_N))
++                k = k.to(q.dtype)
++            elif k.dtype.is_fp8():
+                 k = (k.to(tl.float32) * ks).to(q.dtype)
+             qk = tl.dot(q, k.to(q.dtype))
+             if BLOCK_DPE > 0:
+-                offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
+-                kpe = tl.load(
+-                    K_Buffer + offs_buf_kpe,
+-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+-                    other=0.0,
+-                    cache_modifier=".cg",
+-                )
+-                if kpe.dtype.is_fp8():
+-                    kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
++                if FP8_DS_MLA:
++                    rope_idx = offs_dpe - BLOCK_DMODEL
++                    rope_ptr = (
++                        K_Buffer + kv_off_k[None, :] + 528 + rope_idx[:, None] * 2
++                    )
++                    rope_bits = tl.load(rope_ptr).to(tl.uint16)
++                    rope_bits |= tl.load(rope_ptr + 1).to(tl.uint16) << 8
++                    kpe = rope_bits.to(tl.bfloat16, bitcast=True)
++                else:
++                    offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
++                    kpe = tl.load(
++                        K_Buffer + offs_buf_kpe,
++                        mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
++                        other=0.0,
++                        cache_modifier=".cg",
++                    )
++                    if kpe.dtype.is_fp8():
++                        kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
+                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
+             qk *= sm_scale
+ 
+@@ -481,6 +504,7 @@ def _decode_grouped_att_m_fwd(
+     k_scale,
+     v_scale,
+     is_mla=False,
++    fp8_ds_mla=False,
+ ):
+     # with is_mla there is only a single c_kv in smem.
+     # could increase BLOCK or num_stages.
+@@ -489,7 +513,7 @@ def _decode_grouped_att_m_fwd(
+ 
+     # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
+     if is_mla:
+-        if not is_hip_ and Lk == 576:
++        if fp8_ds_mla or not is_hip_ and Lk == 576:
+             BLOCK_DMODEL = 512
+             BLOCK_DPE = 64
+         elif not is_hip_ and Lk == 288:
+@@ -568,6 +592,7 @@ def _decode_grouped_att_m_fwd(
+         Lk=Lk,
+         Lv=Lv,
+         IS_MLA=is_mla,
++        FP8_DS_MLA=fp8_ds_mla,
+         **extra_kargs,
+     )
+ 
+@@ -732,6 +757,7 @@ def decode_attention_fwd_grouped(
+     k_scale=None,
+     v_scale=None,
+     is_mla=False,
++    fp8_ds_mla=False,
+ ):
+     _decode_grouped_att_m_fwd(
+         q,
+@@ -747,6 +773,7 @@ def decode_attention_fwd_grouped(
+         k_scale,
+         v_scale,
+         is_mla=is_mla,
++        fp8_ds_mla=fp8_ds_mla,
+     )
+     _decode_softmax_reducev_fwd(
+         attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits
+@@ -769,8 +796,10 @@ def decode_attention_fwd(
+     k_scale=None,
+     v_scale=None,
+     is_mla=False,
++    fp8_ds_mla=False,
+ ):
+     assert num_kv_splits == attn_logits.shape[2]
++    assert not fp8_ds_mla or is_mla
+ 
+     if k_scale is None:
+         k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+@@ -815,4 +844,5 @@ def decode_attention_fwd(
+             k_scale,
+             v_scale,
+             is_mla=is_mla,
++            fp8_ds_mla=fp8_ds_mla,
+         )
