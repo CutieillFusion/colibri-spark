@@ -7,6 +7,8 @@ set -uo pipefail
 
 HEAD_IP=${HEAD_IP:-192.168.0.159}
 MODEL=${K3_MODEL:-/k3data/K3-dense}
+mkdir -p "$K3_LOG_DIR"
+exec >>"$K3_LOG_DIR/head.log" 2>&1
 
 echo "[head] importing plugin"
 # Installed, not just importable: VLLM_PLUGINS resolves an entry point, and
@@ -27,7 +29,17 @@ python3 -c "import vllm; assert vllm.__file__.startswith('/work'), vllm.__file__
 python3 -c "import vllm_k3_w1; print('k3_w1 importable')" || exit 1
 
 ray start --head --node-ip-address="$HEAD_IP" --port=6379 --num-gpus=1 \
+  --num-cpus="${K3_RAY_CPUS:-0}" \
   --disable-usage-stats --object-store-memory 200000000 --include-dashboard=false || exit 1
+
+(
+  while :; do
+    date -u +'%Y-%m-%dT%H:%M:%SZ'
+    grep -E 'MemAvailable|SwapFree' /proc/meminfo
+    cat /proc/pressure/memory
+    sleep 5
+  done
+) >>"$K3_LOG_DIR/host-memory.log" 2>&1 &
 
 echo "[head] waiting for 4 ray nodes"
 for i in $(seq 180); do
@@ -53,7 +65,10 @@ exec python3 -m vllm.entrypoints.openai.api_server \
   --max-num-seqs 1 --max-num-batched-tokens "${K3_MNBT:-2048}" \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --gpu-memory-utilization "${K3_UTIL:-0.95}" \
-  ${K3_KV_BYTES:+--kv-cache-memory "$K3_KV_BYTES"} \
+  ${K3_KV_BYTES:+--kv-cache-memory-bytes "$K3_KV_BYTES"} \
+  --kv-cache-dtype "${K3_KV_DTYPE:-auto}" \
+  --no-enable-prefix-caching \
   --enforce-eager \
+  --kernel-config '{"enable_flashinfer_autotune": false, "enable_cutedsl_warmup": false, "enable_jit_warmup": false}' \
   --disable-custom-all-reduce \
   --host 0.0.0.0 --port 8000

@@ -2,6 +2,16 @@
 # Runs inside a worker container: import the plugin so the registration exists
 # in this process image, then join the ray head and block.
 set -uo pipefail
+mkdir -p "$K3_LOG_DIR"
+exec > >(tee -a "$K3_LOG_DIR/worker.log") 2>&1
+(
+  while :; do
+    date -u +'%Y-%m-%dT%H:%M:%SZ'
+    grep -E 'MemAvailable|SwapFree' /proc/meminfo
+    cat /proc/pressure/memory
+    sleep 5
+  done
+) >>"$K3_LOG_DIR/host-memory.log" 2>&1 &
 # Installed, not just importable: VLLM_PLUGINS resolves an entry point, and
 # vLLM loads general plugins inside the engine-core and Ray worker processes
 # (v1/engine/core.py:117, models/registry.py:1506) where our PYTHONPATH import
@@ -28,4 +38,5 @@ done
 echo "[worker] GCS reachable, joining"
 exec ray start --address="${HEAD_IP:-192.168.0.159}:6379" \
   --node-ip-address="$MYIP" --num-gpus=1 \
+  --num-cpus="${K3_RAY_CPUS:-0}" \
   --object-store-memory 200000000 --block
