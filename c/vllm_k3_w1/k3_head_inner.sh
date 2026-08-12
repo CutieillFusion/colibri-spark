@@ -58,6 +58,18 @@ done
 echo "[head] ray nodes alive: ${n:-0}"
 [ "${n:-0}" -ge 4 ] || { echo "[head] cluster never reached 4 nodes"; exit 1; }
 
+EAGER_ARGS=()
+if [ "${K3_ENFORCE_EAGER:-1}" = 1 ]; then
+  EAGER_ARGS+=(--enforce-eager)
+fi
+PROFILE_ARGS=()
+if [ "${K3_PROFILE:-0}" = 1 ]; then
+  PROFILE_ARGS+=(
+    --profiler-config
+    "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$K3_LOG_DIR/profiles\",\"torch_profiler_with_stack\":false,\"torch_profiler_use_gzip\":true,\"max_iterations\":10,\"ignore_frontend\":true}"
+  )
+fi
+
 exec python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" --served-model-name kimi-k3 \
   --quantization k3_w1 --trust-remote-code \
@@ -73,7 +85,8 @@ exec python3 -m vllm.entrypoints.openai.api_server \
   ${K3_KV_BYTES:+--kv-cache-memory-bytes "$K3_KV_BYTES"} \
   --kv-cache-dtype "${K3_KV_DTYPE:-auto}" \
   --no-enable-prefix-caching \
-  --enforce-eager \
+  "${EAGER_ARGS[@]}" \
+  "${PROFILE_ARGS[@]}" \
   --kernel-config '{"enable_flashinfer_autotune": false, "enable_cutedsl_warmup": false, "enable_jit_warmup": false}' \
   --disable-custom-all-reduce \
   --host 0.0.0.0 --port 8000

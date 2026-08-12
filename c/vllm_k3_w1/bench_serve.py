@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import statistics
@@ -127,7 +128,9 @@ def write_results(path, rows):
         "prefill_tok_s",
         "decode_ms_tok",
         "decode_tok_s",
+        "decode_mean_tok_s",
         "elapsed_s",
+        "text_sha256",
         "text_prefix",
     ]
     with csv_path.open("w", newline="") as output:
@@ -186,7 +189,13 @@ def main():
                 "prefill_tok_s": prompt_tokens / ttft,
                 "decode_ms_tok": decode * 1000,
                 "decode_tok_s": 1 / decode if gaps else 0,
+                "decode_mean_tok_s": (
+                    (completion_tokens - 1) / (result["elapsed_s"] - ttft)
+                    if completion_tokens > 1 and result["elapsed_s"] > ttft
+                    else 0
+                ),
                 "elapsed_s": result["elapsed_s"],
+                "text_sha256": hashlib.sha256(result["text"].encode()).hexdigest(),
                 "text_prefix": result["text"][:80],
             }
             rows.append(row)
