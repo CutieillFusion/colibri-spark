@@ -10,7 +10,7 @@ MODEL=${K3_MODEL:-/k3data/K3-dense}
 mkdir -p "$K3_LOG_DIR"
 exec >>"$K3_LOG_DIR/head.log" 2>&1
 
-echo "[head] importing plugin"
+echo "[head] checking vLLM source"
 # Installed, not just importable: VLLM_PLUGINS resolves an entry point, and
 # vLLM loads general plugins inside the engine-core and Ray worker processes
 # (v1/engine/core.py:117, models/registry.py:1506) where our PYTHONPATH import
@@ -24,9 +24,13 @@ python3 -c "import vllm,sys; sys.exit(0 if vllm.__file__.startswith('/work') els
   rm -rf /usr/local/lib/python3.12/dist-packages/vllm \
          /usr/local/lib/python3.12/dist-packages/vllm-*.dist-info 2>/dev/null
 }
-pip install -e /k3w1/vllm_k3_w1 --no-deps -q 2>&1 | tail -2
 python3 -c "import vllm; assert vllm.__file__.startswith('/work'), vllm.__file__; print('vllm', vllm.__version__, 'from /work')" || exit 1
-python3 -c "import vllm_k3_w1; print('k3_w1 importable')" || exit 1
+if [ "${K3_NATIVE:-0}" != 1 ]; then
+  pip install -e /k3w1/vllm_k3_w1 --no-deps -q 2>&1 | tail -2
+  python3 -c "import vllm_k3_w1; print('k3_w1 plugin importable')" || exit 1
+else
+  python3 -c "from vllm.model_executor.layers.quantization import get_quantization_config; print(get_quantization_config('k3_w1'))" || exit 1
+fi
 
 ray start --head --node-ip-address="$HEAD_IP" --port=6379 --num-gpus=1 \
   --num-cpus="${K3_RAY_CPUS:-0}" \
@@ -57,6 +61,7 @@ echo "[head] ray nodes alive: ${n:-0}"
 exec python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" --served-model-name kimi-k3 \
   --quantization k3_w1 --trust-remote-code \
+  --reasoning-parser kimi_k3 \
   --tensor-parallel-size 2 --pipeline-parallel-size 2 \
   --enable-expert-parallel \
   --expert-placement-strategy round_robin \

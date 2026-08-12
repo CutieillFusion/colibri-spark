@@ -25,9 +25,13 @@ python3 -c "import vllm,sys; sys.exit(0 if vllm.__file__.startswith('/work') els
   rm -rf /usr/local/lib/python3.12/dist-packages/vllm \
          /usr/local/lib/python3.12/dist-packages/vllm-*.dist-info 2>/dev/null
 }
-pip install -e /k3w1/vllm_k3_w1 --no-deps -q 2>&1 | tail -2
 python3 -c "import vllm; assert vllm.__file__.startswith('/work'), vllm.__file__; print('vllm', vllm.__version__, 'from /work')" || exit 1
-python3 -c "import vllm_k3_w1; print('k3_w1 importable')" || exit 1
+if [ "${K3_NATIVE:-0}" != 1 ]; then
+  pip install -e /k3w1/vllm_k3_w1 --no-deps -q 2>&1 | tail -2
+  python3 -c "import vllm_k3_w1; print('k3_w1 plugin importable')" || exit 1
+else
+  python3 -c "from vllm.model_executor.layers.quantization import get_quantization_config; print(get_quantization_config('k3_w1'))" || exit 1
+fi
 # Wait for the head's GCS before joining. `ray start` gives up after 60 s,
 # and the head now runs a pip install before `ray start --head`, so a fixed
 # sleep in the launcher is not enough -- all three workers died this way.
